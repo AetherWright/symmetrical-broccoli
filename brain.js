@@ -106,18 +106,31 @@ export async function chooseAction(model, obs, epsilon = 0.1) {
 
 export function copyWeights(target, source) {
   if (!target || !source) return
-  const weights = source.getWeights()
-  target.setWeights(weights)
+  const sourceWeights = source.getWeights()
+  if (!sourceWeights.length) {
+    sourceWeights.forEach(weight => weight.dispose?.())
+    return
+  }
+
+  const clonedWeights = sourceWeights.map(weight => weight.clone())
+  sourceWeights.forEach(weight => weight.dispose())
+
+  target.setWeights(clonedWeights)
 }
 
 export function averageWeights(target, models = []) {
   if (!target || !models?.length) return
   const weightsByModel = models.map(model => model.getWeights())
-  if (!weightsByModel.length) return
+  if (!weightsByModel.length) {
+    return
+  }
 
   const count = weightsByModel.length
   const weightCount = weightsByModel[0]?.length ?? 0
-  if (!weightCount) return
+  if (!weightCount) {
+    weightsByModel.forEach(group => group.forEach(t => t.dispose()))
+    return
+  }
 
   const averaged = []
   for (let i = 0; i < weightCount; i++) {
@@ -140,7 +153,10 @@ export function averageWeights(target, models = []) {
     averaged.push(mean)
   }
 
-  target.setWeights(averaged)
+  const clonedAverages = averaged.map(weight => weight.clone())
+  averaged.forEach(weight => weight.dispose())
+
+  target.setWeights(clonedAverages)
 }
 
 export function mutateWeights(model, stddev = 0.02) {
@@ -160,7 +176,10 @@ export function mutateWeights(model, stddev = 0.02) {
     weight.dispose()
   }
 
-  model.setWeights(mutated)
+  const clonedMutations = mutated.map(weight => weight.clone())
+  mutated.forEach(weight => weight.dispose())
+
+  model.setWeights(clonedMutations)
 }
 
 // ----------------------------
