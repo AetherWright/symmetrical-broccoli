@@ -104,6 +104,84 @@ export async function chooseAction(model, obs, epsilon = 0.1) {
   return bestIndex
 }
 
+export function copyWeights(target, source) {
+  if (!target || !source) return
+  const sourceWeights = source.getWeights()
+  if (!sourceWeights.length) {
+    sourceWeights.forEach(weight => weight.dispose?.())
+    return
+  }
+
+  const clonedWeights = sourceWeights.map(weight => weight.clone())
+  sourceWeights.forEach(weight => weight.dispose())
+
+  target.setWeights(clonedWeights)
+}
+
+export function averageWeights(target, models = []) {
+  if (!target || !models?.length) return
+  const weightsByModel = models.map(model => model.getWeights())
+  if (!weightsByModel.length) {
+    return
+  }
+
+  const count = weightsByModel.length
+  const weightCount = weightsByModel[0]?.length ?? 0
+  if (!weightCount) {
+    weightsByModel.forEach(group => group.forEach(t => t.dispose()))
+    return
+  }
+
+  const averaged = []
+  for (let i = 0; i < weightCount; i++) {
+    const tensors = weightsByModel.map(group => group[i])
+    const mean = tf.tidy(() => {
+      let sum = tensors[0].clone()
+      for (let j = 1; j < tensors.length; j++) {
+        const next = sum.add(tensors[j])
+        sum.dispose()
+        sum = next
+      }
+      const divisor = tf.scalar(count)
+      const averagedTensor = sum.div(divisor)
+      sum.dispose()
+      divisor.dispose()
+      return averagedTensor
+    })
+
+    tensors.forEach(t => t.dispose())
+    averaged.push(mean)
+  }
+
+  const clonedAverages = averaged.map(weight => weight.clone())
+  averaged.forEach(weight => weight.dispose())
+
+  target.setWeights(clonedAverages)
+}
+
+export function mutateWeights(model, stddev = 0.02) {
+  if (!model || !Number.isFinite(stddev) || stddev <= 0) return
+  const weights = model.getWeights()
+  const mutated = []
+
+  for (const weight of weights) {
+    const next = tf.tidy(() => {
+      const noise = tf.randomNormal(weight.shape, 0, stddev)
+      const updated = weight.add(noise)
+      noise.dispose()
+      return updated
+    })
+
+    mutated.push(next)
+    weight.dispose()
+  }
+
+  const clonedMutations = mutated.map(weight => weight.clone())
+  mutated.forEach(weight => weight.dispose())
+
+  model.setWeights(clonedMutations)
+}
+
 // ----------------------------
 // TRAINING
 // ----------------------------
