@@ -29,12 +29,11 @@ async function ensureDir(dir) {
 export function createBrain(inputSize, actionCount) {
   const model = tf.sequential()
 
-  // Normalize input
-  model.add(tf.layers.batchNormalization({ inputShape: [inputSize] }))
+  // Define the input layer explicitly so we can branch the architecture safely
+  model.add(tf.layers.inputLayer({ inputShape: [inputSize] }))
 
-  // Main hidden stack
   if (BRAIN_CONFIG.useLSTM) {
-    // Wrap the input for time steps = 1
+    // Reshape to include a time dimension for the LSTM
     model.add(tf.layers.reshape({ targetShape: [1, inputSize] }))
     model.add(tf.layers.lstm({
       units: BRAIN_CONFIG.hiddenUnits,
@@ -42,7 +41,11 @@ export function createBrain(inputSize, actionCount) {
       recurrentActivation: 'sigmoid',
       returnSequences: false
     }))
+    // Apply normalization after the recurrent layer to stabilize training
+    model.add(tf.layers.batchNormalization())
   } else {
+    // Normalize the raw observations before feeding the dense stack
+    model.add(tf.layers.batchNormalization())
     model.add(tf.layers.dense({
       units: BRAIN_CONFIG.hiddenUnits,
       activation: 'relu'
@@ -51,7 +54,12 @@ export function createBrain(inputSize, actionCount) {
 
   // Optional deeper stack
   model.add(tf.layers.dropout({ rate: BRAIN_CONFIG.dropoutRate }))
-  model.add(tf.layers.dense({ units: BRAIN_CONFIG.hiddenUnits / 2, activation: 'relu' }))
+  model.add(
+    tf.layers.dense({
+      units: Math.max(1, Math.floor(BRAIN_CONFIG.hiddenUnits / 2)),
+      activation: 'relu'
+    })
+  )
   model.add(tf.layers.dropout({ rate: BRAIN_CONFIG.dropoutRate }))
 
   // Output layer — softmax for discrete actions
@@ -109,7 +117,15 @@ export async function trainBrain(model, obs, actionIndex, reward) {
   }
 
   const outputShape = model.outputs[0].shape
-  const outputUnits = outputShape[outputShape.length - 1]
+  const rawUnits = outputShape ? outputShape[outputShape.length - 1] : null
+
+  if (!Number.isFinite(rawUnits) || rawUnits <= 0) {
+    return false
+  }
+
+  const outputUnits = Math.max(1, Math.floor(rawUnits))
+
+  const boundedActionIndex = Math.max(0, Math.min(outputUnits - 1, Math.floor(actionIndex)))
 
   if (typeof tf.nextFrame === 'function') {
     await tf.nextFrame()
@@ -118,13 +134,16 @@ export async function trainBrain(model, obs, actionIndex, reward) {
   let trained = false
   tf.tidy(() => {
     const xs = tf.tensor(obs, [1, obs.length], 'float32')
-    const actionTensor = tf.tensor1d([actionIndex], 'int32')
-    const ys = tf.oneHot(actionTensor, outputUnits)
+    const labelBuffer = new Float32Array(outputUnits)
+    labelBuffer[boundedActionIndex] = 1
+    const ys = tf.tensor(labelBuffer, [1, outputUnits], 'float32')
 
     const minimizeFn = () => {
-      const pred = model.predict(xs)
-      const loss = tf.losses.softmaxCrossEntropy(ys, pred)
-      return loss.mul(-scaledReward)
+      const probs = model.predict(xs)
+      const logProbs = probs.log()
+      const selectedLogProb = logProbs.mul(ys).sum(-1)
+      const scaledLoss = selectedLogProb.mul(-scaledReward)
+      return scaledLoss.mean()
     }
 
     const lossValue = model.optimizer.minimize(minimizeFn, true)
