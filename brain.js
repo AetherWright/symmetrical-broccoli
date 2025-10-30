@@ -1,5 +1,7 @@
 // brain.js
 import * as tf from '@tensorflow/tfjs'
+import { promises as fs } from 'fs'
+import path from 'path'
 
 // ----------------------------
 // CONFIG
@@ -9,6 +11,16 @@ export const BRAIN_CONFIG = {
   dropoutRate: 0.2,
   useLSTM: true,   // flip this if you want temporal memory
   clipNorm: 1.0
+}
+
+export const DEFAULT_BRAIN_DIR = 'tf_brain_checkpoint'
+
+function resolveDir(dir = DEFAULT_BRAIN_DIR) {
+  return path.isAbsolute(dir) ? dir : path.resolve(process.cwd(), dir)
+}
+
+async function ensureDir(dir) {
+  await fs.mkdir(dir, { recursive: true })
 }
 
 // ----------------------------
@@ -60,51 +72,171 @@ export function createBrain(inputSize, actionCount) {
 // ACTION SELECTION
 // ----------------------------
 export async function chooseAction(model, obs, epsilon = 0.1) {
-  const input = tf.tensor([obs])
-  const probs = (await model.predict(input).array())[0]
-  input.dispose()
+  const probsArray = tf.tidy(() => {
+    const input = tf.tensor(obs, [1, obs.length], 'float32')
+    const prediction = model.predict(input)
+    return prediction.dataSync()
+  })
 
-  // epsilon-greedy exploration
+  const probs = Array.from(probsArray)
+
   if (Math.random() < epsilon) {
     return Math.floor(Math.random() * probs.length)
   }
-  return probs.indexOf(Math.max(...probs))
+
+  let bestIndex = 0
+  let bestValue = -Infinity
+  for (let i = 0; i < probs.length; i++) {
+    if (probs[i] > bestValue) {
+      bestValue = probs[i]
+      bestIndex = i
+    }
+  }
+
+  return bestIndex
 }
 
 // ----------------------------
 // TRAINING
 // ----------------------------
-export async function trainBrain(model, obs, actionIndex, reward, lr = 1e-3) {
-  const xs = tf.tensor([obs])
-  const ys = tf.oneHot(tf.tensor1d([actionIndex], 'int32'), model.outputs[0].shape[1])
+export async function trainBrain(model, obs, actionIndex, reward) {
+  if (typeof actionIndex !== 'number' || Number.isNaN(actionIndex)) return false
 
-  // scaled reward adjustment (RL-style)
-  const scaledReward = Math.max(-1, Math.min(1, reward || 0))
+  const scaledReward = Math.max(-1, Math.min(1, reward ?? 0))
 
-  const {grads} = tf.variableGrads(() => {
-    const pred = model.predict(xs)
-    const loss = tf.losses.softmaxCrossEntropy(ys, pred).mul(-scaledReward)
-    return loss
+  if (!Number.isFinite(scaledReward) || scaledReward === 0) {
+    return false
+  }
+
+  const outputShape = model.outputs[0].shape
+  const outputUnits = outputShape[outputShape.length - 1]
+
+  if (typeof tf.nextFrame === 'function') {
+    await tf.nextFrame()
+  }
+
+  let trained = false
+  tf.tidy(() => {
+    const xs = tf.tensor(obs, [1, obs.length], 'float32')
+    const actionTensor = tf.tensor1d([actionIndex], 'int32')
+    const ys = tf.oneHot(actionTensor, outputUnits)
+
+    const minimizeFn = () => {
+      const pred = model.predict(xs)
+      const loss = tf.losses.softmaxCrossEntropy(ys, pred)
+      return loss.mul(-scaledReward)
+    }
+
+    const lossValue = model.optimizer.minimize(minimizeFn, true)
+    if (lossValue) {
+      lossValue.dispose()
+    }
+    trained = true
   })
-  model.optimizer.applyGradients(grads)
 
+  return trained
 }
 
 // ----------------------------
 // PERSISTENCE
 // ----------------------------
-export async function saveBrain(model, path = 'file://./brain_checkpoint') {
-  await model.save(path)
-  console.log(`[Brain] Saved model to ${path}`)
+export async function saveBrain(model, dir = DEFAULT_BRAIN_DIR) {
+  const resolved = resolveDir(dir)
+  await ensureDir(resolved)
+
+  const handler = tf.io.withSaveHandler(async artifacts => {
+    const modelJsonPath = path.join(resolved, 'model.json')
+    const weightsPath = path.join(resolved, 'weights.bin')
+
+    const weightsManifest = [{ paths: ['weights.bin'], weights: artifacts.weightSpecs ?? [] }]
+    const topologyJson = JSON.stringify(artifacts.modelTopology ?? {})
+    const weightsSpecsJson = JSON.stringify(artifacts.weightSpecs ?? [])
+    const modelJSON = {
+      modelTopology: artifacts.modelTopology ?? null,
+      format: 'layers-model',
+      generatedBy: 'BrainBot',
+      convertedBy: null,
+      trainingConfig: artifacts.trainingConfig ?? null,
+      weightsManifest
+    }
+
+    await fs.writeFile(modelJsonPath, JSON.stringify(modelJSON, null, 2))
+    if (artifacts.weightData) {
+      const buffer = Buffer.from(artifacts.weightData)
+      await fs.writeFile(weightsPath, buffer)
+    }
+
+    return {
+      modelArtifactsInfo: {
+        dateSaved: new Date(),
+        modelTopologyType: 'JSON',
+        modelTopologyBytes: Buffer.byteLength(topologyJson, 'utf8'),
+        weightSpecsBytes: Buffer.byteLength(weightsSpecsJson, 'utf8'),
+        weightDataBytes: artifacts.weightData ? artifacts.weightData.byteLength : 0
+      }
+    }
+  })
+
+  await model.save(handler)
+  console.log(`[Brain] Saved model to ${resolved}`)
 }
 
-export async function loadBrain(path = 'file://./brain_checkpoint') {
+export async function loadBrain(dir = DEFAULT_BRAIN_DIR) {
   try {
-    const model = await tf.loadLayersModel(path + '/model.json')
-    console.log(`[Brain] Loaded model from ${path}`)
+    const resolved = resolveDir(dir)
+    const modelJsonPath = path.join(resolved, 'model.json')
+    const weightsPath = path.join(resolved, 'weights.bin')
+
+    const handler = tf.io.withLoadHandler(async () => {
+      const modelJSON = JSON.parse(await fs.readFile(modelJsonPath, 'utf8'))
+      const weightBuffer = await fs.readFile(weightsPath)
+      const arrayBuffer = weightBuffer.buffer.slice(
+        weightBuffer.byteOffset,
+        weightBuffer.byteOffset + weightBuffer.byteLength
+      )
+
+      const manifestWeights = modelJSON.weightsManifest?.[0]?.weights ?? modelJSON.weightSpecs ?? []
+
+      return {
+        modelTopology: modelJSON.modelTopology ?? null,
+        trainingConfig: modelJSON.trainingConfig ?? null,
+        weightSpecs: manifestWeights,
+        weightData: arrayBuffer
+      }
+    })
+
+    const model = await tf.loadLayersModel(handler)
+    if (!model.optimizer) {
+      const optimizer = tf.train.rmsprop(5e-4)
+      model.compile({ optimizer, loss: 'categoricalCrossentropy' })
+    }
+    console.log(`[Brain] Loaded model from ${resolved}`)
     return model
   } catch (err) {
     console.warn('[Brain] No saved model found, creating new one.')
+    return null
+  }
+}
+
+export async function saveBrainState(state, dir = DEFAULT_BRAIN_DIR) {
+  const resolved = resolveDir(dir)
+  await ensureDir(resolved)
+  const statePath = path.join(resolved, 'state.json')
+  const payload = {
+    ...state,
+    savedAt: new Date().toISOString()
+  }
+  await fs.writeFile(statePath, JSON.stringify(payload, null, 2))
+  console.log(`[Brain] Saved state to ${statePath}`)
+}
+
+export async function loadBrainState(dir = DEFAULT_BRAIN_DIR) {
+  try {
+    const resolved = resolveDir(dir)
+    const statePath = path.join(resolved, 'state.json')
+    const raw = await fs.readFile(statePath, 'utf8')
+    return JSON.parse(raw)
+  } catch (err) {
     return null
   }
 }
