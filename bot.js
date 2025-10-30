@@ -8,7 +8,10 @@ import {
   loadBrain,
   saveBrainState,
   loadBrainState,
-  DEFAULT_BRAIN_DIR
+  DEFAULT_BRAIN_DIR,
+  copyWeights,
+  averageWeights,
+  mutateWeights
 } from './brain.js'
 
 // ----------------------------
@@ -16,6 +19,16 @@ import {
 // ----------------------------
 const MC_HOST = 'localhost'
 const MC_PORT = 25565
+const BOT_COUNT = Math.max(2, parseInt(process.env.BOT_COUNT ?? '3', 10))
+const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '200', 10))
+const MUTATION_STDDEV = Number.isFinite(Number(process.env.MUTATION_STDDEV))
+  ? Math.max(0.001, Number(process.env.MUTATION_STDDEV))
+  : 0.02
+
+const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
+const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
+const PREFIXES = ['', 'Mc', 'Von', 'De', "O'", 'El']
+
 const CRAFTING_ACTIONS = {
   craft_planks: { item: 'oak_planks', amount: 4, allowPartial: true, reward: 0.6 },
   craft_sticks: { item: 'stick', amount: 4, allowPartial: true, reward: 0.45 },
@@ -26,6 +39,7 @@ const CRAFTING_ACTIONS = {
   craft_torch: { item: 'torch', amount: 4, allowPartial: true, reward: 0.55 },
   craft_furnace: { item: 'furnace', amount: 1, requireTable: true, allowPartial: false, reward: 1.1 }
 }
+
 const ACTIONS = [
   'move_forward',
   'move_backward',
@@ -46,151 +60,162 @@ const ACTIONS = [
   'use_item',
   ...Object.keys(CRAFTING_ACTIONS)
 ]
-const TICK_RATE = 1000   // 1 second
+
+const TICK_RATE = 1000
 const EPSILON_START = 0.25
 const EPSILON_MIN = 0.05
 const EPSILON_DECAY = 0.999
 const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
-
-// ----------------------------
-// INIT BOT + MODEL
-// ----------------------------
-const bot = mineflayer.createBot({
-  host: MC_HOST,
-  port: MC_PORT,
-  username: 'BrainBot'
-})
-console.log(`[BrainBot] Connecting to ${MC_HOST}:${MC_PORT}`)
-
 const OBS_SIZE = 22
-let brain = null
-let brainReady = null
-let lastObs = null
-let lastAction = null
-let lastPos = null
-let lastHealth = 20
-let lastFood = 20
-let lastInvTotal = 0
-let epsilon = EPSILON_START
-let running = true
-let tickTimer = null
-let tickInFlight = false
-let registry = null
-let tickCount = 0
-let trainingSteps = 0
-let cumulativeReward = 0
+
+// ----------------------------
+// GLOBAL STATE
+// ----------------------------
+const contexts = []
+const usedNames = new Set()
+let globalRunning = true
+let baselineBrain = null
+let baselineReady = null
+let baselineState = {
+  epsilon: EPSILON_START,
+  tickCount: 0,
+  trainingSteps: 0,
+  cumulativeReward: 0,
+  generation: 0
+}
 let lastSaveTick = 0
 let lastSaveTime = Date.now()
 let saveInFlight = null
 let pendingSaveReason = null
+let generationSyncInFlight = false
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+// ----------------------------
+// HELPERS
+// ----------------------------
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-async function initializeBrain() {
+function generateRandomName() {
+  let attempt = 0
+  while (attempt < 25) {
+    const prefix = PREFIXES[Math.floor(Math.random() * PREFIXES.length)] ?? ''
+    const rock = ROCK_PARTS[Math.floor(Math.random() * ROCK_PARTS.length)] ?? 'Stone'
+    const suffix = SUFFIXES[Math.floor(Math.random() * SUFFIXES.length)] ?? 'son'
+    const candidate = `${prefix}${rock}${suffix}`
+    if (!usedNames.has(candidate)) {
+      usedNames.add(candidate)
+      return candidate
+    }
+    attempt += 1
+  }
+  return `BrainBot${Math.floor(Math.random() * 10000)}`
+}
+
+function label(context) {
+  return `${context.username}`
+}
+
+async function initializeBaselineBrain() {
   try {
     const loaded = await loadBrain(CHECKPOINT_DIR)
     if (loaded) {
-      brain = loaded
+      baselineBrain = loaded
     } else {
-      brain = createBrain(OBS_SIZE, ACTIONS.length)
+      baselineBrain = createBrain(OBS_SIZE, ACTIONS.length)
     }
 
     const savedState = await loadBrainState(CHECKPOINT_DIR)
     if (savedState) {
-      if (typeof savedState.epsilon === 'number' && Number.isFinite(savedState.epsilon)) {
-        epsilon = Math.min(Math.max(savedState.epsilon, EPSILON_MIN), EPSILON_START)
+      baselineState = {
+        epsilon: typeof savedState.epsilon === 'number' ? savedState.epsilon : EPSILON_START,
+        tickCount: typeof savedState.tickCount === 'number' ? savedState.tickCount : 0,
+        trainingSteps: typeof savedState.trainingSteps === 'number' ? savedState.trainingSteps : 0,
+        cumulativeReward: typeof savedState.cumulativeReward === 'number' ? savedState.cumulativeReward : 0,
+        generation: typeof savedState.generation === 'number' ? savedState.generation : 0
       }
-      if (typeof savedState.tickCount === 'number' && savedState.tickCount >= 0) {
-        tickCount = savedState.tickCount
-      }
-      if (typeof savedState.trainingSteps === 'number' && savedState.trainingSteps >= 0) {
-        trainingSteps = savedState.trainingSteps
-      }
-      if (typeof savedState.cumulativeReward === 'number' && Number.isFinite(savedState.cumulativeReward)) {
-        cumulativeReward = savedState.cumulativeReward
-      }
-      lastSaveTick = tickCount
-      if (savedState.savedAt) {
-        lastSaveTime = Date.now()
-      }
-      console.log('[BrainBot] Restored training state from disk.')
+      lastSaveTick = baselineState.tickCount
+      lastSaveTime = Date.now()
+      console.log('[Baseline] Restored checkpoint state.')
     }
   } catch (err) {
-    console.error('[BrainBot] Failed to initialize brain from checkpoint:', err)
-    brain = createBrain(OBS_SIZE, ACTIONS.length)
+    console.error('[Baseline] Failed to initialize from checkpoint:', err)
+    baselineBrain = createBrain(OBS_SIZE, ACTIONS.length)
   }
 
-  return brain
+  return baselineBrain
 }
 
-brainReady = initializeBrain()
+baselineReady = initializeBaselineBrain()
 
-async function ensureBrainReady() {
-  if (brain) return brain
-  if (!brainReady) {
-    brainReady = initializeBrain()
+async function ensureBaselineReady() {
+  if (baselineBrain) return baselineBrain
+  if (!baselineReady) {
+    baselineReady = initializeBaselineBrain()
   }
   try {
-    await brainReady
+    await baselineReady
   } catch (err) {
-    console.error('[BrainBot] Brain initialization failed, recreating model:', err)
-    brain = createBrain(OBS_SIZE, ACTIONS.length)
-    brainReady = Promise.resolve(brain)
+    console.error('[Baseline] Initialization failed, recreating model:', err)
+    baselineBrain = createBrain(OBS_SIZE, ACTIONS.length)
+    baselineReady = Promise.resolve(baselineBrain)
   }
-  return brain
+  return baselineBrain
 }
 
-async function persistBrain(reason = 'periodic') {
-  if (!brain) return
+async function persistBaseline(reason = 'periodic') {
+  if (!baselineBrain) return
   try {
-    await saveBrain(brain, CHECKPOINT_DIR)
+    await saveBrain(baselineBrain, CHECKPOINT_DIR)
+    const avgEpsilon = contexts.length
+      ? contexts.reduce((sum, ctx) => sum + ctx.epsilon, 0) / contexts.length
+      : baselineState.epsilon
     await saveBrainState(
       {
-        epsilon,
-        tickCount,
-        trainingSteps,
-        cumulativeReward,
+        epsilon: avgEpsilon,
+        tickCount: baselineState.tickCount,
+        trainingSteps: baselineState.trainingSteps,
+        cumulativeReward: baselineState.cumulativeReward,
+        generation: baselineState.generation,
         reason
       },
       CHECKPOINT_DIR
     )
-    lastSaveTick = tickCount
+    lastSaveTick = baselineState.tickCount
     lastSaveTime = Date.now()
-    console.log(`[BrainBot] Saved checkpoint (${reason}).`)
+    console.log(`[Baseline] Saved checkpoint (${reason}).`)
   } catch (err) {
-    console.error(`[BrainBot] Failed to save checkpoint (${reason}):`, err)
+    console.error(`[Baseline] Failed to save checkpoint (${reason}):`, err)
   }
 }
 
-function scheduleBrainSave(reason = 'periodic') {
+function scheduleBaselineSave(reason = 'periodic') {
   if (saveInFlight) {
     pendingSaveReason = reason
     return
   }
 
   saveInFlight = (async () => {
-    await persistBrain(reason)
+    await persistBaseline(reason)
   })()
 
   saveInFlight
-    .catch(err => console.error('[BrainBot] Save task error:', err))
+    .catch(err => console.error('[Baseline] Save task error:', err))
     .finally(() => {
       saveInFlight = null
       if (pendingSaveReason) {
         const nextReason = pendingSaveReason
         pendingSaveReason = null
-        scheduleBrainSave(nextReason)
+        scheduleBaselineSave(nextReason)
       }
     })
 }
 
 function maybeTriggerAutosave() {
-  const ticksSinceSave = tickCount - lastSaveTick
+  const ticksSinceSave = baselineState.tickCount - lastSaveTick
   const msSinceSave = Date.now() - lastSaveTime
   if (ticksSinceSave >= SAVE_INTERVAL_TICKS || msSinceSave >= SAVE_INTERVAL_MS) {
-    scheduleBrainSave('autosave')
+    scheduleBaselineSave('autosave')
   }
 }
 
@@ -199,139 +224,27 @@ async function flushPendingSave() {
     try {
       await saveInFlight
     } catch (err) {
-      console.error('[BrainBot] Pending save failed:', err)
+      console.error('[Baseline] Pending save failed:', err)
     }
   }
 }
 
-async function equipBestTool(preferredKeywords = []) {
-  const items = bot.inventory?.items?.() ?? []
-  for (const keyword of preferredKeywords) {
-    const tool = items.find(item => item?.name?.includes(keyword))
-    if (tool) {
-      try {
-        await bot.equip(tool, 'hand')
-        return true
-      } catch (err) {
-        console.warn(`[BrainBot] Failed to equip ${tool.name}:`, err?.message ?? err)
-      }
-    }
+async function ensureContextBrain(context) {
+  if (context.brain) return context.brain
+  await ensureBaselineReady()
+  const brain = createBrain(OBS_SIZE, ACTIONS.length)
+  if (baselineBrain) {
+    copyWeights(brain, baselineBrain)
   }
-  return false
+  if (context.id > 0) {
+    mutateWeights(brain, MUTATION_STDDEV)
+  }
+  context.brain = brain
+  return context.brain
 }
 
-async function equipPlaceableBlock() {
-  const items = bot.inventory?.items?.() ?? []
-  for (const item of items) {
-    if (!item?.name) continue
-    if (['sword', 'pickaxe', 'axe', 'shovel', 'hoe', 'bucket'].some(tool => item.name.includes(tool))) continue
-    try {
-      await bot.equip(item, 'hand')
-      return true
-    } catch (err) {
-      console.warn(`[BrainBot] Failed to equip ${item.name} for building:`, err?.message ?? err)
-    }
-  }
-  return false
-}
-
-function findNearbyBlock(name, maxDistance = 4) {
-  if (!registry) return null
-  const blockInfo = registry.blocksByName?.[name]
-  if (!blockInfo) return null
-  try {
-    return bot.findBlock({ matching: blockInfo.id, maxDistance }) ?? null
-  } catch (err) {
-    console.warn(`[BrainBot] findNearbyBlock failed for ${name}:`, err?.message ?? err)
-    return null
-  }
-}
-
-async function craftItem(targetName, options = {}) {
-  if (!registry) return false
-
-  const {
-    amount = 1,
-    requireTable = false,
-    allowPartial = true,
-    tableRange = 4
-  } = options
-
-  const itemInfo = registry.itemsByName?.[targetName]
-  if (!itemInfo) {
-    console.warn(`[BrainBot] Unknown craft target: ${targetName}`)
-    return false
-  }
-
-  const tableBlock = findNearbyBlock('crafting_table', tableRange)
-  const candidates = []
-
-  if (tableBlock) {
-    candidates.push(tableBlock)
-  }
-  if (!requireTable || !tableBlock) {
-    candidates.push(null)
-  }
-
-  if (requireTable && !tableBlock) {
-    console.log('[BrainBot] Crafting table required but not nearby.')
-    return false
-  }
-
-  const uniqueCandidates = []
-  for (const candidate of candidates) {
-    if (!uniqueCandidates.some(existing => existing === candidate)) {
-      uniqueCandidates.push(candidate)
-    }
-  }
-
-  for (const table of uniqueCandidates) {
-    let craftCount = Math.max(1, Math.floor(amount))
-    const minCount = allowPartial ? 1 : craftCount
-
-    while (craftCount >= minCount) {
-      try {
-        const recipes = bot.recipesFor(itemInfo.id, null, craftCount, table ?? null)
-        if (recipes?.length) {
-          try {
-            await bot.craft(recipes[0], craftCount, table ?? undefined)
-            return true
-          } catch (err) {
-            console.warn(`[BrainBot] Craft ${targetName} x${craftCount} failed:`, err?.message ?? err)
-          }
-        }
-      } catch (err) {
-        console.warn(`[BrainBot] recipesFor failed for ${targetName}:`, err?.message ?? err)
-      }
-
-      if (!allowPartial) break
-      if (craftCount === 1) break
-      craftCount = Math.max(1, Math.floor(craftCount / 2))
-      if (craftCount === minCount && !allowPartial) break
-      if (craftCount === 1 && !allowPartial) break
-    }
-  }
-
-  return false
-}
-
-async function executeCraftAction(act) {
-  const config = CRAFTING_ACTIONS[act]
-  if (!config) return
-
-  const success = await craftItem(config.item, config)
-  if (success) {
-    blockReward += config.reward ?? 0.4
-    console.log(`[BrainBot] Crafted ${config.item}`)
-  } else {
-    blockReward -= 0.03
-  }
-}
-
-// ----------------------------
-// OBSERVATION GATHERING
-// ----------------------------
-function gatherObservations(bot) {
+function gatherObservations(context) {
+  const { bot } = context
   const obs = new Float32Array(OBS_SIZE)
 
   if (!bot?.entity?.position) {
@@ -390,16 +303,139 @@ function gatherObservations(bot) {
   return obs
 }
 
-// ----------------------------
-// ACTION EXECUTION
-// ----------------------------
-async function executeAction(index) {
+async function equipBestTool(context, preferredKeywords = []) {
+  const items = context.bot.inventory?.items?.() ?? []
+  for (const keyword of preferredKeywords) {
+    const tool = items.find(item => item?.name?.includes(keyword))
+    if (tool) {
+      try {
+        await context.bot.equip(tool, 'hand')
+        return true
+      } catch (err) {
+        console.warn(`[${label(context)}] Failed to equip ${tool.name}:`, err?.message ?? err)
+      }
+    }
+  }
+  return false
+}
+
+async function equipPlaceableBlock(context) {
+  const items = context.bot.inventory?.items?.() ?? []
+  for (const item of items) {
+    if (!item?.name) continue
+    if (['sword', 'pickaxe', 'axe', 'shovel', 'hoe', 'bucket'].some(tool => item.name.includes(tool))) continue
+    try {
+      await context.bot.equip(item, 'hand')
+      return true
+    } catch (err) {
+      console.warn(`[${label(context)}] Failed to equip ${item.name} for building:`, err?.message ?? err)
+    }
+  }
+  return false
+}
+
+function findNearbyBlock(context, name, maxDistance = 4) {
+  if (!context.registry) return null
+  const blockInfo = context.registry.blocksByName?.[name]
+  if (!blockInfo) return null
+  try {
+    return context.bot.findBlock({ matching: blockInfo.id, maxDistance }) ?? null
+  } catch (err) {
+    console.warn(`[${label(context)}] findNearbyBlock failed for ${name}:`, err?.message ?? err)
+    return null
+  }
+}
+
+async function craftItem(context, targetName, options = {}) {
+  if (!context.registry) return false
+
+  const {
+    amount = 1,
+    requireTable = false,
+    allowPartial = true,
+    tableRange = 4
+  } = options
+
+  const itemInfo = context.registry.itemsByName?.[targetName]
+  if (!itemInfo) {
+    console.warn(`[${label(context)}] Unknown craft target: ${targetName}`)
+    return false
+  }
+
+  const tableBlock = findNearbyBlock(context, 'crafting_table', tableRange)
+  const candidates = []
+
+  if (tableBlock) {
+    candidates.push(tableBlock)
+  }
+  if (!requireTable || !tableBlock) {
+    candidates.push(null)
+  }
+
+  if (requireTable && !tableBlock) {
+    console.log(`[${label(context)}] Crafting table required but not nearby.`)
+    return false
+  }
+
+  const uniqueCandidates = []
+  for (const candidate of candidates) {
+    if (!uniqueCandidates.some(existing => existing === candidate)) {
+      uniqueCandidates.push(candidate)
+    }
+  }
+
+  for (const table of uniqueCandidates) {
+    let craftCount = Math.max(1, Math.floor(amount))
+    const minCount = allowPartial ? 1 : craftCount
+
+    while (craftCount >= minCount) {
+      try {
+        const recipes = context.bot.recipesFor(itemInfo.id, null, craftCount, table ?? null)
+        if (recipes?.length) {
+          try {
+            await context.bot.craft(recipes[0], craftCount, table ?? undefined)
+            return true
+          } catch (err) {
+            console.warn(`[${label(context)}] Craft ${targetName} x${craftCount} failed:`, err?.message ?? err)
+          }
+        }
+      } catch (err) {
+        console.warn(`[${label(context)}] recipesFor failed for ${targetName}:`, err?.message ?? err)
+      }
+
+      if (!allowPartial) break
+      if (craftCount === 1) break
+      craftCount = Math.max(1, Math.floor(craftCount / 2))
+      if (craftCount === minCount && !allowPartial) break
+      if (craftCount === 1 && !allowPartial) break
+    }
+  }
+
+  return false
+}
+
+async function executeCraftAction(context, act) {
+  const config = CRAFTING_ACTIONS[act]
+  if (!config) return
+
+  const success = await craftItem(context, config.item, config)
+  if (success) {
+    context.blockReward += config.reward ?? 0.4
+    console.log(`[${label(context)}] Crafted ${config.item}`)
+  } else {
+    context.blockReward -= 0.03
+  }
+}
+
+async function executeAction(context, index) {
   const act = ACTIONS[index]
   if (!act) return
-  console.log(`[BrainBot] Executing: ${act}`)
+  console.log(`[${label(context)}] Executing: ${act}`)
+
+  const { bot } = context
 
   if (CRAFTING_ACTIONS[act]) {
-    await executeCraftAction(act)
+    await executeCraftAction(context, act)
     bot.clearControlStates()
     return
   }
@@ -442,76 +478,103 @@ async function executeAction(index) {
         await holdControls(['jump'])
         break
       case 'jump_forward':
-        await holdControls(['jump', 'forward'])
+        await holdControls(['forward', 'jump'])
         break
       case 'sprint_forward':
-        await holdControls(['forward', 'sprint'], 450)
+        await holdControls(['forward', 'sprint'], 500)
         break
       case 'sneak_forward':
-        await holdControls(['forward', 'sneak'], 450)
+        await holdControls(['forward', 'sneak'], 500)
         break
       case 'turn_left':
-        await lookBy(-Math.PI / 6, 0)
+        await lookBy(-Math.PI / 4, 0)
         break
       case 'turn_right':
-        await lookBy(Math.PI / 6, 0)
+        await lookBy(Math.PI / 4, 0)
         break
       case 'look_up':
-        await lookBy(0, -Math.PI / 12)
+        await lookBy(0, -Math.PI / 8)
         break
       case 'look_down':
-        await lookBy(0, Math.PI / 12)
+        await lookBy(0, Math.PI / 8)
         break
       case 'mine': {
-        const block = getTargetBlock()
-        if (block) {
-          await equipBestTool(['pickaxe', 'axe', 'shovel'])
-          try {
-            await bot.dig(block)
-          } catch (err) {
-            console.warn('[BrainBot] Dig action failed:', err?.message ?? err)
+        const target = getTargetBlock()
+        if (target) {
+          const mined = await equipBestTool(context, ['pickaxe', 'axe', 'shovel'])
+          if (!mined) {
+            await equipBestTool(context, ['hand'])
           }
+          try {
+            await bot.dig(target)
+            context.blockReward += 0.5
+          } catch (err) {
+            console.warn(`[${label(context)}] Mining failed:`, err?.message ?? err)
+            context.blockReward -= 0.05
+          }
+        } else {
+          context.blockReward -= 0.02
         }
         break
       }
       case 'attack': {
-        const target = bot.nearestEntity()
-        if (target) {
-          await equipBestTool(['sword', 'axe'])
+        const entity = bot.nearestEntity()
+        if (entity) {
           try {
-            bot.attack(target)
-            blockReward += 0.1
+            await bot.attack(entity)
+            context.blockReward += 0.3
           } catch (err) {
-            console.warn('[BrainBot] Attack action failed:', err?.message ?? err)
+            console.warn(`[${label(context)}] Attack failed:`, err?.message ?? err)
+            context.blockReward -= 0.05
           }
+        } else {
+          context.blockReward -= 0.01
         }
         break
       }
       case 'build': {
-        const ref = getTargetBlock()
-        if (ref) {
-          await equipPlaceableBlock()
-          try {
-            await bot.placeBlock(ref, new Vec3(0, 1, 0))
-            blockReward += 0.4
-          } catch (err) {
-            console.warn('[BrainBot] Build action failed:', err?.message ?? err)
+        const target = getTargetBlock()
+        if (target) {
+          const placePos = target.position.offset(0, 1, 0)
+          const success = await equipPlaceableBlock(context)
+          if (success) {
+            try {
+              await bot.placeBlock(target, new Vec3(0, 1, 0))
+              context.blockReward += 0.25
+            } catch (err) {
+              console.warn(`[${label(context)}] Build failed:`, err?.message ?? err)
+              context.blockReward -= 0.02
+            }
+          } else {
+            context.blockReward -= 0.02
           }
+          if (placePos) {
+            // noop - placeholder for potential future heuristics
+          }
+        } else {
+          context.blockReward -= 0.02
         }
         break
       }
       case 'build_above': {
-        const basePos = bot.entity?.position?.floored?.() ?? bot.entity?.position
-        const belowPos = basePos ? basePos.offset(0, -1, 0) : null
-        const below = belowPos ? bot.blockAt(belowPos) : null
-        if (below) {
-          await equipPlaceableBlock()
-          try {
-            await bot.placeBlock(below, new Vec3(0, 1, 0))
-            blockReward += 0.4
-          } catch (err) {
-            console.warn('[BrainBot] Build-above action failed:', err?.message ?? err)
+        const success = await equipPlaceableBlock(context)
+        if (success) {
+          const eyePos = bot.entity?.position
+          if (eyePos) {
+            const targetPos = eyePos.offset(0, 1, 0)
+            const blockBelow = bot.blockAt(targetPos.offset(0, -1, 0))
+            if (blockBelow) {
+              try {
+                await bot.placeBlock(blockBelow, new Vec3(0, 1, 0))
+                context.blockReward += 0.2
+              } catch (err) {
+                console.warn(`[${label(context)}] Build above failed:`, err?.message ?? err)
+                context.blockReward -= 0.02
+              }
+            }
           }
+        } else {
+          context.blockReward -= 0.02
         }
         break
       }
@@ -520,60 +583,28 @@ async function executeAction(index) {
           bot.activateItem()
           await sleep(300)
           bot.deactivateItem()
-          blockReward += 0.05
+          context.blockReward += 0.05
         } catch (err) {
-          console.warn('[BrainBot] Use-item action failed:', err?.message ?? err)
+          console.warn(`[${label(context)}] Use-item action failed:`, err?.message ?? err)
         }
         break
       }
+      default:
+        break
     }
   } finally {
     bot.clearControlStates()
   }
 }
 
-// ----------------------------
-// REWARD FUNCTION
-// ----------------------------
-let blockReward = 0
-
-// only reward real block breaks
-bot.on('blockBreak', (block) => {
-  if (!block || block.name === 'air') return
-  // give more reward for "real" blocks
-  const value =
-    block.name.includes('ore') ? 2.0 :
-    block.name.includes('stone') ? 1.0 :
-    block.name.includes('dirt') ? 0.5 :
-    0.3
-  blockReward += value
-  console.log(`[BrainBot] Broke ${block.name} → +${value.toFixed(2)} reward`)
-})
-
-// light penalty for failed dig attempts
-bot.on('diggingAborted', () => {
-  blockReward -= 0.1
-  console.log('[BrainBot] Dig aborted → -0.1 penalty')
-})
-
-bot.on('playerCollect', (collector, collected) => {
-  if (collector === bot.entity) {
-    const count = collected?.metadata?.itemCount ?? collected?.count ?? 1
-    const bonus = Math.max(0.3, (count || 1) * 0.15)
-    blockReward += bonus
-    console.log(`[BrainBot] Collected item → +${bonus.toFixed(2)} reward`)
-  }
-})
-
-// revised computeReward
-function computeReward(obs) {
+function computeReward(context, obs) {
   let reward = 0
 
   const pos = { x: obs[0], y: obs[1], z: obs[2] }
-  if (lastPos) {
-    const dx = pos.x - lastPos.x
-    const dy = pos.y - lastPos.y
-    const dz = pos.z - lastPos.z
+  if (context.lastPos) {
+    const dx = pos.x - context.lastPos.x
+    const dy = pos.y - context.lastPos.y
+    const dz = pos.z - context.lastPos.z
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
     const horizontal = Math.sqrt(dx * dx + dz * dz)
     reward += Math.min(dist * 0.1, 0.5)
@@ -583,31 +614,31 @@ function computeReward(obs) {
 
   const health = obs[8]
   if (Number.isFinite(health)) {
-    if (health < lastHealth) {
-      reward -= Math.min(1, (lastHealth - health) * 0.5)
-    } else if (health > lastHealth) {
-      reward += Math.min(1, (health - lastHealth) * 0.5)
+    if (health < context.lastHealth) {
+      reward -= Math.min(1, (context.lastHealth - health) * 0.5)
+    } else if (health > context.lastHealth) {
+      reward += Math.min(1, (health - context.lastHealth) * 0.5)
     }
-    lastHealth = health
+    context.lastHealth = health
   }
 
   const food = obs[9]
   if (Number.isFinite(food)) {
-    if (food > lastFood) {
-      reward += Math.min(0.5, (food - lastFood) * 0.1)
-    } else if (food < lastFood) {
-      reward -= Math.min(0.5, (lastFood - food) * 0.05)
+    if (food > context.lastFood) {
+      reward += Math.min(0.5, (food - context.lastFood) * 0.1)
+    } else if (food < context.lastFood) {
+      reward -= Math.min(0.5, (context.lastFood - food) * 0.05)
     }
-    lastFood = food
+    context.lastFood = food
   }
 
   const invTotal = obs[18]
   if (Number.isFinite(invTotal)) {
-    const delta = invTotal - lastInvTotal
+    const delta = invTotal - context.lastInvTotal
     if (delta !== 0) {
       reward += Math.sign(delta) * Math.min(Math.abs(delta) * 0.2, 1.5)
     }
-    lastInvTotal = invTotal
+    context.lastInvTotal = invTotal
   }
 
   const nearestDist = obs[16]
@@ -615,160 +646,310 @@ function computeReward(obs) {
     reward -= (3 - nearestDist) * 0.05
   }
 
-  const consumedBlockReward = blockReward
+  const consumedBlockReward = context.blockReward
   reward += consumedBlockReward
-  blockReward = 0
+  context.blockReward = 0
 
-  reward -= 0.02 // mild time penalty to encourage efficiency
+  reward -= 0.02
 
-  lastPos = { ...pos }
+  context.lastPos = { ...pos }
   return reward
 }
 
-
-// ----------------------------
-// CUSTOM TICK LOOP
-// ----------------------------
-async function tickLoop() {
-  if (!running || tickInFlight) return
-  tickInFlight = true
+async function tickLoop(context) {
+  if (!globalRunning || !context.running || context.tickInFlight) return
+  context.tickInFlight = true
 
   try {
-    await ensureBrainReady()
-    if (!bot?.entity?.position) {
-      console.warn('[BrainBot] Entity not ready, skipping tick.')
+    await ensureContextBrain(context)
+    if (!context.bot?.entity?.position) {
+      console.warn(`[${label(context)}] Entity not ready, skipping tick.`)
       return
     }
 
-    if (!registry && bot.registry) {
-      registry = bot.registry
+    if (!context.registry && context.bot.registry) {
+      context.registry = context.bot.registry
     }
 
-    const observation = gatherObservations(bot)
-    const reward = computeReward(observation)
+    const observation = gatherObservations(context)
+    const reward = computeReward(context, observation)
 
     let trained = false
-    if (lastObs && lastAction != null) {
-      trained = await trainBrain(brain, lastObs, lastAction, reward)
+    if (context.lastObs && context.lastAction != null) {
+      trained = await trainBrain(context.brain, context.lastObs, context.lastAction, reward)
     }
 
-    const action = await chooseAction(brain, observation, epsilon)
-    await executeAction(action)
+    const action = await chooseAction(context.brain, observation, context.epsilon)
+    await executeAction(context, action)
 
-    lastObs = observation
-    lastAction = action
+    context.lastObs = observation
+    context.lastAction = action
 
-    tickCount += 1
-    cumulativeReward += reward
+    context.tickCount += 1
+    context.generationTicks += 1
+    context.cumulativeReward += reward
+    context.generationReward += reward
+    baselineState.tickCount += 1
+    baselineState.cumulativeReward += reward
     if (trained) {
-      trainingSteps += 1
+      context.trainingSteps += 1
+      baselineState.trainingSteps += 1
     }
 
-    if (epsilon > EPSILON_MIN) {
-      epsilon = Math.max(EPSILON_MIN, epsilon * EPSILON_DECAY)
+    if (context.epsilon > EPSILON_MIN) {
+      context.epsilon = Math.max(EPSILON_MIN, context.epsilon * EPSILON_DECAY)
     }
 
-    console.log(`[BrainBot] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${epsilon.toFixed(3)}`)
+    console.log(`[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${context.epsilon.toFixed(3)}`)
     maybeTriggerAutosave()
+    await maybeCompleteGeneration(context)
   } catch (err) {
-    console.error('[BrainBot] Tick error:', err)
+    console.error(`[${label(context)}] Tick error:`, err)
   } finally {
-    tickInFlight = false
+    context.tickInFlight = false
 
-    if (running) {
-      tickTimer = setTimeout(() => {
-        tickTimer = null
-        tickLoop().catch(err => console.error('[BrainBot] Tick scheduling error:', err))
+    if (globalRunning && context.running) {
+      context.tickTimer = setTimeout(() => {
+        context.tickTimer = null
+        tickLoop(context).catch(err => console.error(`[${label(context)}] Tick scheduling error:`, err))
       }, TICK_RATE)
     }
   }
 }
 
-bot.once('spawn', () => {
-  console.log('[BrainBot] Spawned! Waiting for entity to initialize...')
-
-  registry = bot.registry ?? registry
-  if (!registry) {
-    console.warn('[BrainBot] Failed to load registry — crafting actions will be limited.')
+async function maybeCompleteGeneration(context) {
+  if (context.generationTicks < GENERATION_TICKS) {
+    return
   }
 
-  const waitForEntity = setInterval(() => {
-    if (bot?.entity?.position) {
-      clearInterval(waitForEntity)
-      console.log('[BrainBot] Entity ready — starting tick loop!')
+  context.readyForSync = true
+  console.log(`[${label(context)}] Completed generation window with reward ${context.generationReward.toFixed(2)}.`)
+  await synchronizeGeneration()
+}
 
-      // start the main loop
-      tickLoop().catch(err => console.error('[BrainBot] Initial tick error:', err))
+async function synchronizeGeneration() {
+  if (generationSyncInFlight) return
+  if (!contexts.length) return
+  if (!contexts.every(ctx => ctx.readyForSync)) return
+
+  generationSyncInFlight = true
+  try {
+    const sorted = [...contexts].sort((a, b) => b.generationReward - a.generationReward)
+    const topTwo = sorted.slice(0, 2)
+    await ensureBaselineReady()
+
+    if (topTwo.length === 0) {
+      console.warn('[Baseline] No participants available for averaging.')
+      return
     }
-  }, 500)
-})
 
+    if (topTwo.length === 1) {
+      copyWeights(baselineBrain, topTwo[0].brain)
+    } else {
+      averageWeights(baselineBrain, topTwo.map(ctx => ctx.brain))
+    }
 
-// ----------------------------
-// ERROR + SHUTDOWN
-// ----------------------------
-bot.on('error', e => console.error('[BrainBot] Error:', e))
-bot.on('kicked', r => console.error('[BrainBot] Kicked:', r))
+    baselineState.generation += 1
+    console.log(`[Baseline] Generation ${baselineState.generation} | Top rewards: ${topTwo.map(ctx => `${label(ctx)}=${ctx.generationReward.toFixed(2)}`).join(', ')}`)
+
+    for (const ctx of contexts) {
+      if (ctx.brain) {
+        copyWeights(ctx.brain, baselineBrain)
+        if (!topTwo.includes(ctx)) {
+          mutateWeights(ctx.brain, MUTATION_STDDEV)
+        }
+      }
+      ctx.generationTicks = 0
+      ctx.generationReward = 0
+      ctx.readyForSync = false
+    }
+
+    scheduleBaselineSave('generation')
+  } catch (err) {
+    console.error('[Baseline] Failed to synchronize generation:', err)
+  } finally {
+    generationSyncInFlight = false
+  }
+}
+
+function setupRewardTracking(context) {
+  const { bot } = context
+
+  bot.on('blockBreak', block => {
+    if (!block || block.name === 'air') return
+    const value =
+      block.name.includes('ore') ? 2.0 :
+      block.name.includes('stone') ? 1.0 :
+      block.name.includes('dirt') ? 0.5 :
+      0.3
+    context.blockReward += value
+    console.log(`[${label(context)}] Broke ${block.name} → +${value.toFixed(2)} reward`)
+  })
+
+  bot.on('diggingAborted', () => {
+    context.blockReward -= 0.1
+    console.log(`[${label(context)}] Dig aborted → -0.1 penalty`)
+  })
+
+  bot.on('playerCollect', (collector, collected) => {
+    if (collector === bot.entity) {
+      const count = collected?.metadata?.itemCount ?? collected?.count ?? 1
+      const bonus = Math.max(0.3, (count || 1) * 0.15)
+      context.blockReward += bonus
+      console.log(`[${label(context)}] Collected item → +${bonus.toFixed(2)} reward`)
+    }
+  })
+}
+
+function setupBot(context) {
+  const username = context.username
+  console.log(`[${username}] Connecting to ${MC_HOST}:${MC_PORT}`)
+
+  context.bot.once('spawn', () => {
+    console.log(`[${label(context)}] Spawned! Waiting for entity to initialize...`)
+
+    context.registry = context.bot.registry ?? context.registry
+    if (!context.registry) {
+      console.warn(`[${label(context)}] Failed to load registry — crafting actions will be limited.`)
+    }
+
+    const waitForEntity = setInterval(() => {
+      if (context.bot?.entity?.position) {
+        clearInterval(waitForEntity)
+        console.log(`[${label(context)}] Entity ready — starting tick loop!`)
+
+        tickLoop(context).catch(err => console.error(`[${label(context)}] Initial tick error:`, err))
+      }
+    }, 500)
+  })
+
+  context.bot.on('error', e => console.error(`[${label(context)}] Error:`, e))
+  context.bot.on('kicked', r => console.error(`[${label(context)}] Kicked:`, r))
+
+  setupRewardTracking(context)
+}
+
+function createContext(index) {
+  const username = generateRandomName()
+  const bot = mineflayer.createBot({
+    host: MC_HOST,
+    port: MC_PORT,
+    username
+  })
+
+  const context = {
+    id: index,
+    username,
+    bot,
+    brain: null,
+    epsilon: EPSILON_START,
+    running: true,
+    tickTimer: null,
+    tickInFlight: false,
+    registry: null,
+    lastObs: null,
+    lastAction: null,
+    lastPos: null,
+    lastHealth: 20,
+    lastFood: 20,
+    lastInvTotal: 0,
+    blockReward: 0,
+    tickCount: 0,
+    trainingSteps: 0,
+    cumulativeReward: 0,
+    generationTicks: 0,
+    generationReward: 0,
+    readyForSync: false
+  }
+
+  setupBot(context)
+  contexts.push(context)
+  return context
+}
+
+for (let i = 0; i < BOT_COUNT; i++) {
+  createContext(i)
+}
 
 process.stdin.resume()
 process.stdin.setEncoding('utf8')
-  console.log('[BrainBot] Type "pause", "resume", "save", or "exit".')
+console.log('[Brain] Type "pause", "resume", "save", or "exit".')
 
-  process.stdin.on('data', async data => {
-    const cmd = data.trim().toLowerCase()
-    if (cmd === 'pause') {
-      running = false
-    if (tickTimer) {
-      clearTimeout(tickTimer)
-      tickTimer = null
-    }
-    console.log('[BrainBot] Paused. Current tick will finish before stopping.')
-  } else if (cmd === 'resume') {
-    if (!running) {
-      running = true
-      console.log('[BrainBot] Resumed.')
-      if (!tickInFlight && !tickTimer) {
-        tickLoop().catch(err => console.error('[BrainBot] Resume tick error:', err))
+process.stdin.on('data', async data => {
+  const cmd = data.trim().toLowerCase()
+  if (cmd === 'pause') {
+    globalRunning = false
+    for (const ctx of contexts) {
+      ctx.running = false
+      if (ctx.tickTimer) {
+        clearTimeout(ctx.tickTimer)
+        ctx.tickTimer = null
       }
     }
-  } else if (cmd === 'save') {
-    console.log('[BrainBot] Manual save requested...')
-    scheduleBrainSave('manual')
-  } else if (['exit','quit','stop'].includes(cmd)) {
-    console.log('[BrainBot] Saving model + shutting down...')
-    await ensureBrainReady()
-    await flushPendingSave()
-    await persistBrain('shutdown')
-    running = false
-    if (tickTimer) {
-      clearTimeout(tickTimer)
-      tickTimer = null
+    console.log('[Brain] Paused. Current ticks will finish before stopping.')
+  } else if (cmd === 'resume') {
+    if (!globalRunning) {
+      globalRunning = true
+      for (const ctx of contexts) {
+        if (!ctx.running) {
+          ctx.running = true
+          if (!ctx.tickInFlight && !ctx.tickTimer) {
+            tickLoop(ctx).catch(err => console.error(`[${label(ctx)}] Resume tick error:`, err))
+          }
+        }
+      }
+      console.log('[Brain] Resumed.')
     }
-    bot.quit('Manual shutdown')
+  } else if (cmd === 'save') {
+    console.log('[Brain] Manual save requested...')
+    scheduleBaselineSave('manual')
+  } else if (['exit', 'quit', 'stop'].includes(cmd)) {
+    console.log('[Brain] Saving model + shutting down...')
+    globalRunning = false
+    for (const ctx of contexts) {
+      ctx.running = false
+      if (ctx.tickTimer) {
+        clearTimeout(ctx.tickTimer)
+        ctx.tickTimer = null
+      }
+    }
+    await ensureBaselineReady()
+    await flushPendingSave()
+    await persistBaseline('shutdown')
+    for (const ctx of contexts) {
+      try {
+        ctx.bot.quit('Manual shutdown')
+      } catch (err) {
+        console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
+      }
+    }
     process.exit(0)
   }
 })
 
 async function gracefulShutdown(reason = 'signal') {
   try {
-    console.log(`[BrainBot] Caught ${reason}. Saving before exit...`)
-    running = false
-    if (tickTimer) {
-      clearTimeout(tickTimer)
-      tickTimer = null
+    console.log(`[Brain] Caught ${reason}. Saving before exit...`)
+    globalRunning = false
+    for (const ctx of contexts) {
+      ctx.running = false
+      if (ctx.tickTimer) {
+        clearTimeout(ctx.tickTimer)
+        ctx.tickTimer = null
+      }
     }
-    await ensureBrainReady()
+    await ensureBaselineReady()
     await flushPendingSave()
-    await persistBrain(reason)
-    if (bot) {
+    await persistBaseline(reason)
+    for (const ctx of contexts) {
       try {
-        bot.quit(`Shutdown: ${reason}`)
+        ctx.bot.quit(`Shutdown: ${reason}`)
       } catch (err) {
-        console.warn('[BrainBot] Failed to quit bot during shutdown:', err)
+        console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
       }
     }
   } catch (err) {
-    console.error('[BrainBot] Failed during graceful shutdown:', err)
+    console.error('[Brain] Failed during graceful shutdown:', err)
   } finally {
     process.exit(0)
   }

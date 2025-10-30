@@ -104,6 +104,65 @@ export async function chooseAction(model, obs, epsilon = 0.1) {
   return bestIndex
 }
 
+export function copyWeights(target, source) {
+  if (!target || !source) return
+  const weights = source.getWeights()
+  target.setWeights(weights)
+}
+
+export function averageWeights(target, models = []) {
+  if (!target || !models?.length) return
+  const weightsByModel = models.map(model => model.getWeights())
+  if (!weightsByModel.length) return
+
+  const count = weightsByModel.length
+  const weightCount = weightsByModel[0]?.length ?? 0
+  if (!weightCount) return
+
+  const averaged = []
+  for (let i = 0; i < weightCount; i++) {
+    const tensors = weightsByModel.map(group => group[i])
+    const mean = tf.tidy(() => {
+      let sum = tensors[0].clone()
+      for (let j = 1; j < tensors.length; j++) {
+        const next = sum.add(tensors[j])
+        sum.dispose()
+        sum = next
+      }
+      const divisor = tf.scalar(count)
+      const averagedTensor = sum.div(divisor)
+      sum.dispose()
+      divisor.dispose()
+      return averagedTensor
+    })
+
+    tensors.forEach(t => t.dispose())
+    averaged.push(mean)
+  }
+
+  target.setWeights(averaged)
+}
+
+export function mutateWeights(model, stddev = 0.02) {
+  if (!model || !Number.isFinite(stddev) || stddev <= 0) return
+  const weights = model.getWeights()
+  const mutated = []
+
+  for (const weight of weights) {
+    const next = tf.tidy(() => {
+      const noise = tf.randomNormal(weight.shape, 0, stddev)
+      const updated = weight.add(noise)
+      noise.dispose()
+      return updated
+    })
+
+    mutated.push(next)
+    weight.dispose()
+  }
+
+  model.setWeights(mutated)
+}
+
 // ----------------------------
 // TRAINING
 // ----------------------------
