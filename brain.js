@@ -23,54 +23,97 @@ async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true })
 }
 
+function ensureBrainOptimizers(model) {
+  if (!model) return
+
+  if (!model.actionOptimizer) {
+    model.actionOptimizer = tf.train.rmsprop(5e-4)
+  }
+
+  if (!model.predictionOptimizer) {
+    model.predictionOptimizer = tf.train.adam(1e-3)
+  }
+
+  if (!Number.isFinite(model.hebbianRate)) {
+    model.hebbianRate = 5e-4
+  }
+
+  if (!model.featureExtractor) {
+    attachFeatureExtractor(model)
+  }
+
+  if (!model.optimizer) {
+    model.compile({
+      optimizer: model.actionOptimizer,
+      loss: { action_head: 'categoricalCrossentropy', prediction_head: 'meanSquaredError' },
+      lossWeights: { action_head: 1, prediction_head: 0 }
+    })
+  }
+}
+
+function attachFeatureExtractor(model) {
+  if (!model) return
+  try {
+    const policyLayer = model.getLayer('policy_features')
+    if (policyLayer && model.inputs?.length) {
+      model.featureExtractor = tf.model({ inputs: model.inputs[0], outputs: policyLayer.output })
+    }
+  } catch (err) {
+    model.featureExtractor = null
+  }
+}
+
 // ----------------------------
 // MODEL CREATION
 // ----------------------------
 export function createBrain(inputSize, actionCount) {
-  const model = tf.sequential()
+  const input = tf.input({ shape: [inputSize] })
 
-  // Define the input layer explicitly so we can branch the architecture safely
-  model.add(tf.layers.inputLayer({ inputShape: [inputSize] }))
+  let features = input
 
   if (BRAIN_CONFIG.useLSTM) {
-    // Reshape to include a time dimension for the LSTM
-    model.add(tf.layers.reshape({ targetShape: [1, inputSize] }))
-    model.add(tf.layers.lstm({
-      units: BRAIN_CONFIG.hiddenUnits,
-      activation: 'tanh',
-      recurrentActivation: 'sigmoid',
-      returnSequences: false
-    }))
-    // Apply normalization after the recurrent layer to stabilize training
-    model.add(tf.layers.batchNormalization())
+    const reshaped = tf.layers.reshape({ targetShape: [1, inputSize] }).apply(features)
+    const lstm = tf.layers
+      .lstm({
+        units: BRAIN_CONFIG.hiddenUnits,
+        activation: 'tanh',
+        recurrentActivation: 'sigmoid',
+        returnSequences: false
+      })
+      .apply(reshaped)
+    features = tf.layers.batchNormalization().apply(lstm)
   } else {
-    // Normalize the raw observations before feeding the dense stack
-    model.add(tf.layers.batchNormalization())
-    model.add(tf.layers.dense({
-      units: BRAIN_CONFIG.hiddenUnits,
-      activation: 'relu'
-    }))
+    const normalized = tf.layers.batchNormalization().apply(features)
+    features = tf.layers
+      .dense({
+        units: BRAIN_CONFIG.hiddenUnits,
+        activation: 'relu'
+      })
+      .apply(normalized)
   }
 
-  // Optional deeper stack
-  model.add(tf.layers.dropout({ rate: BRAIN_CONFIG.dropoutRate }))
-  model.add(
-    tf.layers.dense({
+  const dropped = tf.layers.dropout({ rate: BRAIN_CONFIG.dropoutRate }).apply(features)
+  const sharedDense = tf.layers
+    .dense({
       units: Math.max(1, Math.floor(BRAIN_CONFIG.hiddenUnits / 2)),
-      activation: 'relu'
+      activation: 'relu',
+      name: 'shared_dense'
     })
-  )
-  model.add(tf.layers.dropout({ rate: BRAIN_CONFIG.dropoutRate }))
+    .apply(dropped)
+  const policyFeatures = tf.layers
+    .dropout({ rate: BRAIN_CONFIG.dropoutRate, name: 'policy_features' })
+    .apply(sharedDense)
 
-  // Output layer — softmax for discrete actions
-  model.add(tf.layers.dense({ units: actionCount, activation: 'softmax' }))
+  const actionHead = tf.layers
+    .dense({ units: actionCount, activation: 'softmax', name: 'action_head' })
+    .apply(policyFeatures)
+  const predictionHead = tf.layers
+    .dense({ units: inputSize, activation: 'linear', name: 'prediction_head' })
+    .apply(policyFeatures)
 
-  // Compile
-  const optimizer = tf.train.rmsprop(5e-4)
-  model.compile({
-    optimizer: optimizer,
-    loss: 'categoricalCrossentropy'
-  })
+  const model = tf.model({ inputs: input, outputs: [actionHead, predictionHead] })
+  attachFeatureExtractor(model)
+  ensureBrainOptimizers(model)
 
   console.log(`[Brain] Created model with ${BRAIN_CONFIG.hiddenUnits} hidden units`)
   return model
@@ -82,8 +125,17 @@ export function createBrain(inputSize, actionCount) {
 export async function chooseAction(model, obs, epsilon = 0.1) {
   const probsArray = tf.tidy(() => {
     const input = tf.tensor(obs, [1, obs.length], 'float32')
-    const prediction = model.predict(input)
-    return prediction.dataSync()
+    const outputs = model.predict(input)
+    let actionTensor = outputs
+    if (Array.isArray(outputs)) {
+      actionTensor = outputs[0]
+      for (let i = 1; i < outputs.length; i++) {
+        outputs[i].dispose?.()
+      }
+    }
+    const data = actionTensor.dataSync()
+    actionTensor.dispose?.()
+    return data
   })
 
   const probs = Array.from(probsArray)
@@ -185,53 +237,205 @@ export function mutateWeights(model, stddev = 0.02) {
 // ----------------------------
 // TRAINING
 // ----------------------------
-export async function trainBrain(model, obs, actionIndex, reward) {
-  if (typeof actionIndex !== 'number' || Number.isNaN(actionIndex)) return false
+export async function trainBrain(model, obs, actionIndex, reward, nextObservation) {
+  ensureBrainOptimizers(model)
 
-  const scaledReward = Math.max(-1, Math.min(1, reward ?? 0))
-
-  if (!Number.isFinite(scaledReward) || scaledReward === 0) {
-    return false
-  }
-
-  const outputShape = model.outputs[0].shape
-  const rawUnits = outputShape ? outputShape[outputShape.length - 1] : null
+  const actionOutput = Array.isArray(model.outputs) ? model.outputs[0] : model.outputs
+  const rawUnits = actionOutput?.shape ? actionOutput.shape[actionOutput.shape.length - 1] : null
 
   if (!Number.isFinite(rawUnits) || rawUnits <= 0) {
     return false
   }
 
   const outputUnits = Math.max(1, Math.floor(rawUnits))
-
   const boundedActionIndex = Math.max(0, Math.min(outputUnits - 1, Math.floor(actionIndex)))
+  const scaledReward = Math.max(-1, Math.min(1, reward ?? 0))
+  const shouldTrainPolicy = Number.isFinite(scaledReward) && scaledReward !== 0
+  const hasNextObservation =
+    Array.isArray(nextObservation) && nextObservation.length === obs.length
+
+  if (!shouldTrainPolicy && !hasNextObservation) {
+    return false
+  }
 
   if (typeof tf.nextFrame === 'function') {
     await tf.nextFrame()
   }
 
   let trained = false
+
   tf.tidy(() => {
     const xs = tf.tensor(obs, [1, obs.length], 'float32')
     const labelBuffer = new Float32Array(outputUnits)
-    labelBuffer[boundedActionIndex] = 1
+    if (Number.isFinite(boundedActionIndex)) {
+      labelBuffer[boundedActionIndex] = 1
+    }
     const ys = tf.tensor(labelBuffer, [1, outputUnits], 'float32')
+    const nextTensor = hasNextObservation
+      ? tf.tensor(nextObservation, [1, nextObservation.length], 'float32')
+      : null
 
-    const minimizeFn = () => {
-      const probs = model.predict(xs)
-      const logProbs = probs.log()
-      const selectedLogProb = logProbs.mul(ys).sum(-1)
-      const scaledLoss = selectedLogProb.mul(-scaledReward)
-      return scaledLoss.mean()
+    if (shouldTrainPolicy) {
+      const lossValue = model.actionOptimizer.minimize(() => {
+        const outputs = model.apply(xs, { training: true })
+        const actionTensor = Array.isArray(outputs) ? outputs[0] : outputs
+        const logProbs = actionTensor.log()
+        const selectedLogProb = logProbs.mul(ys).sum(-1)
+        const scaledLoss = selectedLogProb.mul(-scaledReward)
+        if (Array.isArray(outputs)) {
+          for (let i = 1; i < outputs.length; i++) {
+            outputs[i].dispose?.()
+          }
+        }
+        return scaledLoss.mean()
+      }, true)
+      if (lossValue) {
+        lossValue.dispose()
+      }
+      trained = true
     }
 
-    const lossValue = model.optimizer.minimize(minimizeFn, true)
-    if (lossValue) {
-      lossValue.dispose()
+    if (nextTensor) {
+      const predictionLoss = model.predictionOptimizer.minimize(() => {
+        const outputs = model.apply(xs, { training: true })
+        const predictionTensor = Array.isArray(outputs) ? outputs[1] : outputs
+        if (!predictionTensor) {
+          return tf.scalar(0)
+        }
+        const diff = predictionTensor.sub(nextTensor)
+        const mse = diff.square().mean()
+        diff.dispose()
+        if (Array.isArray(outputs)) {
+          outputs[0]?.dispose?.()
+          for (let i = 2; i < outputs.length; i++) {
+            outputs[i].dispose?.()
+          }
+        }
+        return mse
+      }, true)
+      if (predictionLoss) {
+        predictionLoss.dispose()
+      }
+      trained = true
     }
-    trained = true
+
+    if (model.hebbianRate > 0) {
+      const outputs = model.predict(xs)
+      const actionTensor = Array.isArray(outputs) ? outputs[0] : outputs
+      const predictionTensor = Array.isArray(outputs) ? outputs[1] : null
+      applyHebbianUpdate(model, xs, actionTensor, nextTensor, predictionTensor)
+      if (Array.isArray(outputs)) {
+        for (let i = 0; i < outputs.length; i++) {
+          outputs[i].dispose?.()
+        }
+      } else {
+        outputs.dispose?.()
+      }
+    }
+
+    ys.dispose()
+    nextTensor?.dispose()
   })
 
   return trained
+}
+
+function applyHebbianUpdate(model, inputTensor, actionTensor, nextTensor, predictionTensor) {
+  const rate = Number(model.hebbianRate)
+  if (!Number.isFinite(rate) || rate <= 0) {
+    return
+  }
+
+  const extractor = model.featureExtractor
+  if (!extractor) {
+    return
+  }
+
+  try {
+    const features = extractor.predict(inputTensor)
+    if (!features) {
+      return
+    }
+
+    const featureSize = features.shape?.[features.shape.length - 1]
+    if (!Number.isFinite(featureSize) || featureSize <= 0) {
+      features.dispose?.()
+      return
+    }
+
+    const featureVector = features.reshape([featureSize])
+    const featureColumn = featureVector.expandDims(1)
+
+    const actionUnits = actionTensor?.shape?.[actionTensor.shape.length - 1]
+    if (!Number.isFinite(actionUnits) || actionUnits <= 0) {
+      featureColumn.dispose()
+      featureVector.dispose()
+      features.dispose()
+      return
+    }
+
+    const actionVector = actionTensor.reshape([actionUnits])
+    const actionRow = actionVector.expandDims(0)
+    const hebbianOuter = featureColumn.matMul(actionRow).mul(rate)
+
+    const actionLayer = safeGetLayer(model, 'action_head')
+    if (actionLayer) {
+      const [kernel, bias] = actionLayer.getWeights()
+      const updatedKernel = kernel.add(hebbianOuter)
+      const updatedBias = bias.clone()
+      actionLayer.setWeights([updatedKernel, updatedBias])
+      kernel.dispose()
+      bias.dispose()
+    }
+
+    hebbianOuter.dispose()
+    actionRow.dispose()
+    actionVector.dispose()
+
+    if (nextTensor && predictionTensor) {
+      const targetUnits = nextTensor.shape?.[nextTensor.shape.length - 1]
+      const predictionUnits = predictionTensor.shape?.[predictionTensor.shape.length - 1]
+
+      if (Number.isFinite(targetUnits) && targetUnits > 0 && targetUnits === predictionUnits) {
+        const predictionLayer = safeGetLayer(model, 'prediction_head')
+        if (predictionLayer) {
+          const targetVector = nextTensor.reshape([targetUnits])
+          const predictionVector = predictionTensor.reshape([predictionUnits])
+          const errorVector = targetVector.sub(predictionVector)
+          const predictionRow = errorVector.expandDims(0)
+          const predictionOuter = featureColumn.matMul(predictionRow).mul(rate * 0.5)
+
+          const [predKernel, predBias] = predictionLayer.getWeights()
+          const updatedKernel = predKernel.add(predictionOuter)
+          const biasAdjustment = errorVector.mul(rate * 0.1)
+          const updatedBias = predBias.add(biasAdjustment)
+          predictionLayer.setWeights([updatedKernel, updatedBias])
+          predKernel.dispose()
+          predBias.dispose()
+          predictionOuter.dispose()
+          predictionRow.dispose()
+          biasAdjustment.dispose()
+          errorVector.dispose()
+          targetVector.dispose()
+          predictionVector.dispose()
+        }
+      }
+    }
+
+    featureColumn.dispose()
+    featureVector.dispose()
+    features.dispose()
+  } catch (err) {
+    console.warn('[Brain] Hebbian update skipped due to error:', err)
+  }
+}
+
+function safeGetLayer(model, name) {
+  try {
+    return model?.getLayer?.(name)
+  } catch (err) {
+    return null
+  }
 }
 
 // ----------------------------
@@ -302,13 +506,44 @@ export async function loadBrain(dir = DEFAULT_BRAIN_DIR) {
       }
     })
 
-    const model = await tf.loadLayersModel(handler)
-    if (!model.optimizer) {
-      const optimizer = tf.train.rmsprop(5e-4)
-      model.compile({ optimizer, loss: 'categoricalCrossentropy' })
+    const loadedModel = await tf.loadLayersModel(handler)
+    let finalModel = loadedModel
+
+    if (!Array.isArray(loadedModel.outputs) || loadedModel.outputs.length < 2) {
+      console.warn('[Brain] Loaded legacy single-head model, migrating to dual-head architecture.')
+      const inputShape = loadedModel.inputs?.[0]?.shape
+      const actionShape = loadedModel.outputs?.[0]?.shape
+      const inputSize = inputShape ? inputShape[inputShape.length - 1] : null
+      const actionUnits = actionShape ? actionShape[actionShape.length - 1] : null
+
+      if (Number.isFinite(inputSize) && Number.isFinite(actionUnits)) {
+        const upgraded = createBrain(inputSize, actionUnits)
+        const legacyWeights = loadedModel.getWeights()
+        const upgradedWeights = upgraded.getWeights()
+        const assignable = Math.min(legacyWeights.length, upgradedWeights.length)
+        const weightsToAssign = upgradedWeights.map((tensor, idx) => {
+          if (idx < assignable) {
+            tensor.dispose()
+            return legacyWeights[idx]
+          }
+          return tensor
+        })
+        upgraded.setWeights(weightsToAssign)
+        for (let i = assignable; i < legacyWeights.length; i++) {
+          legacyWeights[i].dispose()
+        }
+        finalModel = upgraded
+        loadedModel.dispose()
+      } else {
+        console.warn('[Brain] Could not determine legacy model dimensions. Creating fresh brain.')
+        loadedModel.dispose()
+        return null
+      }
     }
+
+    ensureBrainOptimizers(finalModel)
     console.log(`[Brain] Loaded model from ${resolved}`)
-    return model
+    return finalModel
   } catch (err) {
     console.warn('[Brain] No saved model found, creating new one.')
     return null

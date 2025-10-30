@@ -69,6 +69,7 @@ const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
 const OBS_SIZE = 22
+const MAX_USERNAME_LENGTH = 16
 
 // ----------------------------
 // GLOBAL STATE
@@ -96,6 +97,81 @@ let generationSyncInFlight = false
 // ----------------------------
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+function sanitizeNetworkString(value, {
+  fallback = '',
+  maxLength = 64,
+  allowed = /[0-9A-Za-z_\-]/,
+  label = 'value'
+} = {}) {
+  let raw = ''
+  if (typeof value === 'string') {
+    raw = value
+  } else if (value != null && typeof value.toString === 'function') {
+    raw = value.toString()
+  }
+
+  if (!raw) {
+    if (!fallback) return ''
+    const trimmedFallback = fallback.slice(0, maxLength)
+    console.warn(`[NetworkGuard] Missing ${label}, using fallback "${trimmedFallback}".`)
+    return trimmedFallback
+  }
+
+  let sanitized = ''
+  const normalized = raw.normalize('NFKC')
+  for (const ch of normalized) {
+    if (allowed instanceof RegExp) {
+      allowed.lastIndex = 0
+      if (!allowed.test(ch)) continue
+    }
+    sanitized += ch
+    if (sanitized.length >= maxLength) break
+  }
+
+  if (!sanitized) {
+    if (!fallback) {
+      console.warn(`[NetworkGuard] Dropped invalid ${label} "${raw}".`)
+      return ''
+    }
+    const trimmedFallback = fallback.slice(0, maxLength)
+    console.warn(`[NetworkGuard] Sanitized ${label} "${raw}" to fallback "${trimmedFallback}".`)
+    return trimmedFallback
+  }
+
+  if (sanitized !== raw) {
+    console.warn(`[NetworkGuard] Sanitized ${label}: "${raw}" → "${sanitized}".`)
+  }
+
+  return sanitized
+}
+
+function sanitizeNetworkPort(value, fallback = 25565) {
+  const numeric = Number(value)
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= 65535) {
+    return numeric
+  }
+  console.warn(`[NetworkGuard] Invalid port "${value}". Using fallback ${fallback}.`)
+  return fallback
+}
+
+const NETWORK_HOST = sanitizeNetworkString(MC_HOST, {
+  fallback: 'localhost',
+  maxLength: 255,
+  allowed: /[0-9A-Za-z.\-:]/,
+  label: 'host'
+})
+
+const NETWORK_PORT = sanitizeNetworkPort(MC_PORT, 25565)
+
+function safeDisconnectReason(reason, fallback = 'shutdown') {
+  return sanitizeNetworkString(reason, {
+    fallback,
+    maxLength: 64,
+    allowed: /[0-9A-Za-z _\-.:]/,
+    label: 'disconnect reason'
+  })
+}
+
 function generateRandomName() {
   let attempt = 0
   while (attempt < 25) {
@@ -103,13 +179,35 @@ function generateRandomName() {
     const rock = ROCK_PARTS[Math.floor(Math.random() * ROCK_PARTS.length)] ?? 'Stone'
     const suffix = SUFFIXES[Math.floor(Math.random() * SUFFIXES.length)] ?? 'son'
     const candidate = `${prefix}${rock}${suffix}`
-    if (!usedNames.has(candidate)) {
-      usedNames.add(candidate)
-      return candidate
+    const sanitized = sanitizeNetworkString(candidate, {
+      fallback: '',
+      maxLength: MAX_USERNAME_LENGTH,
+      allowed: /[0-9A-Za-z_\-]/,
+      label: 'username'
+    })
+    if (sanitized && !usedNames.has(sanitized)) {
+      usedNames.add(sanitized)
+      return sanitized
     }
     attempt += 1
   }
-  return `BrainBot${Math.floor(Math.random() * 10000)}`
+  let fallbackName = ''
+  let safety = 0
+  while (!fallbackName || usedNames.has(fallbackName)) {
+    if (safety > 50) {
+      fallbackName = 'BrainBot'
+      break
+    }
+    fallbackName = sanitizeNetworkString(`BrainBot${Math.floor(Math.random() * 100000)}`, {
+      fallback: 'BrainBot',
+      maxLength: MAX_USERNAME_LENGTH,
+      allowed: /[0-9A-Za-z_\-]/,
+      label: 'username'
+    })
+    safety += 1
+  }
+  usedNames.add(fallbackName)
+  return fallbackName
 }
 
 function label(context) {
@@ -676,7 +774,13 @@ async function tickLoop(context) {
 
     let trained = false
     if (context.lastObs && context.lastAction != null) {
-      trained = await trainBrain(context.brain, context.lastObs, context.lastAction, reward)
+      trained = await trainBrain(
+        context.brain,
+        context.lastObs,
+        context.lastAction,
+        reward,
+        observation
+      )
     }
 
     const action = await chooseAction(context.brain, observation, context.epsilon)
@@ -803,7 +907,7 @@ function setupRewardTracking(context) {
 
 function setupBot(context) {
   const username = context.username
-  console.log(`[${username}] Connecting to ${MC_HOST}:${MC_PORT}`)
+  console.log(`[${username}] Connecting to ${NETWORK_HOST}:${NETWORK_PORT}`)
 
   context.bot.once('spawn', () => {
     console.log(`[${label(context)}] Spawned! Waiting for entity to initialize...`)
@@ -832,8 +936,8 @@ function setupBot(context) {
 function createContext(index) {
   const username = generateRandomName()
   const bot = mineflayer.createBot({
-    host: MC_HOST,
-    port: MC_PORT,
+    host: NETWORK_HOST,
+    port: NETWORK_PORT,
     username
   })
 
@@ -918,7 +1022,7 @@ process.stdin.on('data', async data => {
     await persistBaseline('shutdown')
     for (const ctx of contexts) {
       try {
-        ctx.bot.quit('Manual shutdown')
+        ctx.bot.quit(safeDisconnectReason('Manual shutdown'))
       } catch (err) {
         console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
       }
@@ -943,7 +1047,7 @@ async function gracefulShutdown(reason = 'signal') {
     await persistBaseline(reason)
     for (const ctx of contexts) {
       try {
-        ctx.bot.quit(`Shutdown: ${reason}`)
+        ctx.bot.quit(safeDisconnectReason(`Shutdown: ${reason}`))
       } catch (err) {
         console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
       }
