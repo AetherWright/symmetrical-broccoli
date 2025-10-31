@@ -61,6 +61,19 @@ const TOOL_TYPE_WEIGHTS = {
   shears: 30
 }
 
+const FATAL_RECOVERY_COOLDOWN_MS = Math.max(
+  5000,
+  Math.floor(readNumberEnv('BOT_RECOVERY_COOLDOWN_MS', 15000, { min: 1000 }))
+)
+const FATAL_RECOVERY_RESTART_DELAY_MS = Math.max(
+  2000,
+  Math.floor(readNumberEnv('BOT_RECOVERY_RESTART_DELAY_MS', 5000, { min: 1000 }))
+)
+const FATAL_RECOVERY_MAX_ATTEMPTS = Math.max(
+  1,
+  Math.floor(readNumberEnv('BOT_RECOVERY_MAX_ATTEMPTS', 5, { min: 1 }))
+)
+
 const HUNGER_EAT_THRESHOLD = Math.max(12, parseInt(process.env.BOT_AUTOEAT_THRESHOLD ?? '14', 10))
 const HUNGER_CRITICAL_THRESHOLD = Math.max(6, Math.min(HUNGER_EAT_THRESHOLD - 2, parseInt(process.env.BOT_HUNGER_CRITICAL ?? '8', 10)))
 const AUTO_EAT_CHECK_INTERVAL_MS = 2500
@@ -497,6 +510,9 @@ let pendingSaveReason = null
 let generationSyncInFlight = false
 let stagnantGenerations = 0
 let bestGenerationReward = -Infinity
+let fatalRecoveryInProgress = false
+let fatalRecoveryAttempts = 0
+let lastFatalRecoveryAt = 0
 
 // ----------------------------
 // HELPERS
@@ -867,6 +883,49 @@ async function flushPendingSave() {
       await saveInFlight
     } catch (err) {
       console.error('[Baseline] Pending save failed:', err)
+    }
+  }
+}
+
+async function safePersistState(reason = 'recovery') {
+  try {
+    await flushPendingSave()
+  } catch (err) {
+    console.error(`[Baseline] Failed to flush pending save during ${reason}:`, err)
+  }
+
+  if (!isRemoteBrainConnected()) {
+    const status = getRemoteBrainStatus()
+    console.warn(
+      `[Baseline] Remote brain unavailable during ${reason} save (${describeRemoteRetry(status)}).`
+    )
+    return
+  }
+
+  try {
+    await ensureBaselineReady()
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      const status = getRemoteBrainStatus()
+      console.warn(
+        `[Baseline] Baseline unavailable for ${reason} save (${describeRemoteRetry(status)}).`
+      )
+      return
+    }
+    console.error(`[Baseline] Failed to prepare baseline for ${reason} save:`, err)
+    return
+  }
+
+  try {
+    await persistBaseline(reason)
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      const status = getRemoteBrainStatus()
+      console.warn(
+        `[Baseline] Skipping ${reason} save: remote brain unavailable (${describeRemoteRetry(status)}).`
+      )
+    } else {
+      console.error(`[Baseline] Failed to persist baseline during ${reason}:`, err)
     }
   }
 }
@@ -2946,6 +3005,120 @@ async function retireContext(context, reason = 'retire') {
   }
 }
 
+async function restartAllBots(reason = 'recovery', { resume } = {}) {
+  const desiredRunning = resume ?? globalRunning
+  const enforceLimit = typeof reason === 'string' && reason.startsWith('fatal')
+  if (enforceLimit && fatalRecoveryAttempts >= FATAL_RECOVERY_MAX_ATTEMPTS) {
+    console.error(
+      `[Brain] Maximum recovery attempts (${FATAL_RECOVERY_MAX_ATTEMPTS}) reached. Skipping ${reason} restart.`
+    )
+    return
+  }
+
+  console.warn(`[Brain] Restarting bot population due to ${reason}.`)
+
+  globalRunning = false
+
+  const active = [...contexts]
+  for (const ctx of active) {
+    try {
+      await retireContext(ctx, reason)
+    } catch (err) {
+      console.error(`[Brain] Failed retiring ${label(ctx)} during restart:`, err)
+    }
+  }
+
+  contexts.length = 0
+
+  try {
+    await ensureBaselineReady()
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      const status = getRemoteBrainStatus()
+      console.warn(
+        `[Brain] Baseline unavailable while restarting (${describeRemoteRetry(status)}). Proceeding with fresh contexts.`
+      )
+    } else {
+      console.error('[Brain] Failed to prepare baseline during restart:', err)
+    }
+  }
+
+  if (FATAL_RECOVERY_RESTART_DELAY_MS > 0) {
+    await sleep(FATAL_RECOVERY_RESTART_DELAY_MS)
+  }
+
+  globalRunning = desiredRunning
+
+  for (let i = 0; i < BOT_COUNT; i++) {
+    const seedMutation = deriveMutationStddev(null, { jitter: true }) ?? NEW_BRAIN_MUTATION_STDDEV
+    try {
+      const ctx = createContext(i, { mutationStddev: seedMutation })
+      if (ctx && !desiredRunning) {
+        ctx.running = false
+      }
+    } catch (err) {
+      console.error(`[Brain] Failed spawning context ${i} during restart:`, err)
+    }
+  }
+
+  console.log(
+    `[Brain] Restart complete (${contexts.length} bots active, running=${desiredRunning}).`
+  )
+}
+
+async function handleFatalProcessError(source, error) {
+  const now = Date.now()
+
+  if (fatalRecoveryInProgress) {
+    console.error(`[Brain] Additional fatal ${source} while recovery is in progress:`, error)
+    return
+  }
+
+  if (now - lastFatalRecoveryAt > FATAL_RECOVERY_COOLDOWN_MS * 4) {
+    fatalRecoveryAttempts = 0
+  }
+
+  if (fatalRecoveryAttempts >= FATAL_RECOVERY_MAX_ATTEMPTS) {
+    console.error(
+      `[Brain] Fatal ${source} detected but maximum recoveries reached (${FATAL_RECOVERY_MAX_ATTEMPTS}).`,
+      error
+    )
+    return
+  }
+
+  if (now - lastFatalRecoveryAt < FATAL_RECOVERY_COOLDOWN_MS) {
+    console.error(
+      `[Brain] Fatal ${source} occurred within recovery cooldown (${FATAL_RECOVERY_COOLDOWN_MS}ms). Skipping restart.`,
+      error
+    )
+    return
+  }
+
+  fatalRecoveryInProgress = true
+  fatalRecoveryAttempts += 1
+  lastFatalRecoveryAt = now
+
+  const wasRunning = globalRunning
+  console.error(
+    `[Brain] Fatal ${source} detected. Attempting automated recovery (#${fatalRecoveryAttempts}).`,
+    error
+  )
+
+  try {
+    await safePersistState(`fatal-${source}`)
+  } catch (persistErr) {
+    console.error('[Brain] Recovery save step failed:', persistErr)
+  }
+
+  try {
+    await restartAllBots(`fatal-${source}`, { resume: wasRunning })
+  } catch (restartErr) {
+    console.error('[Brain] Automated restart failed:', restartErr)
+  } finally {
+    fatalRecoveryInProgress = false
+  }
+}
+
 function createContext(index, options = {}) {
   const parent = options.parent ?? null
   let mode = options.mode ?? null
@@ -3098,7 +3271,7 @@ for (let i = 0; i < BOT_COUNT; i++) {
 
 process.stdin.resume()
 process.stdin.setEncoding('utf8')
-console.log('[Brain] Type "pause", "resume", "save", or "exit".')
+console.log('[Brain] Type "pause", "resume", "save", "restart", or "exit".')
 
 process.stdin.on('data', async data => {
   const cmd = data.trim().toLowerCase()
@@ -3124,6 +3297,19 @@ process.stdin.on('data', async data => {
         }
       }
       console.log('[Brain] Resumed.')
+    }
+  } else if (cmd === 'restart') {
+    const wasRunning = globalRunning
+    console.log('[Brain] Manual restart requested...')
+    try {
+      await safePersistState('manual-restart')
+    } catch (err) {
+      console.error('[Brain] Manual restart save failed:', err)
+    }
+    try {
+      await restartAllBots('manual-restart', { resume: wasRunning })
+    } catch (err) {
+      console.error('[Brain] Manual restart failed:', err)
     }
   } else if (cmd === 'save') {
     console.log('[Brain] Manual save requested...')
@@ -3165,6 +3351,19 @@ process.stdin.on('data', async data => {
     }
     process.exit(0)
   }
+})
+
+process.on('uncaughtException', err => {
+  handleFatalProcessError('uncaughtException', err).catch(recoveryErr => {
+    console.error('[Brain] Uncaught exception recovery handler failed:', recoveryErr)
+  })
+})
+
+process.on('unhandledRejection', reason => {
+  const error = reason instanceof Error ? reason : new Error(`Unhandled rejection: ${String(reason)}`)
+  handleFatalProcessError('unhandledRejection', error).catch(recoveryErr => {
+    console.error('[Brain] Unhandled rejection recovery handler failed:', recoveryErr)
+  })
 })
 
 async function gracefulShutdown(reason = 'signal') {
