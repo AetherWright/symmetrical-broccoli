@@ -147,8 +147,25 @@ class LookaheadOptimizer:
                 continue
             self._fast_vars.append(var)
             initial_value = self._read_variable(var)
-            self._slow_vars.append(tf.Variable(initial_value, trainable=False))
+            var_dtype = getattr(var, "dtype", None)
+            if var_dtype is not None:
+                slow_var = tf.Variable(initial_value, dtype=var_dtype, trainable=False)
+            else:
+                slow_var = tf.Variable(initial_value, trainable=False)
+            self._slow_vars.append(slow_var)
             self._fast_var_ids[var_id] = len(self._fast_vars) - 1
+
+    def sync_slow_variables(self, variables=None):
+        if variables is None:
+            variables = list(self._fast_vars)
+        else:
+            self._ensure_slot_variables(variables)
+        for var in variables:
+            index = self._fast_var_ids.get(id(var))
+            if index is None:
+                continue
+            fast_value = self._read_variable(self._fast_vars[index])
+            self._slow_vars[index].assign(fast_value)
 
     def apply_gradients(self, grads_and_vars):
         if not grads_and_vars:
@@ -261,6 +278,7 @@ class RemoteBrain:
             with second._lock:
                 weights = other.model.get_weights()
                 self.model.set_weights(weights)
+                self.optimizer.sync_slow_variables(self.model.trainable_variables)
 
     def average_from(self, sources):
         if not sources:
@@ -274,14 +292,26 @@ class RemoteBrain:
                     weights.append(source.model.get_weights())
             if not weights:
                 return
-            averaged = [np.mean(np.stack(layer_weights, axis=0), axis=0) for layer_weights in zip(*weights)]
+            averaged = []
+            for layer_weights in zip(*weights):
+                layer_stack = np.stack(layer_weights, axis=0)
+                averaged_layer = layer_stack.mean(axis=0)
+                if averaged_layer.dtype != layer_stack.dtype:
+                    averaged_layer = averaged_layer.astype(layer_stack.dtype)
+                averaged.append(averaged_layer)
             self.model.set_weights(averaged)
+            self.optimizer.sync_slow_variables(self.model.trainable_variables)
 
     def mutate(self, stddev):
         with self._lock:
             weights = self.model.get_weights()
-            mutated = [w + np.random.normal(0, stddev, size=w.shape) for w in weights]
+            mutated = []
+            for weight in weights:
+                noise = np.random.normal(0, stddev, size=weight.shape).astype(weight.dtype, copy=False)
+                mutated_weight = (weight + noise).astype(weight.dtype, copy=False)
+                mutated.append(mutated_weight)
             self.model.set_weights(mutated)
+            self.optimizer.sync_slow_variables(self.model.trainable_variables)
 
     def save(self, directory):
         with self._lock:
@@ -296,6 +326,7 @@ class RemoteBrain:
             weights_path = os.path.join(directory, "weights.h5")
             if os.path.exists(weights_path):
                 self.model.load_weights(weights_path)
+                self.optimizer.sync_slow_variables(self.model.trainable_variables)
 
 
 def require_brain(brain_id):
