@@ -127,19 +127,19 @@ class LookaheadOptimizer:
         self.slow_step_size = float(slow_step_size)
         self._fast_vars = []
         self._slow_vars = []
-        self._fast_var_refs = set()
+        self._fast_var_ids = {}
         self._step = 0
 
     def _ensure_slot_variables(self, variables):
         for var in variables:
-            var_ref = var.ref()
-            if var_ref in self._fast_var_refs:
+            var_id = id(var)
+            if var_id in self._fast_var_ids:
                 continue
             self._fast_vars.append(var)
             self._slow_vars.append(
                 tf.Variable(var.read_value(), trainable=False)
             )
-            self._fast_var_refs.add(var_ref)
+            self._fast_var_ids[var_id] = len(self._fast_vars) - 1
 
     def apply_gradients(self, grads_and_vars):
         if not grads_and_vars:
