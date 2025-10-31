@@ -15,6 +15,8 @@ import {
   loadBrainState,
   DEFAULT_BRAIN_DIR,
   mutateWeights,
+  averageWeights,
+  copyWeights,
   isRemoteBrainConnected,
   getRemoteBrainStatus,
   RemoteBrainUnavailableError
@@ -30,6 +32,15 @@ const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
 const PREFIXES = ['', 'Mc', 'Von', 'De', "O'", 'El']
+
+const LINEAGE_ROOT_NAME = 'VonBasaltdeep'
+const FERAL_DEFAULT_RATIO = Math.min(0.5, Math.max(0, Number.parseFloat(process.env.FERAL_RATIO ?? '0.2')))
+const FERAL_INTERVAL = Math.max(2, Math.round(1 / (FERAL_DEFAULT_RATIO || 0.2)))
+const EMOTION_DECAY = 0.92
+const MORALE_BASELINE = 0.55
+const REWARD_MUTATION_INTERVAL = Math.max(500, parseInt(process.env.REWARD_MUTATION_INTERVAL ?? '2500', 10))
+const REWARD_MUTATION_JITTER = Math.max(100, parseInt(process.env.REWARD_MUTATION_JITTER ?? '600', 10))
+const CROSSOVER_GENERATION_INTERVAL = Math.max(1, parseInt(process.env.CROSSOVER_INTERVAL ?? '5', 10))
 
 const pipelineAsync = promisify(pipeline)
 
@@ -232,7 +243,8 @@ const EPSILON_BOOST_DECAY = 0.995
 const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
-const OBS_SIZE = 34
+const EMOTION_VECTOR_SIZE = 3
+const OBS_SIZE = 44
 const NOVELTY_HASH_PRECISION = 2
 const NOVELTY_TARGET = 500
 const STAGNATION_WINDOW = 40
@@ -242,12 +254,15 @@ const DIVERSITY_WINDOW = 60
 const MAX_BOTS = Math.max(BOT_COUNT, parseInt(process.env.BOT_MAX ?? '8', 10))
 const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
 const MAX_USERNAME_LENGTH = 16
+const RESOURCE_TYPES = ['wood', 'stone', 'ore', 'crafted']
 
 // ----------------------------
 // GLOBAL STATE
 // ----------------------------
 const contexts = []
 const usedNames = new Set()
+const lineageStats = new Map()
+const lineageCounters = new Map([[LINEAGE_ROOT_NAME, 0]])
 let globalRunning = true
 let baselineBrain = null
 let baselineReady = null
@@ -259,8 +274,21 @@ const GLOBAL_RESOURCE_POOL = {
   ore: 0,
   crafted: 0,
   totalContribution: 0,
-  totalWithdrawal: 0
+  totalWithdrawal: 0,
+  diversity: new Set()
 }
+const rewardProfile = {
+  novelty: 1,
+  cooperation: 1,
+  entropy: 1,
+  skill: 1,
+  resource: 1,
+  lineage: 1,
+  feral: 1.15,
+  morale: 1
+}
+let nextRewardMutationTick = REWARD_MUTATION_INTERVAL
+const crossoverBrains = []
 let baselineState = {
   epsilon: EPSILON_START,
   tickCount: 0,
@@ -356,46 +384,118 @@ function safeDisconnectReason(reason, fallback = 'shutdown') {
   })
 }
 
-function generateRandomName() {
+function romanNumeral(value) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return `${Math.max(1, Math.floor(Math.abs(value) || 1))}`
+  }
+  const numerals = [
+    [1000, 'M'],
+    [900, 'CM'],
+    [500, 'D'],
+    [400, 'CD'],
+    [100, 'C'],
+    [90, 'XC'],
+    [50, 'L'],
+    [40, 'XL'],
+    [10, 'X'],
+    [9, 'IX'],
+    [5, 'V'],
+    [4, 'IV'],
+    [1, 'I']
+  ]
+  let remaining = Math.floor(value)
+  let output = ''
+  for (const [step, glyph] of numerals) {
+    while (remaining >= step) {
+      output += glyph
+      remaining -= step
+    }
+  }
+  return output || 'I'
+}
+
+function ensureLineageRecord(name) {
+  const lineageName = name || LINEAGE_ROOT_NAME
+  let stats = lineageStats.get(lineageName)
+  if (!stats) {
+    stats = {
+      createdAtGeneration: baselineState.generation,
+      survivalStreak: 0,
+      prestige: 0,
+      births: 0,
+      lastSeenGeneration: baselineState.generation
+    }
+    lineageStats.set(lineageName, stats)
+  }
+  return stats
+}
+
+function formatLineageName(base, ordinal) {
+  if (ordinal <= 1) {
+    return base
+  }
+  const suffix = `-${romanNumeral(ordinal)}`
+  let workingBase = base
+  let candidate = `${workingBase}${suffix}`
+  if (candidate.length > MAX_USERNAME_LENGTH) {
+    const overflow = candidate.length - MAX_USERNAME_LENGTH
+    workingBase = workingBase.slice(0, Math.max(3, workingBase.length - overflow))
+    candidate = `${workingBase}${suffix}`
+    if (candidate.length > MAX_USERNAME_LENGTH) {
+      candidate = `${workingBase}${suffix.replace('-', '')}`
+    }
+    if (candidate.length > MAX_USERNAME_LENGTH) {
+      candidate = candidate.slice(0, MAX_USERNAME_LENGTH)
+    }
+  }
+  return candidate
+}
+
+function allocateLineageIdentity({ parentLineage = LINEAGE_ROOT_NAME, mode = 'civilized' } = {}) {
+  const lineage = parentLineage || LINEAGE_ROOT_NAME
+  ensureLineageRecord(lineage)
+  let ordinal = (lineageCounters.get(lineage) ?? 0) + 1
   let attempt = 0
-  while (attempt < 25) {
-    const prefix = PREFIXES[Math.floor(Math.random() * PREFIXES.length)] ?? ''
-    const rock = ROCK_PARTS[Math.floor(Math.random() * ROCK_PARTS.length)] ?? 'Stone'
-    const suffix = SUFFIXES[Math.floor(Math.random() * SUFFIXES.length)] ?? 'son'
-    const candidate = `${prefix}${rock}${suffix}`
-    const sanitized = sanitizeNetworkString(candidate, {
-      fallback: '',
+  while (attempt < 50) {
+    const rawName = formatLineageName(lineage, ordinal)
+    const sanitized = sanitizeNetworkString(rawName, {
+      fallback: rawName,
       maxLength: MAX_USERNAME_LENGTH,
       allowed: /[0-9A-Za-z_\-]/,
       label: 'username'
     })
     if (sanitized && !usedNames.has(sanitized)) {
       usedNames.add(sanitized)
-      return sanitized
+      lineageCounters.set(lineage, ordinal)
+      const stats = ensureLineageRecord(lineage)
+      stats.births = (stats.births ?? 0) + 1
+      stats.lastSeenGeneration = baselineState.generation
+      return { username: sanitized, lineage, ordinal }
     }
+    ordinal += 1
     attempt += 1
   }
-  let fallbackName = ''
-  let safety = 0
-  while (!fallbackName || usedNames.has(fallbackName)) {
-    if (safety > 50) {
-      fallbackName = 'BrainBot'
-      break
-    }
-    fallbackName = sanitizeNetworkString(`BrainBot${Math.floor(Math.random() * 100000)}`, {
-      fallback: 'BrainBot',
-      maxLength: MAX_USERNAME_LENGTH,
-      allowed: /[0-9A-Za-z_\-]/,
-      label: 'username'
-    })
-    safety += 1
-  }
-  usedNames.add(fallbackName)
-  return fallbackName
+  const fallback = sanitizeNetworkString(`BrainBot${Math.floor(Math.random() * 100000)}`, {
+    fallback: 'BrainBot',
+    maxLength: MAX_USERNAME_LENGTH,
+    allowed: /[0-9A-Za-z_\-]/,
+    label: 'username'
+  })
+  usedNames.add(fallback)
+  const stats = ensureLineageRecord(lineage)
+  stats.births = (stats.births ?? 0) + 1
+  stats.lastSeenGeneration = baselineState.generation
+  return { username: fallback, lineage, ordinal }
+}
+
+function generateRandomName(options = {}) {
+  const { username } = allocateLineageIdentity(options)
+  return username
 }
 
 function label(context) {
-  return `${context.username}`
+  if (!context) return 'unknown'
+  return context.mode === 'feral' ? `${context.username}[F]` : `${context.username}`
 }
 
 async function initializeBaselineBrain() {
@@ -704,6 +804,162 @@ function updateCooperationScore(context) {
   context.cooperationScore = fairness
 }
 
+function noteResourceDiversity(type) {
+  if (!type || !RESOURCE_TYPES.includes(type)) return
+  const pool = GLOBAL_RESOURCE_POOL
+  if ((pool[type] ?? 0) <= 0) return
+  if (!pool.diversity.has(type)) {
+    pool.diversity.add(type)
+    const bonus = 0.08
+    for (const ctx of contexts) {
+      ctx.blockReward += bonus
+    }
+    console.log(`[Resource] Diversity bonus unlocked for ${type} (${pool.diversity.size}/${RESOURCE_TYPES.length}).`)
+  }
+}
+
+function ensureEmotionVector(context) {
+  if (!(context.emotion instanceof Float32Array) || context.emotion.length !== EMOTION_VECTOR_SIZE) {
+    context.emotion = new Float32Array(EMOTION_VECTOR_SIZE)
+    for (let i = 0; i < EMOTION_VECTOR_SIZE; i++) {
+      context.emotion[i] = MORALE_BASELINE
+    }
+  }
+  return context.emotion
+}
+
+function adjustMorale(context, reward) {
+  if (!context.morale) {
+    context.morale = {
+      value: MORALE_BASELINE,
+      frustration: 0,
+      sharpness: 0.5,
+      successStreak: 0,
+      failureStreak: 0
+    }
+  }
+
+  const morale = context.morale
+  const bounded = Math.max(-2, Math.min(2, reward))
+
+  if (bounded > 0.2) {
+    morale.value = Math.min(1, morale.value + 0.04 + bounded * 0.02)
+    morale.frustration = Math.max(0, morale.frustration - 0.03)
+    morale.successStreak = (morale.successStreak ?? 0) + 1
+    morale.failureStreak = 0
+    morale.sharpness = Math.min(1, (morale.sharpness ?? 0.5) + 0.05)
+  } else if (bounded < -0.2) {
+    morale.value = Math.max(0, morale.value - 0.05 - Math.abs(bounded) * 0.02)
+    morale.frustration = Math.min(1, morale.frustration + 0.04 + Math.abs(bounded) * 0.01)
+    morale.failureStreak = (morale.failureStreak ?? 0) + 1
+    morale.successStreak = 0
+    morale.sharpness = Math.max(0, (morale.sharpness ?? 0.5) - 0.06)
+  } else {
+    morale.value = morale.value * 0.98 + MORALE_BASELINE * 0.02
+    morale.frustration *= 0.96
+    morale.sharpness = (morale.sharpness ?? 0.5) * 0.97 + 0.5 * 0.03
+    morale.successStreak = Math.max(0, (morale.successStreak ?? 0) - 1)
+    morale.failureStreak = Math.max(0, (morale.failureStreak ?? 0) - 1)
+  }
+
+  const frustrationPenalty = 1 - Math.min(0.6, morale.frustration * 0.4)
+  const moraleBoost = 1 + (morale.value - MORALE_BASELINE) * 0.25
+  const sharpnessBoost = 1 + ((morale.sharpness ?? 0.5) - 0.5) * 0.15
+  let modified = reward * moraleBoost * frustrationPenalty * sharpnessBoost * rewardProfile.morale
+
+  if (!Number.isFinite(modified)) {
+    modified = reward
+  }
+
+  const emotion = ensureEmotionVector(context)
+  const targets = [morale.value, morale.frustration, morale.sharpness ?? 0.5]
+  for (let i = 0; i < EMOTION_VECTOR_SIZE; i++) {
+    emotion[i] = emotion[i] * EMOTION_DECAY + targets[i] * (1 - EMOTION_DECAY)
+  }
+
+  return modified
+}
+
+function mutateRewardProfile() {
+  const adjustments = []
+  for (const key of Object.keys(rewardProfile)) {
+    const jitter = (Math.random() - 0.5) * 0.18
+    const next = rewardProfile[key] * (1 + jitter)
+    rewardProfile[key] = Math.min(1.8, Math.max(0.4, next))
+    adjustments.push(`${key}=${rewardProfile[key].toFixed(2)}`)
+  }
+  const jitterDelay = Math.floor(Math.random() * REWARD_MUTATION_JITTER)
+  nextRewardMutationTick = baselineState.tickCount + REWARD_MUTATION_INTERVAL + jitterDelay
+  console.log(`[Baseline] Reward profile nudged: ${adjustments.join(', ')}`)
+}
+
+function getLineagePrestige(lineage) {
+  const stats = lineageStats.get(lineage)
+  return stats?.prestige ?? 0
+}
+
+async function ensureCrossoverBrain(slot) {
+  while (crossoverBrains.length <= slot) {
+    crossoverBrains.push(null)
+  }
+  if (crossoverBrains[slot]) {
+    return crossoverBrains[slot]
+  }
+  try {
+    const brain = await createBrain(OBS_SIZE, ACTIONS.length)
+    crossoverBrains[slot] = brain
+    return brain
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      throw err
+    }
+    console.error('[Baseline] Failed to provision crossover brain:', err)
+    return null
+  }
+}
+
+async function performPopulationCrossover(sortedContexts) {
+  if (!baselineBrain) return
+  if (!Array.isArray(sortedContexts) || !sortedContexts.length) return
+
+  const midIndex = Math.max(1, Math.floor(sortedContexts.length / 2))
+  const peers = sortedContexts.slice(midIndex, midIndex + 2)
+  const clones = []
+
+  for (let i = 0; i < peers.length; i++) {
+    try {
+      const clone = await ensureCrossoverBrain(i)
+      if (!clone) continue
+      await copyWeights(clone, baselineBrain)
+      const targetReward = peers[i]?.generationReward ?? 0
+      const topReward = sortedContexts[i]?.generationReward ?? sortedContexts[0]?.generationReward ?? 0
+      const gap = Math.max(0.1, Math.abs(topReward - targetReward))
+      await mutateWeights(clone, Math.min(0.1, 0.01 + gap * 0.005))
+      clones.push(clone)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        throw err
+      }
+      console.error('[Baseline] Failed preparing crossover clone:', err)
+    }
+  }
+
+  if (!clones.length) {
+    return
+  }
+
+  try {
+    await averageWeights(baselineBrain, clones)
+    await mutateWeights(baselineBrain, 0.015)
+    console.log(`[Baseline] Applied population crossover with ${clones.length} companion models.`)
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      throw err
+    }
+    console.error('[Baseline] Population crossover failed:', err)
+  }
+}
+
 function gatherObservations(context) {
   const { bot } = context
   const obs = new Float32Array(OBS_SIZE)
@@ -760,6 +1016,16 @@ function gatherObservations(context) {
   obs[19] = Number(bot.quickBarSlot ?? 0)
   obs[20] = Number(bot.experience?.level ?? 0)
   obs[21] = Number(bot.experience?.progress ?? 0)
+  const timeOfDay = Number(bot.time?.timeOfDay ?? bot.time?.day ?? bot.time?.age ?? 0)
+  const normalizedTime = Number.isFinite(timeOfDay) ? ((timeOfDay % 24000) / 24000) : 0
+  const isDay = normalizedTime >= 0.25 && normalizedTime <= 0.75 ? 1 : 0
+  const weatherState = bot.world?.weather ?? (bot.isRaining ? 'rain' : 'clear')
+  const raining = bot.isRaining || weatherState === 'rain' || weatherState === 'thunder' ? 1 : 0
+  const thundering = bot.isThundering || weatherState === 'thunder' ? 1 : 0
+  obs[22] = normalizedTime
+  obs[23] = isDay
+  obs[24] = raining ? 1 : 0
+  obs[25] = thundering ? 1 : 0
 
   trackEnvironmentAwareness(context)
   trackNovelty(context, obs)
@@ -767,19 +1033,28 @@ function gatherObservations(context) {
   const uniqueStateRatio = Math.min(1, context.visitedStates.size / NOVELTY_TARGET)
   const uniqueBlocksRatio = Math.min(1, context.visitedBlocks.size / 200)
   const uniqueBiomesRatio = Math.min(1, context.visitedBiomes.size / 32)
-  obs[22] = uniqueStateRatio
-  obs[23] = uniqueBlocksRatio
-  obs[24] = uniqueBiomesRatio
+  obs[26] = uniqueStateRatio
+  obs[27] = uniqueBlocksRatio
+  obs[28] = uniqueBiomesRatio
 
-  obs[25] = Math.min(1, context.resources.wood / 64)
-  obs[26] = Math.min(1, context.resources.stone / 128)
-  obs[27] = Math.min(1, context.resources.ore / 64)
-  obs[28] = Math.min(1, context.resources.crafted / 32)
-  obs[29] = Math.min(1, context.resourceLedger.contributed / 128)
-  obs[30] = Math.min(1, context.resourceLedger.withdrawn / 128)
-  obs[31] = Math.min(1, context.behaviorEntropy)
-  obs[32] = Math.min(1, context.currentChainScore)
-  obs[33] = context.stagnation.active ? 1 : 0
+  obs[29] = Math.min(1, context.resources.wood / 64)
+  obs[30] = Math.min(1, context.resources.stone / 128)
+  obs[31] = Math.min(1, context.resources.ore / 64)
+  obs[32] = Math.min(1, context.resources.crafted / 32)
+  obs[33] = Math.min(1, context.resourceLedger.contributed / 128)
+  obs[34] = Math.min(1, context.resourceLedger.withdrawn / 128)
+  obs[35] = Math.min(1, context.behaviorEntropy)
+  obs[36] = Math.min(1, context.currentChainScore)
+  obs[37] = context.stagnation.active ? 1 : 0
+  const emotion = ensureEmotionVector(context)
+  obs[38] = emotion[0] ?? MORALE_BASELINE
+  obs[39] = emotion[1] ?? 0
+  obs[40] = emotion[2] ?? 0.5
+  obs[41] = context.mode === 'feral' ? 1 : 0
+  const lineagePrestige = getLineagePrestige(context.lineage)
+  obs[42] = Math.max(0, Math.min(1, lineagePrestige))
+  const diversityRatio = Math.min(1, GLOBAL_RESOURCE_POOL.diversity.size / RESOURCE_TYPES.length)
+  obs[43] = diversityRatio
 
   return obs
 }
@@ -904,8 +1179,12 @@ async function executeCraftAction(context, act) {
     context.blockReward += config.reward ?? 0.4
     context.resources.crafted += config.amount ?? 1
     GLOBAL_RESOURCE_POOL.crafted += config.amount ?? 1
+    noteResourceDiversity('crafted')
     registerWithdrawal(context, config.amount ?? 1)
     updateCooperationScore(context)
+    if (context.mode === 'feral') {
+      context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.3)
+    }
     console.log(`[${label(context)}] Crafted ${config.item}`)
   } else {
     context.blockReward -= 0.03
@@ -941,12 +1220,19 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
     if (resourceType && typeof context.resources[resourceType] === 'number') {
       context.resources[resourceType] += 1
       GLOBAL_RESOURCE_POOL[resourceType] += 1
+      noteResourceDiversity(resourceType)
       registerContribution(context, 1)
       updateCooperationScore(context)
+    }
+    if (context.mode === 'feral') {
+      context.feralFury = Math.min(5, (context.feralFury ?? 0) + 0.4)
     }
   } catch (err) {
     console.warn(`[${label(context)}] Mining failed:`, err?.message ?? err)
     context.blockReward -= 0.05
+    if (context.mode === 'feral') {
+      context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.2)
+    }
   }
 }
 
@@ -1039,12 +1325,21 @@ async function executeAction(context, index) {
           try {
             await bot.attack(entity)
             context.blockReward += 0.3
+            if (context.mode === 'feral') {
+              context.feralFury = Math.min(5, (context.feralFury ?? 0) + 0.6)
+            }
           } catch (err) {
             console.warn(`[${label(context)}] Attack failed:`, err?.message ?? err)
             context.blockReward -= 0.05
+            if (context.mode === 'feral') {
+              context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.1)
+            }
           }
         } else {
           context.blockReward -= 0.01
+          if (context.mode === 'feral') {
+            context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.05)
+          }
         }
         break
       }
@@ -1226,22 +1521,38 @@ function computeReward(context, obs) {
   }
 
   if (context.noveltyFlag) {
-    reward += 0.12
+    reward += 0.12 * rewardProfile.novelty
   }
 
   updateCooperationScore(context)
-  reward += Math.max(-0.3, Math.min(0.3, context.cooperationScore * 0.5))
-  reward += (context.behaviorEntropy - 0.5) * 0.1
-  reward += Math.min(0.25, context.currentChainScore * 0.2)
+  reward += Math.max(-0.3, Math.min(0.3, context.cooperationScore * 0.5)) * rewardProfile.cooperation
+  reward += (context.behaviorEntropy - 0.5) * 0.1 * rewardProfile.entropy
+  reward += Math.min(0.25, context.currentChainScore * 0.2) * rewardProfile.skill
 
   const consumedBlockReward = context.blockReward
-  reward += consumedBlockReward
+  reward += consumedBlockReward * rewardProfile.resource
   context.blockReward = 0
+
+  const lineageBonus = getLineagePrestige(context.lineage) * 0.1 * rewardProfile.lineage
+  reward += lineageBonus
+
+  if (context.mode === 'feral') {
+    const fury = context.feralFury ?? 0
+    reward += Math.min(0.5, fury * 0.08) * rewardProfile.feral
+    reward -= Math.max(0, context.cooperationScore) * 0.2
+    context.feralFury = Math.max(0, fury * 0.92)
+  } else {
+    context.feralFury = Math.max(0, (context.feralFury ?? 0) * 0.85)
+  }
 
   reward -= 0.02
 
+  reward = adjustMorale(context, reward)
+
   updateStagnation(context, reward)
   updateSkillChains(context, reward)
+
+  context.lineagePrestige = getLineagePrestige(context.lineage)
 
   context.lastPos = { ...pos }
   return reward
@@ -1293,7 +1604,11 @@ async function tickLoop(context) {
       }
     }
 
-    const effectiveEpsilon = Math.min(0.95, Math.max(EPSILON_MIN, context.epsilon + context.epsilonBoost))
+    const moraleState = context.morale ?? { value: MORALE_BASELINE, frustration: 0 }
+    const moraleInfluence = (moraleState.value ?? MORALE_BASELINE) - MORALE_BASELINE
+    const frustrationInfluence = moraleState.frustration ?? 0
+    const epsilonBase = context.epsilon + context.epsilonBoost - moraleInfluence * 0.15 + frustrationInfluence * 0.1
+    const effectiveEpsilon = Math.min(0.95, Math.max(EPSILON_MIN, epsilonBase))
 
     let trained = false
     if (context.lastObs && context.lastAction != null) {
@@ -1323,6 +1638,9 @@ async function tickLoop(context) {
     context.generationReward += reward
     baselineState.tickCount += 1
     baselineState.cumulativeReward += reward
+    if (baselineState.tickCount >= nextRewardMutationTick) {
+      mutateRewardProfile()
+    }
     if (trained) {
       context.trainingSteps += 1
       baselineState.trainingSteps += 1
@@ -1435,6 +1753,10 @@ async function synchronizeGeneration() {
       stagnantGenerations = 0
     }
 
+    if (baselineState.generation % CROSSOVER_GENERATION_INTERVAL === 0) {
+      await performPopulationCrossover(sorted)
+    }
+
     let expansionCount = 0
     if (averageReward > 1 && contexts.length < MAX_BOTS) {
       expansionCount = 1
@@ -1470,8 +1792,28 @@ async function synchronizeGeneration() {
       }
     }
 
+    const activeLineages = new Set()
+    for (const ctx of contexts) {
+      if (!ctx?.lineage) continue
+      const stats = ensureLineageRecord(ctx.lineage)
+      stats.survivalStreak = (stats.survivalStreak ?? 0) + 1
+      stats.lastSeenGeneration = baselineState.generation
+      stats.prestige = Math.min(0.6, (stats.prestige ?? 0) * 0.9 + 0.05)
+      activeLineages.add(ctx.lineage)
+    }
+    for (const [name, stats] of lineageStats.entries()) {
+      if (!activeLineages.has(name)) {
+        stats.survivalStreak = Math.max(0, (stats.survivalStreak ?? 0) - 1)
+        stats.prestige = Math.max(0, (stats.prestige ?? 0) * 0.85)
+      }
+    }
+    for (const ctx of contexts) {
+      ctx.lineagePrestige = getLineagePrestige(ctx.lineage)
+    }
+
     for (let i = 0; i < expansionCount; i++) {
-      createContext(contexts.length + i)
+      const parentCandidate = topTwo[i % (topTwo.length || 1)] ?? sorted[0] ?? null
+      createContext(contexts.length + i, { parent: parentCandidate })
     }
 
     scheduleBaselineSave('generation')
@@ -1498,12 +1840,18 @@ function setupRewardTracking(context) {
       block.name.includes('dirt') ? 0.5 :
       0.3
     context.blockReward += value
+    if (context.mode === 'feral') {
+      context.feralFury = Math.min(5, (context.feralFury ?? 0) + value * 0.2)
+    }
     console.log(`[${label(context)}] Broke ${block.name} → +${value.toFixed(2)} reward`)
   })
 
   bot.on('diggingAborted', () => {
     context.blockReward -= 0.1
     console.log(`[${label(context)}] Dig aborted → -0.1 penalty`)
+    if (context.mode === 'feral') {
+      context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.15)
+    }
   })
 
   bot.on('playerCollect', (collector, collected) => {
@@ -1511,11 +1859,15 @@ function setupRewardTracking(context) {
       const count = collected?.metadata?.itemCount ?? collected?.count ?? 1
       const bonus = Math.max(0.3, (count || 1) * 0.15)
       context.blockReward += bonus
+      if (context.mode === 'feral') {
+        context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.1)
+      }
       const itemName = collected?.name ?? collected?.metadata?.item?.name
       const category = typeof itemName === 'string' ? categorizeResource(itemName) : null
       if (category && typeof context.resources[category] === 'number') {
         context.resources[category] += count
         GLOBAL_RESOURCE_POOL[category] += count
+        noteResourceDiversity(category)
         registerContribution(context, count)
         updateCooperationScore(context)
       }
@@ -1628,17 +1980,40 @@ async function retireContext(context, reason = 'retire') {
   }
 }
 
-function createContext(index) {
-  const username = generateRandomName()
+function createContext(index, options = {}) {
+  const parent = options.parent ?? null
+  let mode = options.mode ?? null
+  if (!mode) {
+    if (parent?.mode === 'feral') {
+      mode = 'feral'
+    } else if ((contexts.length + 1) % FERAL_INTERVAL === 0) {
+      mode = 'feral'
+    } else {
+      mode = 'civilized'
+    }
+  }
+
+  const identity = allocateLineageIdentity({ parentLineage: parent?.lineage ?? LINEAGE_ROOT_NAME, mode })
+  const username = identity.username
   const bot = mineflayer.createBot({
     host: NETWORK_HOST,
     port: NETWORK_PORT,
     username
   })
 
+  const emotion = new Float32Array(EMOTION_VECTOR_SIZE)
+  for (let i = 0; i < EMOTION_VECTOR_SIZE; i++) {
+    emotion[i] = MORALE_BASELINE
+  }
+
   const context = {
     id: index,
     username,
+    lineage: identity.lineage,
+    lineageOrdinal: identity.ordinal,
+    lineagePrestige: getLineagePrestige(identity.lineage),
+    mode,
+    feralFury: 0,
     bot,
     brain: null,
     epsilon: EPSILON_START,
@@ -1691,6 +2066,14 @@ function createContext(index) {
       streak: 0,
       lastMutation: 0
     },
+    morale: {
+      value: MORALE_BASELINE,
+      frustration: 0,
+      sharpness: 0.5,
+      successStreak: 0,
+      failureStreak: 0
+    },
+    emotion,
     reconnectAttempts: 0,
     reconnectTimer: null,
     reconnecting: false,
@@ -1705,6 +2088,7 @@ function createContext(index) {
 
   setupBot(context)
   contexts.push(context)
+  console.log(`[${label(context)}] Born from lineage ${context.lineage}-${romanNumeral(context.lineageOrdinal)} (${context.mode}).`)
   return context
 }
 
