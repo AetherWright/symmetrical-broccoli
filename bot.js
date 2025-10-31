@@ -14,7 +14,10 @@ import {
   saveBrainState,
   loadBrainState,
   DEFAULT_BRAIN_DIR,
-  mutateWeights
+  mutateWeights,
+  isRemoteBrainConnected,
+  getRemoteBrainStatus,
+  RemoteBrainUnavailableError
 } from './brainClient.js'
 
 // ----------------------------
@@ -133,6 +136,57 @@ console.error = (...args) => {
   mirrorToLog('ERROR', args)
 }
 
+function isRemoteBrainUnavailableError(err) {
+  return err instanceof RemoteBrainUnavailableError || err?.code === 'REMOTE_BRAIN_UNAVAILABLE'
+}
+
+function describeRemoteRetry(status) {
+  if (!status) return 'retry pending'
+  if (status.retryAt) {
+    return `retry after ${new Date(status.retryAt).toISOString()}`
+  }
+  if (status.retryDelay) {
+    return `retry delay ${Math.round(status.retryDelay)}ms`
+  }
+  return 'retry pending'
+}
+
+function ensureRemoteBrainTracker(context) {
+  if (!context.remoteBrain) {
+    context.remoteBrain = {
+      offlineNotified: false,
+      lastMessage: null,
+      nextLogAt: 0
+    }
+  }
+  return context.remoteBrain
+}
+
+function noteRemoteBrainOffline(context, status, source) {
+  const tracker = ensureRemoteBrainTracker(context)
+  const now = Date.now()
+  const message = source?.message ?? status?.lastError ?? 'Remote brain unavailable'
+  if (!tracker.offlineNotified || tracker.lastMessage !== message || now >= tracker.nextLogAt) {
+    const retryNote = describeRemoteRetry(status)
+    console.warn(`[${label(context)}] Remote brain unavailable: ${message} (${retryNote}).`)
+    tracker.offlineNotified = true
+    tracker.lastMessage = message
+    tracker.nextLogAt = now + 5000
+  }
+  context.waitingForBrain = true
+}
+
+function noteRemoteBrainOnline(context) {
+  const tracker = ensureRemoteBrainTracker(context)
+  if (tracker.offlineNotified) {
+    console.log(`[${label(context)}] Remote brain connection restored. Resuming ticks.`)
+  }
+  tracker.offlineNotified = false
+  tracker.lastMessage = null
+  tracker.nextLogAt = 0
+  context.waitingForBrain = false
+}
+
 const CRAFTING_ACTIONS = {
   craft_planks: { item: 'oak_planks', amount: 4, allowPartial: true, reward: 0.6 },
   craft_sticks: { item: 'stick', amount: 4, allowPartial: true, reward: 0.45 },
@@ -197,6 +251,8 @@ const usedNames = new Set()
 let globalRunning = true
 let baselineBrain = null
 let baselineReady = null
+let deferredBaselineSaveReason = null
+let nextBaselineSaveLogAt = 0
 const GLOBAL_RESOURCE_POOL = {
   wood: 0,
   stone: 0,
@@ -369,17 +425,26 @@ async function initializeBaselineBrain() {
       console.log('[Baseline] Restored checkpoint state.')
     }
   } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      throw err
+    }
     console.error('[Baseline] Failed to initialize from checkpoint:', err)
-    baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
-    if (baselineBrain) {
-      baselineBrain.owner = 'hivemind'
+    try {
+      baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
+      if (baselineBrain) {
+        baselineBrain.owner = 'hivemind'
+      }
+    } catch (creationError) {
+      if (isRemoteBrainUnavailableError(creationError)) {
+        throw creationError
+      }
+      console.error('[Baseline] Failed to create baseline brain after initialization error:', creationError)
+      throw creationError
     }
   }
 
   return baselineBrain
 }
-
-baselineReady = initializeBaselineBrain()
 
 async function ensureBaselineReady() {
   if (baselineBrain) return baselineBrain
@@ -389,12 +454,26 @@ async function ensureBaselineReady() {
   try {
     await baselineReady
   } catch (err) {
-    console.error('[Baseline] Initialization failed, recreating model:', err)
-    baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
-    if (baselineBrain) {
-      baselineBrain.owner = 'hivemind'
+    if (isRemoteBrainUnavailableError(err)) {
+      baselineReady = null
+      throw err
     }
-    baselineReady = Promise.resolve(baselineBrain)
+    console.error('[Baseline] Initialization failed, recreating model:', err)
+    try {
+      baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
+      if (baselineBrain) {
+        baselineBrain.owner = 'hivemind'
+      }
+      baselineReady = Promise.resolve(baselineBrain)
+    } catch (creationError) {
+      if (isRemoteBrainUnavailableError(creationError)) {
+        baselineReady = null
+        throw creationError
+      }
+      console.error('[Baseline] Failed to recreate baseline brain:', creationError)
+      baselineReady = null
+      throw creationError
+    }
   }
   return baselineBrain
 }
@@ -421,6 +500,9 @@ async function persistBaseline(reason = 'periodic') {
     lastSaveTime = Date.now()
     console.log(`[Baseline] Saved checkpoint (${reason}).`)
   } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      throw err
+    }
     console.error(`[Baseline] Failed to save checkpoint (${reason}):`, err)
   }
 }
@@ -431,17 +513,47 @@ function scheduleBaselineSave(reason = 'periodic') {
     return
   }
 
+  if (!isRemoteBrainConnected()) {
+    if (!deferredBaselineSaveReason) {
+      deferredBaselineSaveReason = reason
+    }
+    const now = Date.now()
+    if (now >= nextBaselineSaveLogAt) {
+      const status = getRemoteBrainStatus()
+      console.warn(`[Baseline] Deferring save until remote brain returns (${describeRemoteRetry(status)}).`)
+      nextBaselineSaveLogAt = now + 5000
+    }
+    return
+  }
+
+  deferredBaselineSaveReason = null
+  nextBaselineSaveLogAt = 0
+
   saveInFlight = (async () => {
     await persistBaseline(reason)
   })()
 
   saveInFlight
-    .catch(err => console.error('[Baseline] Save task error:', err))
+    .catch(err => {
+      if (isRemoteBrainUnavailableError(err)) {
+        if (!deferredBaselineSaveReason) {
+          deferredBaselineSaveReason = reason
+        }
+        const status = getRemoteBrainStatus()
+        console.warn(`[Baseline] Save deferred: remote brain unavailable (${describeRemoteRetry(status)}).`)
+      } else {
+        console.error('[Baseline] Save task error:', err)
+      }
+    })
     .finally(() => {
       saveInFlight = null
       if (pendingSaveReason) {
         const nextReason = pendingSaveReason
         pendingSaveReason = null
+        scheduleBaselineSave(nextReason)
+      } else if (deferredBaselineSaveReason && isRemoteBrainConnected()) {
+        const nextReason = deferredBaselineSaveReason
+        deferredBaselineSaveReason = null
         scheduleBaselineSave(nextReason)
       }
     })
@@ -1139,7 +1251,16 @@ async function tickLoop(context) {
   if (!globalRunning || !context.running || context.tickInFlight) return
   context.tickInFlight = true
 
+  let remoteUnavailable = false
+  let remoteIssue = null
   try {
+    const status = getRemoteBrainStatus()
+    if (!status.connected) {
+      remoteUnavailable = true
+      remoteIssue = status
+      return
+    }
+
     await ensureContextBrain(context)
     if (!context.bot?.entity?.position) {
       console.warn(`[${label(context)}] Entity not ready, skipping tick.`)
@@ -1227,9 +1348,26 @@ async function tickLoop(context) {
     maybeTriggerAutosave()
     await maybeCompleteGeneration(context)
   } catch (err) {
-    console.error(`[${label(context)}] Tick error:`, err)
+    if (isRemoteBrainUnavailableError(err)) {
+      remoteUnavailable = true
+      remoteIssue = err
+    } else {
+      console.error(`[${label(context)}] Tick error:`, err)
+    }
   } finally {
     context.tickInFlight = false
+
+    if (remoteUnavailable) {
+      const status = getRemoteBrainStatus()
+      noteRemoteBrainOffline(context, status, remoteIssue)
+    } else {
+      noteRemoteBrainOnline(context)
+      if (deferredBaselineSaveReason && !saveInFlight && isRemoteBrainConnected()) {
+        const reason = deferredBaselineSaveReason
+        deferredBaselineSaveReason = null
+        scheduleBaselineSave(reason)
+      }
+    }
 
     if (globalRunning && context.running) {
       context.tickTimer = setTimeout(() => {
@@ -1287,7 +1425,12 @@ async function synchronizeGeneration() {
           ctx.stagnation.lastMutation = baselineState.generation
         }
       } catch (err) {
-        console.error('[Baseline] Meta-mutation failed:', err)
+        if (isRemoteBrainUnavailableError(err)) {
+          const status = getRemoteBrainStatus()
+          console.warn(`[Baseline] Meta-mutation skipped: remote brain unavailable (${describeRemoteRetry(status)}).`)
+        } else {
+          console.error('[Baseline] Meta-mutation failed:', err)
+        }
       }
       stagnantGenerations = 0
     }
@@ -1333,7 +1476,12 @@ async function synchronizeGeneration() {
 
     scheduleBaselineSave('generation')
   } catch (err) {
-    console.error('[Baseline] Failed to synchronize generation:', err)
+    if (isRemoteBrainUnavailableError(err)) {
+      const status = getRemoteBrainStatus()
+      console.warn(`[Baseline] Skipping generation sync: remote brain unavailable (${describeRemoteRetry(status)}).`)
+    } else {
+      console.error('[Baseline] Failed to synchronize generation:', err)
+    }
   } finally {
     generationSyncInFlight = false
   }
@@ -1546,7 +1694,13 @@ function createContext(index) {
     reconnectAttempts: 0,
     reconnectTimer: null,
     reconnecting: false,
-    shuttingDown: false
+    shuttingDown: false,
+    waitingForBrain: false,
+    remoteBrain: {
+      offlineNotified: false,
+      lastMessage: null,
+      nextLogAt: 0
+    }
   }
 
   setupBot(context)
@@ -1601,9 +1755,23 @@ process.stdin.on('data', async data => {
         ctx.tickTimer = null
       }
     }
-    await ensureBaselineReady()
     await flushPendingSave()
-    await persistBaseline('shutdown')
+    if (isRemoteBrainConnected()) {
+      try {
+        await ensureBaselineReady()
+        await persistBaseline('shutdown')
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err)) {
+          const status = getRemoteBrainStatus()
+          console.warn(`[Brain] Skipping shutdown save: remote brain unavailable (${describeRemoteRetry(status)}).`)
+        } else {
+          console.error('[Brain] Failed to persist baseline during shutdown:', err)
+        }
+      }
+    } else {
+      const status = getRemoteBrainStatus()
+      console.warn(`[Brain] Remote brain unavailable during shutdown (${describeRemoteRetry(status)}). Skipping save.`)
+    }
     for (const ctx of contexts) {
       try {
         ctx.bot?.quit?.(safeDisconnectReason('Manual shutdown'))
@@ -1627,9 +1795,23 @@ async function gracefulShutdown(reason = 'signal') {
         ctx.tickTimer = null
       }
     }
-    await ensureBaselineReady()
     await flushPendingSave()
-    await persistBaseline(reason)
+    if (isRemoteBrainConnected()) {
+      try {
+        await ensureBaselineReady()
+        await persistBaseline(reason)
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err)) {
+          const status = getRemoteBrainStatus()
+          console.warn(`[Brain] Skipping ${reason} save: remote brain unavailable (${describeRemoteRetry(status)}).`)
+        } else {
+          throw err
+        }
+      }
+    } else {
+      const status = getRemoteBrainStatus()
+      console.warn(`[Brain] Remote brain unavailable during ${reason} shutdown (${describeRemoteRetry(status)}). Skipping save.`)
+    }
     for (const ctx of contexts) {
       try {
         ctx.bot?.quit?.(safeDisconnectReason(`Shutdown: ${reason}`))
