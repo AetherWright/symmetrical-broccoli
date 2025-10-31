@@ -346,28 +346,41 @@ class RemoteBrain:
 
     def _load_partial_weights(self, weights_path):
         if h5py is None or not os.path.exists(weights_path):
-            return False
+            return 0, 0
         loaded_variables = 0
+        attempted_variables = 0
         try:
             with h5py.File(weights_path, "r") as handle:  # type: ignore[call-arg]
-                layer_names = handle.attrs.get("layer_names")
+                root_group = handle
+                if "model_weights" in handle:
+                    root_group = handle["model_weights"]
+                layer_names = root_group.attrs.get("layer_names")
+                if isinstance(layer_names, np.ndarray):
+                    layer_names = layer_names.tolist()
                 if not layer_names:
-                    return False
+                    return 0, 0
                 layer_lookup = {}
                 for raw_name in layer_names:
                     layer_name = self._decode_name(raw_name)
-                    if layer_name in handle:
-                        layer_lookup[layer_name] = handle[layer_name]
+                    if layer_name in root_group:
+                        layer_lookup[layer_name] = root_group[layer_name]
                 if not layer_lookup:
-                    return False
+                    return 0, 0
                 for layer in self.model.layers:
                     group = layer_lookup.get(layer.name)
                     if group is None:
                         continue
                     weight_names = group.attrs.get("weight_names")
+                    if isinstance(weight_names, np.ndarray):
+                        weight_names = weight_names.tolist()
                     if not weight_names:
                         continue
-                    for raw_weight_name, weight_var in zip(weight_names, layer.weights):
+                    for index, weight_var in enumerate(layer.weights):
+                        attempted_variables += 1
+                        try:
+                            raw_weight_name = weight_names[index]
+                        except IndexError:
+                            break
                         weight_name = self._decode_name(raw_weight_name)
                         if weight_name not in group:
                             continue
@@ -387,15 +400,10 @@ class RemoteBrain:
                             app.logger.exception(
                                 "Failed assigning partial weight %s for layer %s", weight_name, layer.name
                             )
-            if loaded_variables:
-                app.logger.info(
-                    "Partially restored %s variables from %s", loaded_variables, weights_path
-                )
-                return True
-            return False
+                return loaded_variables, attempted_variables
         except Exception:  # pylint: disable=broad-except
             app.logger.exception("Partial weight load failed for %s", weights_path)
-            return False
+            return loaded_variables, attempted_variables
 
     def load_weights(self, directory):
         with self._lock:
@@ -404,23 +412,66 @@ class RemoteBrain:
                 legacy_path = os.path.join(directory, "weights.h5")
                 if os.path.exists(legacy_path):
                     weights_path = legacy_path
-            if os.path.exists(weights_path):
-                loaded = False
+            if not os.path.exists(weights_path):
+                return {"status": "fresh"}
+
+            loaded_info = {"status": "fresh"}
+            try:
+                self.model.load_weights(weights_path)
+                loaded_info = {"status": "exact", "path": weights_path}
+                app.logger.info("Restored weights exactly from %s", weights_path)
+            except ValueError as exc:
+                app.logger.warning(
+                    "Exact weight load failed for %s: %s. Attempting relaxed restore.",
+                    weights_path,
+                    exc,
+                )
+                relaxed_loaded = False
                 try:
-                    self.model.load_weights(weights_path)
-                    loaded = True
-                except ValueError as exc:
-                    app.logger.warning(
-                        "Exact weight load failed for %s: %s. Retrying with name-based partial load.",
+                    self.model.load_weights(weights_path, by_name=True, skip_mismatch=True)
+                    relaxed_loaded = True
+                    loaded_info = {
+                        "status": "relaxed",
+                        "path": weights_path,
+                    }
+                    app.logger.info("Restored compatible weights with skip_mismatch from %s", weights_path)
+                except (TypeError, ValueError) as relaxed_exc:
+                    app.logger.info(
+                        "Relaxed weight load unavailable for %s: %s",
                         weights_path,
-                        exc,
+                        relaxed_exc,
                     )
-                    if self._load_partial_weights(weights_path):
-                        loaded = True
+                if not relaxed_loaded:
+                    loaded_vars, attempted = self._load_partial_weights(weights_path)
+                    if loaded_vars:
+                        loaded_info = {
+                            "status": "partial",
+                            "path": weights_path,
+                            "loaded_variables": loaded_vars,
+                            "attempted_variables": attempted,
+                        }
+                        app.logger.info(
+                            "Partially restored %s/%s variables from %s",
+                            loaded_vars,
+                            attempted or "?",
+                            weights_path,
+                        )
                     else:
-                        raise
-            if loaded:
+                        loaded_info = {
+                            "status": "mismatch",
+                            "path": weights_path,
+                            "loaded_variables": loaded_vars,
+                            "attempted_variables": attempted,
+                        }
+                        app.logger.warning(
+                            "No compatible tensors found when loading %s; keeping initialized weights",
+                            weights_path,
+                        )
+            if loaded_info["status"] != "fresh":
                 self.optimizer.sync_slow_variables(self.model.trainable_variables)
+            else:
+                app.logger.info("No compatible weights found at %s; using fresh initialization", weights_path)
+            return loaded_info
 
 
 def require_brain(brain_id):
@@ -620,11 +671,18 @@ def load_endpoint():
     brain_id = str(uuid.uuid4())
     brain = RemoteBrain(input_size, action_count)
     try:
-        _execute("load", brain.load_weights, path)
+        load_result = _execute("load", brain.load_weights, path)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 503
     BRAINS[brain_id] = brain
-    return jsonify({"brain_id": brain_id})
+    response = {"brain_id": brain_id}
+    if isinstance(load_result, dict):
+        response.update(
+            {key: value for key, value in load_result.items() if key not in {"path"}}
+        )
+        if load_result.get("status") in {"exact", "relaxed", "partial"}:
+            response["source_path"] = load_result.get("path")
+    return jsonify(response)
 
 
 @app.post("/api/state/save")
