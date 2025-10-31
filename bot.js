@@ -61,6 +61,43 @@ const TOOL_TYPE_WEIGHTS = {
   shears: 30
 }
 
+const HUNGER_EAT_THRESHOLD = Math.max(12, parseInt(process.env.BOT_AUTOEAT_THRESHOLD ?? '14', 10))
+const HUNGER_CRITICAL_THRESHOLD = Math.max(6, Math.min(HUNGER_EAT_THRESHOLD - 2, parseInt(process.env.BOT_HUNGER_CRITICAL ?? '8', 10)))
+const AUTO_EAT_CHECK_INTERVAL_MS = 2500
+const ARMOR_CHECK_INTERVAL_MS = 4000
+const HUNGER_HUNT_THRESHOLD = Math.max(8, Math.min(HUNGER_EAT_THRESHOLD, parseInt(process.env.BOT_HUNT_HUNGER_THRESHOLD ?? '12', 10)))
+const HUNGER_HUNT_ACTION_REWARD = 0.35
+const HUNGER_COLLECTION_REWARD = 0.25
+
+const COOKED_FOOD_KEYWORDS = ['cooked', 'baked', 'roasted', 'stew', 'pie', 'bread']
+const AVOID_FOOD_KEYWORDS = ['rotten_flesh', 'spider_eye', 'poisonous', 'raw_fish', 'raw_salmon']
+const PASSIVE_ANIMAL_KEYWORDS = ['cow', 'pig', 'sheep', 'chicken', 'rabbit', 'mooshroom', 'goat', 'hoglin', 'salmon', 'cod']
+
+const ARMOR_SLOT_PATTERNS = [
+  { slot: 'head', keywords: ['helmet', 'cap', 'turtle_helmet', 'turtle_shell'] },
+  { slot: 'torso', keywords: ['chestplate', 'tunic', 'elytra'] },
+  { slot: 'legs', keywords: ['leggings', 'pants'] },
+  { slot: 'feet', keywords: ['boots'] }
+]
+
+const ARMOR_TIER_WEIGHTS = [
+  { keyword: 'netherite', score: 160 },
+  { keyword: 'diamond', score: 130 },
+  { keyword: 'golden', score: 110 },
+  { keyword: 'gold', score: 105 },
+  { keyword: 'iron', score: 95 },
+  { keyword: 'chainmail', score: 85 },
+  { keyword: 'stone', score: 60 },
+  { keyword: 'leather', score: 55 }
+]
+
+const ARMOR_SLOT_BONUS = {
+  head: 25,
+  torso: 35,
+  legs: 30,
+  feet: 20
+}
+
 const pipelineAsync = promisify(pipeline)
 
 class RotatingCompressedLogger {
@@ -1122,6 +1159,300 @@ async function equipBestTool(context, preferredKeywords = []) {
   return false
 }
 
+function ensureMaintenanceState(context) {
+  if (!context.maintenance) {
+    context.maintenance = {
+      nextAutoEatAt: 0,
+      nextArmorCheckAt: 0,
+      eating: false,
+      lastAutoEatSuccess: 0,
+      hungerCrisis: false,
+      lastArmorSignature: null,
+      lastArmorUpdate: 0
+    }
+  }
+  return context.maintenance
+}
+
+function getItemName(context, item) {
+  if (!item) return null
+  if (item.name) return item.name
+  if (typeof item.type === 'number') {
+    return resolveRegistryItemName(context, item.type)
+  }
+  return null
+}
+
+function getItemInfo(context, item) {
+  if (!context?.registry || !item) return null
+  const name = getItemName(context, item)
+  if (name && context.registry.itemsByName?.[name]) {
+    return context.registry.itemsByName[name]
+  }
+  if (typeof item.type === 'number') {
+    return context.registry.items?.[item.type] ?? null
+  }
+  return null
+}
+
+function getFoodPoints(context, item) {
+  if (!item) return 0
+  if (typeof item.foodPoints === 'number') return item.foodPoints
+  const info = getItemInfo(context, item)
+  if (info && typeof info.foodPoints === 'number') {
+    return info.foodPoints
+  }
+  if (info && typeof info.foodPoints === 'object' && typeof info.foodPoints.default === 'number') {
+    return info.foodPoints.default
+  }
+  return 0
+}
+
+function isCookedFood(name = '') {
+  if (!name) return false
+  return COOKED_FOOD_KEYWORDS.some(keyword => name.includes(keyword))
+}
+
+function isAvoidFood(name = '') {
+  if (!name) return false
+  return AVOID_FOOD_KEYWORDS.some(keyword => name.includes(keyword))
+}
+
+function isEdible(context, item) {
+  if (!item) return false
+  const name = getItemName(context, item)
+  const info = getItemInfo(context, item)
+  if (info?.edible) return true
+  if (typeof item.foodPoints === 'number') return item.foodPoints > 0
+  if (info && typeof info.foodPoints === 'number') return info.foodPoints > 0
+  if (name && name.includes('bread')) return true
+  if (name && name.includes('apple')) return true
+  return false
+}
+
+function scoreFoodItem(context, item) {
+  const name = (getItemName(context, item) ?? '').toLowerCase()
+  const foodPoints = getFoodPoints(context, item)
+  let score = foodPoints * 10
+  if (isCookedFood(name)) score += 45
+  if (name.includes('stew') || name.includes('soup')) score += 25
+  if (name.includes('bread') || name.includes('pie') || name.includes('cake')) score += 15
+  if (name.includes('raw')) score -= 18
+  if (isAvoidFood(name)) score -= 35
+  if (name.includes('golden_apple')) score += 60
+  if (foodPoints === 0 && name.includes('honey')) score += 15
+  return score
+}
+
+function armorSlotFromName(name = '') {
+  if (!name) return null
+  for (const { slot, keywords } of ARMOR_SLOT_PATTERNS) {
+    if (keywords.some(keyword => name.includes(keyword))) {
+      return slot
+    }
+  }
+  return null
+}
+
+function scoreArmorItem(item) {
+  if (!item) return 0
+  const name = (item.name ?? '').toLowerCase()
+  const slot = armorSlotFromName(name)
+  if (!slot) return 0
+  let score = ARMOR_SLOT_BONUS[slot] ?? 10
+  for (const { keyword, score: tierScore } of ARMOR_TIER_WEIGHTS) {
+    if (name.includes(keyword)) {
+      score = Math.max(score, tierScore + (ARMOR_SLOT_BONUS[slot] ?? 0))
+    }
+  }
+  if (name.includes('elytra')) {
+    score += 40
+  }
+  if (name.includes('leather')) {
+    score -= 10
+  }
+  if (name.includes('gold')) {
+    score -= 5
+  }
+  return score
+}
+
+function getEquippedArmor(context, slot) {
+  if (!context?.bot?.getEquipmentDestSlot) return null
+  const slotId = context.bot.getEquipmentDestSlot(slot)
+  if (typeof slotId !== 'number') return null
+  return context.bot.inventory?.slots?.[slotId] ?? null
+}
+
+async function maybeAutoEquipArmor(context) {
+  const maint = ensureMaintenanceState(context)
+  const now = Date.now()
+  if (now < maint.nextArmorCheckAt) {
+    return false
+  }
+  maint.nextArmorCheckAt = now + ARMOR_CHECK_INTERVAL_MS
+
+  const { bot } = context
+  if (!bot?.inventory?.items) return false
+  const items = bot.inventory.items() ?? []
+  const slotBest = new Map()
+  for (const item of items) {
+    const name = getItemName(context, item)
+    const slot = armorSlotFromName(name?.toLowerCase?.() ?? name ?? '')
+    if (!slot) continue
+    const score = scoreArmorItem(item)
+    const current = slotBest.get(slot)
+    if (!current || score > current.score) {
+      slotBest.set(slot, { item, score })
+    }
+  }
+
+  let equipped = false
+  for (const [slot, candidate] of slotBest.entries()) {
+    const current = getEquippedArmor(context, slot)
+    const currentScore = scoreArmorItem(current)
+    if (!current || candidate.score > currentScore + 0.5) {
+      try {
+        await bot.equip(candidate.item, slot)
+        equipped = true
+      } catch (err) {
+        console.warn(`[${label(context)}] Failed to auto-equip ${candidate.item?.name ?? 'armor'}:`, err?.message ?? err)
+      }
+    }
+  }
+
+  if (equipped) {
+    maint.lastArmorSignature = generateArmorSignature(context)
+    maint.lastArmorUpdate = Date.now()
+  }
+
+  return equipped
+}
+
+function generateArmorSignature(context) {
+  if (!context?.bot?.getEquipmentDestSlot) return null
+  const slots = ['head', 'torso', 'legs', 'feet']
+  const pieces = []
+  for (const slot of slots) {
+    const item = getEquippedArmor(context, slot)
+    pieces.push(item?.name ?? 'none')
+  }
+  return pieces.join('|')
+}
+
+function isHungry(context) {
+  const hunger = Number(context?.bot?.food ?? 20)
+  return hunger < HUNGER_EAT_THRESHOLD
+}
+
+function isCriticalHunger(context) {
+  const hunger = Number(context?.bot?.food ?? 20)
+  return hunger <= HUNGER_CRITICAL_THRESHOLD
+}
+
+async function maybeAutoEat(context) {
+  const maint = ensureMaintenanceState(context)
+  const now = Date.now()
+  if (now < maint.nextAutoEatAt) {
+    return false
+  }
+  if (!context?.bot?.inventory?.items) {
+    maint.nextAutoEatAt = now + AUTO_EAT_CHECK_INTERVAL_MS
+    return false
+  }
+  const hunger = Number(context.bot.food ?? 20)
+  const interval =
+    hunger <= HUNGER_CRITICAL_THRESHOLD
+      ? Math.max(800, Math.floor(AUTO_EAT_CHECK_INTERVAL_MS / 2))
+      : AUTO_EAT_CHECK_INTERVAL_MS
+  maint.nextAutoEatAt = now + interval
+  if (hunger >= HUNGER_EAT_THRESHOLD) {
+    maint.hungerCrisis = false
+    return false
+  }
+
+  const items = context.bot.inventory.items() ?? []
+  const edible = items.filter(item => isEdible(context, item))
+  if (!edible.length) {
+    maint.hungerCrisis = hunger <= HUNGER_HUNT_THRESHOLD
+    return false
+  }
+
+  edible.sort((a, b) => scoreFoodItem(context, b) - scoreFoodItem(context, a))
+  const best = edible[0]
+  if (!best) {
+    maint.hungerCrisis = hunger <= HUNGER_HUNT_THRESHOLD
+    return false
+  }
+
+  try {
+    maint.eating = true
+    if (!context.bot.heldItem || context.bot.heldItem.type !== best.type) {
+      await context.bot.equip(best, 'hand')
+    }
+    context.bot.clearControlStates()
+    await context.bot.consume()
+    await sleep(200)
+    maint.lastAutoEatSuccess = Date.now()
+    maint.hungerCrisis = false
+    context.blockReward += hunger <= HUNGER_CRITICAL_THRESHOLD ? 0.25 : 0.12
+    console.log(`[${label(context)}] Auto-ate ${best.name ?? 'food'} to restore hunger.`)
+    return true
+  } catch (err) {
+    maint.hungerCrisis = hunger <= HUNGER_HUNT_THRESHOLD
+    console.warn(`[${label(context)}] Auto-eat failed:`, err?.message ?? err)
+  } finally {
+    maint.eating = false
+  }
+
+  return false
+}
+
+function isPassiveAnimal(entity) {
+  if (!entity) return false
+  const kind = (entity.kind ?? entity.type ?? '').toLowerCase()
+  if (kind.includes('passive')) return true
+  const name = (entity.name ?? entity.displayName ?? '').toLowerCase()
+  if (!name) return false
+  return PASSIVE_ANIMAL_KEYWORDS.some(keyword => name.includes(keyword))
+}
+
+function isAnimalFoodItem(name = '') {
+  const normalized = name.toLowerCase()
+  return (
+    normalized.includes('beef') ||
+    normalized.includes('pork') ||
+    normalized.includes('mutton') ||
+    normalized.includes('chicken') ||
+    normalized.includes('rabbit') ||
+    normalized.includes('cod') ||
+    normalized.includes('salmon') ||
+    normalized.includes('steak') ||
+    normalized.includes('bacon')
+  )
+}
+
+async function runMaintenanceRoutines(context) {
+  if (!context?.bot) return
+  const maint = ensureMaintenanceState(context)
+  maint.hungerCrisis = isHungry(context)
+
+  let ate = false
+  try {
+    ate = await maybeAutoEat(context)
+  } catch (err) {
+    console.warn(`[${label(context)}] Auto-eat routine failed:`, err?.message ?? err)
+  }
+
+  try {
+    await maybeAutoEquipArmor(context)
+  } catch (err) {
+    console.warn(`[${label(context)}] Auto-armor routine failed:`, err?.message ?? err)
+  }
+
+  return ate
+}
+
 function getToolTypeFromName(name = '') {
   if (!name) return null
   if (name.includes('pickaxe')) return 'pickaxe'
@@ -1511,9 +1842,17 @@ async function executeAction(context, index) {
       case 'attack': {
         const entity = bot.nearestEntity()
         if (entity) {
+          const hungerBefore = Number(bot.food ?? 20)
           try {
             await bot.attack(entity)
             context.blockReward += 0.3
+            if (
+              hungerBefore <= HUNGER_HUNT_THRESHOLD &&
+              isPassiveAnimal(entity)
+            ) {
+              context.blockReward += HUNGER_HUNT_ACTION_REWARD
+              console.log(`[${label(context)}] Rewarding hunt on ${entity.name ?? entity.displayName ?? 'mob'} while hungry.`)
+            }
             if (context.mode === 'feral') {
               context.feralFury = Math.min(5, (context.feralFury ?? 0) + 0.6)
             }
@@ -1811,14 +2150,6 @@ async function tickLoop(context) {
   let remoteUnavailable = false
   let remoteIssue = null
   try {
-    const status = getRemoteBrainStatus()
-    if (!status.connected) {
-      remoteUnavailable = true
-      remoteIssue = status
-      return
-    }
-
-    await ensureContextBrain(context)
     if (!context.bot?.entity?.position) {
       console.warn(`[${label(context)}] Entity not ready, skipping tick.`)
       return
@@ -1827,6 +2158,17 @@ async function tickLoop(context) {
     if (!context.registry && context.bot.registry) {
       context.registry = context.bot.registry
     }
+
+    await runMaintenanceRoutines(context)
+
+    const status = getRemoteBrainStatus()
+    if (!status.connected) {
+      remoteUnavailable = true
+      remoteIssue = status
+      return
+    }
+
+    await ensureContextBrain(context)
 
     const observation = gatherObservations(context)
     if (Array.isArray(context.lastPrediction) && context.lastPrediction.length === observation.length) {
@@ -2154,6 +2496,15 @@ function setupRewardTracking(context) {
         noteResourceDiversity(category)
         registerContribution(context, count)
         updateCooperationScore(context)
+      }
+      if (typeof itemName === 'string' && isAnimalFoodItem(itemName)) {
+        const hungerBonusBase = isCriticalHunger(context) ? HUNGER_COLLECTION_REWARD * 1.5 : HUNGER_COLLECTION_REWARD
+        if (isHungry(context)) {
+          context.blockReward += hungerBonusBase
+          console.log(
+            `[${label(context)}] Collected ${itemName} while hungry → +${hungerBonusBase.toFixed(2)} reward`
+          )
+        }
       }
       console.log(`[${label(context)}] Collected item → +${bonus.toFixed(2)} reward`)
     }
