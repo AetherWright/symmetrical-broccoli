@@ -73,6 +73,14 @@ const COOKED_FOOD_KEYWORDS = ['cooked', 'baked', 'roasted', 'stew', 'pie', 'brea
 const AVOID_FOOD_KEYWORDS = ['rotten_flesh', 'spider_eye', 'poisonous', 'raw_fish', 'raw_salmon']
 const PASSIVE_ANIMAL_KEYWORDS = ['cow', 'pig', 'sheep', 'chicken', 'rabbit', 'mooshroom', 'goat', 'hoglin', 'salmon', 'cod']
 
+const DEATH_REWARD_PENALTY = (() => {
+  const raw = Number.parseFloat(process.env.BOT_DEATH_REWARD_PENALTY ?? '20')
+  if (!Number.isFinite(raw) || raw <= 0) {
+    return 20
+  }
+  return Math.max(5, raw)
+})()
+
 const ARMOR_SLOT_PATTERNS = [
   { slot: 'head', keywords: ['helmet', 'cap', 'turtle_helmet', 'turtle_shell'] },
   { slot: 'torso', keywords: ['chestplate', 'tunic', 'elytra'] },
@@ -2118,6 +2126,12 @@ function computeReward(context, obs) {
   reward += consumedBlockReward * rewardProfile.resource
   context.blockReward = 0
 
+  const pendingDeathPenalty = context.deathPenalty ?? 0
+  if (pendingDeathPenalty > 0) {
+    reward -= pendingDeathPenalty
+    context.deathPenalty = 0
+  }
+
   const lineageBonus = getLineagePrestige(context.lineage) * 0.1 * rewardProfile.lineage
   reward += lineageBonus
 
@@ -2455,6 +2469,21 @@ async function synchronizeGeneration() {
   }
 }
 
+function applyDeathPenalty(context, source = 'unknown') {
+  if (!context) return
+  const now = Date.now()
+  if (context.lastDeathAt && now - context.lastDeathAt < 1000) {
+    return
+  }
+  context.lastDeathAt = now
+  const penalty = Math.max(5, DEATH_REWARD_PENALTY)
+  context.deathPenalty = (context.deathPenalty ?? 0) + penalty
+  context.blockReward = Math.max(0, context.blockReward - penalty * 0.1)
+  context.repetitionStreak = 0
+  context.noveltyFlag = false
+  console.warn(`[${label(context)}] Death detected via ${source} → -${penalty.toFixed(2)} reward penalty`)
+}
+
 function setupRewardTracking(context) {
   const { bot } = context
 
@@ -2508,6 +2537,10 @@ function setupRewardTracking(context) {
       }
       console.log(`[${label(context)}] Collected item → +${bonus.toFixed(2)} reward`)
     }
+  })
+
+  bot.on('death', () => {
+    applyDeathPenalty(context, 'death-event')
   })
 }
 
@@ -2575,6 +2608,10 @@ function setupBot(context) {
 
   const handleDisconnect = reason => {
     console.warn(`[${label(context)}] Disconnected: ${reason}`)
+    const normalized = typeof reason === 'string' ? reason.toLowerCase() : ''
+    if (normalized.includes('death') || normalized.includes('died') || normalized.includes('killed')) {
+      applyDeathPenalty(context, `disconnect:${reason}`)
+    }
     scheduleReconnect(context, reason)
   }
 
@@ -2687,6 +2724,8 @@ function createContext(index, options = {}) {
     visitedBiomes: new Set(),
     noveltyCount: 0,
     noveltyFlag: false,
+    deathPenalty: 0,
+    lastDeathAt: 0,
     resources: {
       wood: 0,
       stone: 0,
