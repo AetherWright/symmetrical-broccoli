@@ -42,6 +42,25 @@ const REWARD_MUTATION_INTERVAL = Math.max(500, parseInt(process.env.REWARD_MUTAT
 const REWARD_MUTATION_JITTER = Math.max(100, parseInt(process.env.REWARD_MUTATION_JITTER ?? '600', 10))
 const CROSSOVER_GENERATION_INTERVAL = Math.max(1, parseInt(process.env.CROSSOVER_INTERVAL ?? '5', 10))
 
+const DEFAULT_MINING_TOOL_PREFERENCES = ['pickaxe', 'axe', 'shovel']
+const TOOL_TIER_WEIGHTS = [
+  { keyword: 'netherite', score: 120 },
+  { keyword: 'diamond', score: 100 },
+  { keyword: 'golden', score: 90 },
+  { keyword: 'gold', score: 85 },
+  { keyword: 'iron', score: 75 },
+  { keyword: 'stone', score: 60 },
+  { keyword: 'wooden', score: 45 },
+  { keyword: 'wood', score: 45 }
+]
+const TOOL_TYPE_WEIGHTS = {
+  pickaxe: 80,
+  axe: 65,
+  shovel: 55,
+  hoe: 20,
+  shears: 30
+}
+
 const pipelineAsync = promisify(pipeline)
 
 class RotatingCompressedLogger {
@@ -1089,6 +1108,9 @@ async function equipBestTool(context, preferredKeywords = []) {
   for (const keyword of preferredKeywords) {
     const tool = items.find(item => item?.name?.includes(keyword))
     if (tool) {
+      if (context.bot.heldItem?.type === tool.type) {
+        return true
+      }
       try {
         await context.bot.equip(tool, 'hand')
         return true
@@ -1097,6 +1119,144 @@ async function equipBestTool(context, preferredKeywords = []) {
       }
     }
   }
+  return false
+}
+
+function getToolTypeFromName(name = '') {
+  if (!name) return null
+  if (name.includes('pickaxe')) return 'pickaxe'
+  if (name.includes('axe')) return 'axe'
+  if (name.includes('shovel') || name.includes('spade')) return 'shovel'
+  if (name.includes('hoe')) return 'hoe'
+  if (name.includes('shears')) return 'shears'
+  return null
+}
+
+function getToolTierScore(name = '') {
+  let score = 0
+  for (const { keyword, score: tierScore } of TOOL_TIER_WEIGHTS) {
+    if (name.includes(keyword)) {
+      score = Math.max(score, tierScore)
+    }
+  }
+  return score
+}
+
+function resolveRegistryItemName(context, id) {
+  if (!context?.registry || typeof id !== 'number' || Number.isNaN(id)) return null
+  const { registry } = context
+  const direct = registry.items?.[id]
+  if (direct?.name) return direct.name
+  if (Array.isArray(registry.items)) {
+    const match = registry.items.find(item => item?.id === id)
+    if (match?.name) return match.name
+  }
+  if (registry.itemsByName) {
+    for (const [name, info] of Object.entries(registry.itemsByName)) {
+      if (info?.id === id) return name
+    }
+  }
+  return null
+}
+
+function determinePreferredToolTypes(context, block) {
+  const order = []
+  const addType = type => {
+    if (type && !order.includes(type)) {
+      order.push(type)
+    }
+  }
+
+  if (block?.harvestTools && typeof block.harvestTools === 'object') {
+    for (const key of Object.keys(block.harvestTools)) {
+      const id = Number.parseInt(key, 10)
+      if (Number.isNaN(id)) continue
+      const name = resolveRegistryItemName(context, id)
+      const toolType = getToolTypeFromName(name ?? '')
+      addType(toolType)
+    }
+  }
+
+  if (order.length === 0) {
+    const material = block?.material ?? ''
+    const name = block?.name ?? ''
+    const addForTokens = (tokens, type) => {
+      if (tokens.some(token => material.includes(token) || name.includes(token))) {
+        addType(type)
+      }
+    }
+
+    addForTokens(['stone', 'rock', 'ore', 'deepslate', 'nether', 'metal', 'anvil', 'obsidian'], 'pickaxe')
+    addForTokens(['log', 'wood', 'stem', 'hyphae', 'plank', 'mushroom', 'pumpkin'], 'axe')
+    addForTokens(['dirt', 'grass', 'sand', 'gravel', 'clay', 'snow', 'soul', 'mud', 'powder'], 'shovel')
+    if (name.includes('leaves') || material.includes('leaf')) {
+      addType('hoe')
+    }
+  }
+
+  if (order.length === 0) {
+    for (const fallback of DEFAULT_MINING_TOOL_PREFERENCES) {
+      addType(fallback)
+    }
+  }
+
+  return order
+}
+
+function scoreToolForBlock(context, item, block, preferredTypes) {
+  if (!item?.name) return -Infinity
+  const name = item.name
+  const toolType = getToolTypeFromName(name)
+  const harvestTools = block?.harvestTools
+  const hasHarvestHints = harvestTools && Object.keys(harvestTools).length > 0
+
+  let score = 0
+  if (hasHarvestHints) {
+    if (harvestTools[item.type]) {
+      score += 600
+    } else {
+      score -= 60
+    }
+  }
+
+  if (toolType && preferredTypes.includes(toolType)) {
+    score += 180
+  }
+
+  if (preferredTypes.some(type => name.includes(type))) {
+    score += 120
+  }
+
+  score += TOOL_TYPE_WEIGHTS[toolType] ?? 0
+  score += getToolTierScore(name)
+
+  return score
+}
+
+async function equipOptimalMiningTool(context, block) {
+  const preferredTypes = determinePreferredToolTypes(context, block)
+  const items = context.bot.inventory?.items?.() ?? []
+  let best = null
+
+  for (const item of items) {
+    const score = scoreToolForBlock(context, item, block, preferredTypes)
+    if (!best || score > best.score) {
+      best = { item, score }
+    }
+  }
+
+  if (best && best.score > 0) {
+    if (context.bot.heldItem?.type === best.item.type) {
+      return true
+    }
+    try {
+      await context.bot.equip(best.item, 'hand')
+      return true
+    } catch (err) {
+      console.warn(`[${label(context)}] Failed to equip ${best.item.name}:`, err?.message ?? err)
+    }
+  }
+
   return false
 }
 
@@ -1233,7 +1393,11 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
     bot.setControlState('right', true)
   }
 
-  const equipped = await equipBestTool(context, ['pickaxe', 'axe', 'shovel'])
+  let equipped = await equipOptimalMiningTool(context, target)
+  if (!equipped) {
+    const preferences = determinePreferredToolTypes(context, target)
+    equipped = await equipBestTool(context, preferences)
+  }
   if (!equipped) {
     await equipBestTool(context, ['hand'])
   }
