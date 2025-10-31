@@ -132,8 +132,14 @@ class LookaheadOptimizer:
 
     @staticmethod
     def _read_variable(variable):
-        if hasattr(variable, "value"):
-            return variable.value()
+        value_attr = getattr(variable, "value", None)
+        if value_attr is not None:
+            if callable(value_attr):
+                return value_attr()
+            try:
+                return tf.convert_to_tensor(value_attr)
+            except TypeError:
+                pass
         if hasattr(variable, "read_value"):
             return variable.read_value()
         if hasattr(variable, "numpy"):
