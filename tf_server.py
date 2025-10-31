@@ -10,6 +10,11 @@ import numpy as np
 import tensorflow as tf
 from flask import Flask, jsonify, request
 
+try:
+    import h5py  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    h5py = None
+
 ALLOWED_SEGMENT_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
 STORAGE_ROOT = os.environ.get("TF_SERVER_STORAGE_ROOT") or os.path.join(os.getcwd(), "tf_server_storage")
 os.makedirs(STORAGE_ROOT, exist_ok=True)
@@ -333,6 +338,65 @@ class RemoteBrain:
                     pass
             self.model.save_weights(weights_path)
 
+    @staticmethod
+    def _decode_name(name):
+        if isinstance(name, (bytes, bytearray)):
+            return name.decode("utf-8")
+        return str(name)
+
+    def _load_partial_weights(self, weights_path):
+        if h5py is None or not os.path.exists(weights_path):
+            return False
+        loaded_variables = 0
+        try:
+            with h5py.File(weights_path, "r") as handle:  # type: ignore[call-arg]
+                layer_names = handle.attrs.get("layer_names")
+                if not layer_names:
+                    return False
+                layer_lookup = {}
+                for raw_name in layer_names:
+                    layer_name = self._decode_name(raw_name)
+                    if layer_name in handle:
+                        layer_lookup[layer_name] = handle[layer_name]
+                if not layer_lookup:
+                    return False
+                for layer in self.model.layers:
+                    group = layer_lookup.get(layer.name)
+                    if group is None:
+                        continue
+                    weight_names = group.attrs.get("weight_names")
+                    if not weight_names:
+                        continue
+                    for raw_weight_name, weight_var in zip(weight_names, layer.weights):
+                        weight_name = self._decode_name(raw_weight_name)
+                        if weight_name not in group:
+                            continue
+                        value = group[weight_name][()]
+                        target_shape = tuple(int(dim) for dim in weight_var.shape)
+                        if value.shape != target_shape:
+                            continue
+                        if (
+                            hasattr(weight_var, "dtype")
+                            and hasattr(weight_var.dtype, "as_numpy_dtype")
+                        ):
+                            value = value.astype(weight_var.dtype.as_numpy_dtype, copy=False)
+                        try:
+                            weight_var.assign(value)
+                            loaded_variables += 1
+                        except Exception:  # pylint: disable=broad-except
+                            app.logger.exception(
+                                "Failed assigning partial weight %s for layer %s", weight_name, layer.name
+                            )
+            if loaded_variables:
+                app.logger.info(
+                    "Partially restored %s variables from %s", loaded_variables, weights_path
+                )
+                return True
+            return False
+        except Exception:  # pylint: disable=broad-except
+            app.logger.exception("Partial weight load failed for %s", weights_path)
+            return False
+
     def load_weights(self, directory):
         with self._lock:
             weights_path = os.path.join(directory, "weights.weights.h5")
@@ -351,17 +415,12 @@ class RemoteBrain:
                         weights_path,
                         exc,
                     )
-                    try:
-                        self.model.load_weights(
-                            weights_path,
-                            by_name=True,
-                            skip_mismatch=True,
-                        )
+                    if self._load_partial_weights(weights_path):
                         loaded = True
-                    except Exception as fallback_exc:
-                        raise exc from fallback_exc
-                if loaded:
-                    self.optimizer.sync_slow_variables(self.model.trainable_variables)
+                    else:
+                        raise
+            if loaded:
+                self.optimizer.sync_slow_variables(self.model.trainable_variables)
 
 
 def require_brain(brain_id):
