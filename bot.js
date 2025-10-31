@@ -12,7 +12,7 @@ import {
   copyWeights,
   averageWeights,
   mutateWeights
-} from './brain.js'
+} from './brainClient.js'
 
 // ----------------------------
 // CONFIG
@@ -220,7 +220,11 @@ async function initializeBaselineBrain() {
     if (loaded) {
       baselineBrain = loaded
     } else {
-      baselineBrain = createBrain(OBS_SIZE, ACTIONS.length)
+      baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
+    }
+
+    if (baselineBrain) {
+      baselineBrain.owner = 'baseline'
     }
 
     const savedState = await loadBrainState(CHECKPOINT_DIR)
@@ -238,7 +242,10 @@ async function initializeBaselineBrain() {
     }
   } catch (err) {
     console.error('[Baseline] Failed to initialize from checkpoint:', err)
-    baselineBrain = createBrain(OBS_SIZE, ACTIONS.length)
+    baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
+    if (baselineBrain) {
+      baselineBrain.owner = 'baseline'
+    }
   }
 
   return baselineBrain
@@ -255,7 +262,10 @@ async function ensureBaselineReady() {
     await baselineReady
   } catch (err) {
     console.error('[Baseline] Initialization failed, recreating model:', err)
-    baselineBrain = createBrain(OBS_SIZE, ACTIONS.length)
+    baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
+    if (baselineBrain) {
+      baselineBrain.owner = 'baseline'
+    }
     baselineReady = Promise.resolve(baselineBrain)
   }
   return baselineBrain
@@ -330,12 +340,13 @@ async function flushPendingSave() {
 async function ensureContextBrain(context) {
   if (context.brain) return context.brain
   await ensureBaselineReady()
-  const brain = createBrain(OBS_SIZE, ACTIONS.length)
+  const brain = await createBrain(OBS_SIZE, ACTIONS.length)
+  brain.owner = label(context)
   if (baselineBrain) {
-    copyWeights(brain, baselineBrain)
+    await copyWeights(brain, baselineBrain)
   }
   if (context.id > 0) {
-    mutateWeights(brain, MUTATION_STDDEV)
+    await mutateWeights(brain, MUTATION_STDDEV)
   }
   context.brain = brain
   return context.brain
@@ -848,9 +859,9 @@ async function synchronizeGeneration() {
     }
 
     if (topTwo.length === 1) {
-      copyWeights(baselineBrain, topTwo[0].brain)
+      await copyWeights(baselineBrain, topTwo[0].brain)
     } else {
-      averageWeights(baselineBrain, topTwo.map(ctx => ctx.brain))
+      await averageWeights(baselineBrain, topTwo.map(ctx => ctx.brain))
     }
 
     baselineState.generation += 1
@@ -858,9 +869,9 @@ async function synchronizeGeneration() {
 
     for (const ctx of contexts) {
       if (ctx.brain) {
-        copyWeights(ctx.brain, baselineBrain)
+        await copyWeights(ctx.brain, baselineBrain)
         if (!topTwo.includes(ctx)) {
-          mutateWeights(ctx.brain, MUTATION_STDDEV)
+          await mutateWeights(ctx.brain, MUTATION_STDDEV)
         }
       }
       ctx.generationTicks = 0
