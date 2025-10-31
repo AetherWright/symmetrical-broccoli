@@ -317,6 +317,16 @@ const STAGNATION_MUTATION_THRESHOLD = 3
 const DIVERSITY_WINDOW = 60
 const MAX_BOTS = Math.max(BOT_COUNT, parseInt(process.env.BOT_MAX ?? '8', 10))
 const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
+const LOW_REWARD_RETIRE_LIMIT = (() => {
+  const raw = Number.parseInt(process.env.BOT_LOW_REWARD_RETIRE ?? '2', 10)
+  if (!Number.isFinite(raw) || raw <= 0) return 0
+  return raw
+})()
+const LOW_REWARD_RETIRE_THRESHOLD = (() => {
+  const raw = Number.parseFloat(process.env.BOT_LOW_REWARD_THRESHOLD ?? '')
+  if (Number.isFinite(raw)) return raw
+  return Number.NEGATIVE_INFINITY
+})()
 const DOWNTREND_GENERATION_WINDOW = (() => {
   const raw = Number.parseInt(process.env.BOT_DOWNTREND_WINDOW ?? '4', 10)
   return Number.isFinite(raw) && raw >= 2 ? Math.max(3, raw) : 4
@@ -2412,6 +2422,31 @@ async function synchronizeGeneration() {
       }
     }
 
+    const lowRewardRetirees = []
+    const availableLowRewardSlots = Math.max(
+      0,
+      Math.min(LOW_REWARD_RETIRE_LIMIT, contexts.length - retireReasons.size - MIN_BOTS)
+    )
+    if (availableLowRewardSlots > 0) {
+      const eligible = sorted.filter(ctx => !retireReasons.has(ctx))
+      const applyThreshold = Number.isFinite(LOW_REWARD_RETIRE_THRESHOLD)
+      const thresholdCandidates = applyThreshold
+        ? eligible.filter(ctx => (ctx.generationReward ?? 0) <= LOW_REWARD_RETIRE_THRESHOLD)
+        : eligible
+      const rankingPool = (thresholdCandidates.length ? thresholdCandidates : eligible).slice()
+      rankingPool.sort((a, b) => {
+        const genDelta = (a.generationReward ?? 0) - (b.generationReward ?? 0)
+        if (genDelta !== 0) return genDelta
+        const cumulativeDelta = (a.cumulativeReward ?? 0) - (b.cumulativeReward ?? 0)
+        if (cumulativeDelta !== 0) return cumulativeDelta
+        return (a.birthOrder ?? 0) - (b.birthOrder ?? 0)
+      })
+      for (const candidate of rankingPool.slice(0, availableLowRewardSlots)) {
+        retireReasons.set(candidate, 'lowest-reward')
+        lowRewardRetirees.push(candidate)
+      }
+    }
+
     for (const ctx of contexts) {
       ctx.generationTicks = 0
       ctx.generationReward = 0
@@ -2425,6 +2460,16 @@ async function synchronizeGeneration() {
       const snapshot = history.length ? history.map(value => value.toFixed(2)).join(' → ') : 'n/a'
       console.log(
         `[Baseline] Retiring ${label(retiree)} due to sustained reward downtrend (slope ${slope.toFixed(3)}, window ${snapshot}).`
+      )
+    }
+
+    for (const retiree of lowRewardRetirees) {
+      const genReward = retiree.generationReward ?? 0
+      const totalReward = retiree.cumulativeReward ?? 0
+      console.log(
+        `[Baseline] Retiring ${label(retiree)} due to lowest generation reward (${genReward.toFixed(
+          2
+        )} gen, total ${totalReward.toFixed(2)}).`
       )
     }
 
