@@ -341,8 +341,27 @@ class RemoteBrain:
                 if os.path.exists(legacy_path):
                     weights_path = legacy_path
             if os.path.exists(weights_path):
-                self.model.load_weights(weights_path)
-                self.optimizer.sync_slow_variables(self.model.trainable_variables)
+                loaded = False
+                try:
+                    self.model.load_weights(weights_path)
+                    loaded = True
+                except ValueError as exc:
+                    app.logger.warning(
+                        "Exact weight load failed for %s: %s. Retrying with name-based partial load.",
+                        weights_path,
+                        exc,
+                    )
+                    try:
+                        self.model.load_weights(
+                            weights_path,
+                            by_name=True,
+                            skip_mismatch=True,
+                        )
+                        loaded = True
+                    except Exception as fallback_exc:
+                        raise exc from fallback_exc
+                if loaded:
+                    self.optimizer.sync_slow_variables(self.model.trainable_variables)
 
 
 def require_brain(brain_id):
