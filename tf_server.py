@@ -1,8 +1,10 @@
+import atexit
 import json
 import os
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import tensorflow as tf
@@ -38,8 +40,79 @@ STATUS = {
     "started_at": time.time(),
     "total_requests": 0,
     "requests": [],
-    "bots": {}
+    "bots": {},
+    "workers": {}
 }
+
+
+def _read_int(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return max(1, int(default))
+
+
+DEFAULT_WORKERS = _read_int("TF_SERVER_DEFAULT_WORKERS", 2)
+ENDPOINT_WORKER_LIMITS = {
+    "act": _read_int("TF_SERVER_ACT_WORKERS", DEFAULT_WORKERS * 2),
+    "train": _read_int("TF_SERVER_TRAIN_WORKERS", DEFAULT_WORKERS),
+    "average": _read_int("TF_SERVER_AVERAGE_WORKERS", DEFAULT_WORKERS),
+    "mutate": _read_int("TF_SERVER_MUTATE_WORKERS", DEFAULT_WORKERS),
+    "copy": _read_int("TF_SERVER_COPY_WORKERS", DEFAULT_WORKERS),
+    "save": _read_int("TF_SERVER_SAVE_WORKERS", DEFAULT_WORKERS),
+    "load": _read_int("TF_SERVER_LOAD_WORKERS", DEFAULT_WORKERS),
+    "default": DEFAULT_WORKERS
+}
+
+
+class EndpointWorkerPool:
+    def __init__(self, limits):
+        self._limits = dict(limits)
+        self._executors = {}
+        self._lock = threading.Lock()
+
+    def _get_limit(self, endpoint):
+        return max(1, int(self._limits.get(endpoint, self._limits.get("default", 1))))
+
+    def _get_executor(self, endpoint):
+        with self._lock:
+            executor = self._executors.get(endpoint)
+            if executor is None:
+                max_workers = self._get_limit(endpoint)
+                executor = ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix=f"{endpoint}-worker"
+                )
+                self._executors[endpoint] = executor
+            return executor
+
+    def run(self, endpoint, func, *args, **kwargs):
+        executor = self._get_executor(endpoint)
+        future = executor.submit(func, *args, **kwargs)
+        return future.result()
+
+    def snapshot(self):
+        snapshot = {}
+        with self._lock:
+            for endpoint, executor in self._executors.items():
+                queue = getattr(executor, "_work_queue", None)
+                pending = queue.qsize() if queue is not None else 0
+                snapshot[endpoint] = {
+                    "max_workers": executor._max_workers,
+                    "pending": pending
+                }
+        return snapshot
+
+    def shutdown(self):
+        with self._lock:
+            executors = list(self._executors.values())
+            self._executors.clear()
+        for executor in executors:
+            executor.shutdown(wait=False)
+
+
+WORKERS = EndpointWorkerPool(ENDPOINT_WORKER_LIMITS)
+atexit.register(WORKERS.shutdown)
 
 BRAIN_CONFIG = {
     "hidden_units": 64,
@@ -113,84 +186,104 @@ class RemoteBrain:
         nadam = tf.keras.optimizers.Nadam(learning_rate=2e-3)
         self.optimizer = LookaheadOptimizer(nadam, sync_period=6, slow_step_size=0.5)
         self.prediction_weight = tf.constant(1.0, dtype=tf.float32)
+        self._lock = threading.RLock()
 
     def choose_action(self, observation, epsilon):
-        obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
-        action_probs, prediction = self.model(obs, training=False)
-        probs = np.clip(action_probs.numpy().flatten(), 1e-8, 1.0)
-        probs = probs / probs.sum()
-        predicted_next = prediction.numpy().flatten().tolist()
-        if np.random.random() < epsilon:
-            action_index = int(np.random.randint(0, self.action_count))
-        else:
-            action_index = int(np.argmax(probs))
-        return action_index, predicted_next
+        with self._lock:
+            obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
+            action_probs, prediction = self.model(obs, training=False)
+            probs = np.clip(action_probs.numpy().flatten(), 1e-8, 1.0)
+            probs = probs / probs.sum()
+            predicted_next = prediction.numpy().flatten().tolist()
+            if np.random.random() < epsilon:
+                action_index = int(np.random.randint(0, self.action_count))
+            else:
+                action_index = int(np.argmax(probs))
+            return action_index, predicted_next
 
     def train(self, observation, action_index, reward, next_observation):
-        obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
+        with self._lock:
+            obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
 
-        use_policy = action_index is not None and reward is not None
-        use_prediction = next_observation is not None
+            use_policy = action_index is not None and reward is not None
+            use_prediction = next_observation is not None
 
-        if not (use_policy or use_prediction):
-            return False
+            if not (use_policy or use_prediction):
+                return False
 
-        with tf.GradientTape() as tape:
-            action_pred, prediction = self.model(obs, training=True)
-            total_loss = tf.constant(0.0, dtype=tf.float32)
+            with tf.GradientTape() as tape:
+                action_pred, prediction = self.model(obs, training=True)
+                total_loss = tf.constant(0.0, dtype=tf.float32)
 
-            if use_policy:
-                bounded_action = int(np.clip(int(action_index), 0, self.action_count - 1))
-                scaled_reward = float(np.clip(reward, -1.0, 1.0))
-                one_hot = tf.one_hot([bounded_action], self.action_count)
-                log_probs = tf.math.log(action_pred + 1e-8)
-                policy_loss = -scaled_reward * tf.reduce_mean(
-                    tf.reduce_sum(log_probs * one_hot, axis=-1)
-                )
-                total_loss += policy_loss
+                if use_policy:
+                    bounded_action = int(np.clip(int(action_index), 0, self.action_count - 1))
+                    scaled_reward = float(np.clip(reward, -1.0, 1.0))
+                    one_hot = tf.one_hot([bounded_action], self.action_count)
+                    log_probs = tf.math.log(action_pred + 1e-8)
+                    policy_loss = -scaled_reward * tf.reduce_mean(
+                        tf.reduce_sum(log_probs * one_hot, axis=-1)
+                    )
+                    total_loss += policy_loss
 
-            if use_prediction:
-                next_obs = np.asarray(next_observation, dtype=np.float32).reshape(1, -1)
-                prediction_loss = tf.reduce_mean(tf.square(prediction - next_obs))
-                total_loss += self.prediction_weight * prediction_loss
+                if use_prediction:
+                    next_obs = np.asarray(next_observation, dtype=np.float32).reshape(1, -1)
+                    prediction_loss = tf.reduce_mean(tf.square(prediction - next_obs))
+                    total_loss += self.prediction_weight * prediction_loss
 
-        gradients = tape.gradient(total_loss, self.model.trainable_variables)
-        grads_and_vars = [
-            (grad, var)
-            for grad, var in zip(gradients, self.model.trainable_variables)
-            if grad is not None
-        ]
-        if grads_and_vars:
-            self.optimizer.apply_gradients(grads_and_vars)
+            gradients = tape.gradient(total_loss, self.model.trainable_variables)
+            grads_and_vars = [
+                (grad, var)
+                for grad, var in zip(gradients, self.model.trainable_variables)
+                if grad is not None
+            ]
+            if grads_and_vars:
+                self.optimizer.apply_gradients(grads_and_vars)
 
-        return bool(grads_and_vars)
+            return bool(grads_and_vars)
 
     def copy_from(self, other):
-        self.model.set_weights(other.model.get_weights())
+        if other is self:
+            return
+        first, second = (self, other) if id(self) <= id(other) else (other, self)
+        with first._lock:
+            with second._lock:
+                weights = other.model.get_weights()
+                self.model.set_weights(weights)
 
     def average_from(self, sources):
         if not sources:
             return
-        weights = [source.model.get_weights() for source in sources]
-        averaged = [np.mean(np.stack(layer_weights, axis=0), axis=0) for layer_weights in zip(*weights)]
-        self.model.set_weights(averaged)
+        with self._lock:
+            weights = []
+            for source in sources:
+                if source is None:
+                    continue
+                with source._lock:
+                    weights.append(source.model.get_weights())
+            if not weights:
+                return
+            averaged = [np.mean(np.stack(layer_weights, axis=0), axis=0) for layer_weights in zip(*weights)]
+            self.model.set_weights(averaged)
 
     def mutate(self, stddev):
-        weights = self.model.get_weights()
-        mutated = [w + np.random.normal(0, stddev, size=w.shape) for w in weights]
-        self.model.set_weights(mutated)
+        with self._lock:
+            weights = self.model.get_weights()
+            mutated = [w + np.random.normal(0, stddev, size=w.shape) for w in weights]
+            self.model.set_weights(mutated)
 
     def save(self, directory):
-        os.makedirs(directory, exist_ok=True)
-        with open(os.path.join(directory, "model.json"), "w", encoding="utf-8") as handle:
-            handle.write(self.model.to_json())
-        weights_path = os.path.join(directory, "weights.h5")
-        self.model.save_weights(weights_path)
+        with self._lock:
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "model.json"), "w", encoding="utf-8") as handle:
+                handle.write(self.model.to_json())
+            weights_path = os.path.join(directory, "weights.h5")
+            self.model.save_weights(weights_path)
 
     def load_weights(self, directory):
-        weights_path = os.path.join(directory, "weights.h5")
-        if os.path.exists(weights_path):
-            self.model.load_weights(weights_path)
+        with self._lock:
+            weights_path = os.path.join(directory, "weights.h5")
+            if os.path.exists(weights_path):
+                self.model.load_weights(weights_path)
 
 
 def require_brain(brain_id):
@@ -198,6 +291,14 @@ def require_brain(brain_id):
     if brain is None:
         return None, (jsonify({"error": "Unknown brain"}), 404)
     return brain, None
+
+
+def _execute(endpoint, func, *args, **kwargs):
+    try:
+        return WORKERS.run(endpoint, func, *args, **kwargs)
+    except Exception as exc:  # pylint: disable=broad-except
+        app.logger.exception("Endpoint '%s' task failed", endpoint)
+        raise RuntimeError(f"Failed to process {endpoint} request") from exc
 
 
 def log_request(bot_id, endpoint, payload):
@@ -214,6 +315,7 @@ def log_request(bot_id, endpoint, payload):
         }
         STATUS["requests"].append(entry)
         STATUS["requests"] = STATUS["requests"][-50:]
+        STATUS["workers"] = WORKERS.snapshot()
         if bot_id:
             bot_state = STATUS["bots"].setdefault(bot_id, {})
             bot_state.update(
@@ -262,7 +364,10 @@ def choose_action_endpoint(brain_id):
     if not isinstance(observation, (list, tuple)):
         return jsonify({"error": "Observation must be a list"}), 400
     epsilon = float(payload.get("epsilon", 0.1))
-    action, prediction = brain.choose_action(observation, epsilon)
+    try:
+        action, prediction = _execute("act", brain.choose_action, observation, epsilon)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
     log_request(
         payload.get("bot_id"),
         "act",
@@ -281,12 +386,17 @@ def train_endpoint(brain_id):
     if not isinstance(observation, (list, tuple)):
         return jsonify({"error": "Observation must be a list"}), 400
     next_observation = payload.get("next_observation")
-    trained = brain.train(
-        observation,
-        payload.get("action"),
-        payload.get("reward"),
-        next_observation if isinstance(next_observation, (list, tuple)) else None
-    )
+    try:
+        trained = _execute(
+            "train",
+            brain.train,
+            observation,
+            payload.get("action"),
+            payload.get("reward"),
+            next_observation if isinstance(next_observation, (list, tuple)) else None
+        )
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
     log_request(payload.get("bot_id"), "train", payload)
     return jsonify({"trained": bool(trained)})
 
@@ -301,7 +411,10 @@ def copy_endpoint(brain_id):
     source, source_error = require_brain(source_id)
     if source_error:
         return source_error
-    brain.copy_from(source)
+    try:
+        _execute("copy", brain.copy_from, source)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
     return jsonify({"status": "ok"})
 
 
@@ -318,7 +431,10 @@ def average_endpoint(brain_id):
         if src_error:
             return src_error
         sources.append(src)
-    brain.average_from(sources)
+    try:
+        _execute("average", brain.average_from, sources)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
     return jsonify({"status": "ok"})
 
 
@@ -331,7 +447,10 @@ def mutate_endpoint(brain_id):
     stddev = float(payload.get("stddev", 0.02))
     if stddev <= 0:
         return jsonify({"error": "Stddev must be positive"}), 400
-    brain.mutate(stddev)
+    try:
+        _execute("mutate", brain.mutate, stddev)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
     return jsonify({"status": "ok"})
 
 
@@ -343,7 +462,10 @@ def save_endpoint(brain_id):
     payload = request.get_json(force=True) or {}
     label = payload.get("path") or brain_id
     target_dir = _resolve_storage_path("brains", label, create=True)
-    brain.save(target_dir)
+    try:
+        _execute("save", brain.save, target_dir)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
     return jsonify({"status": "ok", "path": label})
 
 
@@ -360,7 +482,10 @@ def load_endpoint():
         return jsonify({"error": "Checkpoint not found"}), 404
     brain_id = str(uuid.uuid4())
     brain = RemoteBrain(input_size, action_count)
-    brain.load_weights(path)
+    try:
+        _execute("load", brain.load_weights, path)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
     BRAINS[brain_id] = brain
     return jsonify({"brain_id": brain_id})
 
@@ -397,13 +522,15 @@ def load_state_endpoint():
 @app.get("/status")
 def status_endpoint():
     with STATE_LOCK:
+        STATUS["workers"] = WORKERS.snapshot()
         payload = {
             "started_at": STATUS["started_at"],
             "uptime": time.time() - STATUS["started_at"],
             "total_requests": STATUS["total_requests"],
             "brain_count": len(BRAINS),
             "bots": STATUS["bots"],
-            "recent_requests": STATUS["requests"][-10:]
+            "recent_requests": STATUS["requests"][-10:],
+            "workers": STATUS["workers"]
         }
     return jsonify(payload)
 
