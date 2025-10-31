@@ -6,7 +6,6 @@ import uuid
 
 import numpy as np
 import tensorflow as tf
-import tensorflow_addons as tfa
 from flask import Flask, jsonify, request
 
 ALLOWED_SEGMENT_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
@@ -48,6 +47,41 @@ BRAIN_CONFIG = {
 }
 
 
+class LookaheadOptimizer:
+    def __init__(self, optimizer, sync_period=6, slow_step_size=0.5):
+        self.optimizer = optimizer
+        self.sync_period = max(1, int(sync_period))
+        self.slow_step_size = float(slow_step_size)
+        self._fast_vars = []
+        self._slow_vars = []
+        self._step = 0
+
+    def _ensure_slot_variables(self, variables):
+        for var in variables:
+            if var in self._fast_vars:
+                continue
+            self._fast_vars.append(var)
+            self._slow_vars.append(
+                tf.Variable(var.read_value(), trainable=False)
+            )
+
+    def apply_gradients(self, grads_and_vars):
+        if not grads_and_vars:
+            return
+        variables = [var for grad, var in grads_and_vars if var is not None]
+        if not variables:
+            return
+        self._ensure_slot_variables(variables)
+        self.optimizer.apply_gradients(grads_and_vars)
+        self._step += 1
+        if self.sync_period and self._step % self.sync_period == 0:
+            for slow_var, fast_var in zip(self._slow_vars, self._fast_vars):
+                fast_value = fast_var.read_value()
+                slow_value = slow_var.read_value()
+                slow_var.assign(slow_value + (fast_value - slow_value) * self.slow_step_size)
+                fast_var.assign(slow_var.read_value())
+
+
 def build_model(input_size, action_count):
     inputs = tf.keras.Input(shape=(input_size,), name="observation")
     x = tf.keras.layers.BatchNormalization()(inputs)
@@ -77,7 +111,7 @@ class RemoteBrain:
         self.action_count = int(action_count)
         self.model = build_model(self.input_size, self.action_count)
         nadam = tf.keras.optimizers.Nadam(learning_rate=2e-3)
-        self.optimizer = tfa.optimizers.Lookahead(nadam, sync_period=6, slow_step_size=0.5)
+        self.optimizer = LookaheadOptimizer(nadam, sync_period=6, slow_step_size=0.5)
         self.prediction_weight = tf.constant(1.0, dtype=tf.float32)
 
     def choose_action(self, observation, epsilon):
