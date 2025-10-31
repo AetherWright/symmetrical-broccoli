@@ -57,6 +57,13 @@ def _read_int(name, default):
         return max(1, int(default))
 
 
+def _read_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 DEFAULT_WORKERS = _read_int("TF_SERVER_DEFAULT_WORKERS", 2)
 ENDPOINT_WORKER_LIMITS = {
     "act": _read_int("TF_SERVER_ACT_WORKERS", DEFAULT_WORKERS * 2),
@@ -125,6 +132,44 @@ BRAIN_CONFIG = {
     "shared_units": 64,
     "dropout_rate": 0.25,
 }
+
+OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
+
+
+def _sanitize_vector(vector, expected_size=None, label="vector"):
+    if vector is None:
+        return None, 0, 0, False
+    try:
+        arr = np.asarray(vector, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        app.logger.warning("Failed to coerce %s payload into float array", label)
+        return None, 0, 0, False
+    invalid_mask = ~np.isfinite(arr)
+    replaced = int(np.count_nonzero(invalid_mask))
+    if replaced:
+        arr = np.where(invalid_mask, 0.0, arr)
+    clipped = 0
+    if OBS_CLAMP > 0:
+        clipped_mask = np.abs(arr) > OBS_CLAMP
+        clipped = int(np.count_nonzero(clipped_mask))
+        if clipped:
+            arr = np.clip(arr, -OBS_CLAMP, OBS_CLAMP)
+    adjusted = False
+    if expected_size and expected_size > 0 and arr.size != expected_size:
+        adjusted = True
+        if arr.size > expected_size:
+            arr = arr[:expected_size]
+        else:
+            arr = np.pad(arr, (0, expected_size - arr.size), constant_values=0.0)
+    if replaced or clipped or adjusted:
+        app.logger.warning(
+            "Sanitized %s payload (replaced=%d, clipped=%d, adjusted=%s)",
+            label,
+            replaced,
+            clipped,
+            adjusted,
+        )
+    return arr.astype(np.float32, copy=False), replaced, clipped, adjusted
 
 
 class LookaheadOptimizer:
@@ -246,13 +291,57 @@ class RemoteBrain:
         self.prediction_weight = tf.constant(1.0, dtype=tf.float32)
         self._lock = threading.RLock()
 
+    def _prepare_observation(self, vector, label):
+        prepared, _, _, _ = _sanitize_vector(vector, expected_size=self.input_size, label=label)
+        if prepared is None:
+            raise ValueError(f"{label} payload missing")
+        return prepared.reshape(1, -1)
+
+    def _sanitize_prediction_output(self, tensor):
+        array = np.asarray(tensor, dtype=np.float32).reshape(-1)
+        if not np.all(np.isfinite(array)):
+            app.logger.warning("Sanitized prediction output due to non-finite values")
+        array = np.nan_to_num(array, nan=0.0, posinf=OBS_CLAMP, neginf=-OBS_CLAMP)
+        if OBS_CLAMP > 0:
+            array = np.clip(array, -OBS_CLAMP, OBS_CLAMP)
+        if array.size != self.input_size:
+            app.logger.warning(
+                "Adjusted prediction output size from %d to %d",
+                array.size,
+                self.input_size,
+            )
+            if array.size > self.input_size:
+                array = array[: self.input_size]
+            else:
+                array = np.pad(array, (0, self.input_size - array.size), constant_values=0.0)
+        return array.astype(np.float32, copy=False).tolist()
+
+    @staticmethod
+    def _filter_gradients(grads_and_vars):
+        cleaned = []
+        dropped = 0
+        for grad, var in grads_and_vars:
+            if grad is None:
+                continue
+            tensor = grad.values if isinstance(grad, tf.IndexedSlices) else grad
+            finite = bool(tf.reduce_all(tf.math.is_finite(tensor)).numpy())
+            if not finite:
+                dropped += 1
+                app.logger.warning("Dropped non-finite gradients for variable %s", getattr(var, "name", "?"))
+                continue
+            cleaned.append((grad, var))
+        return cleaned, dropped
+
     def choose_action(self, observation, epsilon):
         with self._lock:
-            obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
+            try:
+                obs = self._prepare_observation(observation, "observation")
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
             action_probs, prediction = self.model(obs, training=False)
             probs = np.clip(action_probs.numpy().flatten(), 1e-8, 1.0)
             probs = probs / probs.sum()
-            predicted_next = prediction.numpy().flatten().tolist()
+            predicted_next = self._sanitize_prediction_output(prediction.numpy())
             if np.random.random() < epsilon:
                 action_index = int(np.random.randint(0, self.action_count))
             else:
@@ -261,7 +350,11 @@ class RemoteBrain:
 
     def train(self, observation, action_index, reward, next_observation):
         with self._lock:
-            obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
+            try:
+                obs = self._prepare_observation(observation, "observation")
+            except ValueError:
+                app.logger.warning("Skipping train call due to missing observation payload")
+                return False
 
             use_policy = action_index is not None and reward is not None
             use_prediction = next_observation is not None
@@ -269,13 +362,39 @@ class RemoteBrain:
             if not (use_policy or use_prediction):
                 return False
 
+            bounded_action = None
+            scaled_reward = 0.0
+            if use_policy:
+                try:
+                    bounded_action = int(action_index)
+                except (TypeError, ValueError):
+                    app.logger.warning("Received invalid action index: %s", action_index)
+                    use_policy = False
+                else:
+                    bounded_action = int(np.clip(bounded_action, 0, self.action_count - 1))
+                    try:
+                        reward_value = float(reward)
+                    except (TypeError, ValueError):
+                        app.logger.warning("Received invalid reward value: %s", reward)
+                        reward_value = 0.0
+                    if not np.isfinite(reward_value):
+                        app.logger.warning("Reward contained non-finite value: %s", reward)
+                        reward_value = 0.0
+                    scaled_reward = float(np.clip(reward_value, -1.0, 1.0))
+
+            next_obs = None
+            if use_prediction:
+                try:
+                    next_obs = self._prepare_observation(next_observation, "next_observation")
+                except ValueError:
+                    app.logger.warning("Skipping prediction loss due to invalid next observation payload")
+                    use_prediction = False
+
             with tf.GradientTape() as tape:
                 action_pred, prediction = self.model(obs, training=True)
                 total_loss = tf.constant(0.0, dtype=tf.float32)
 
                 if use_policy:
-                    bounded_action = int(np.clip(int(action_index), 0, self.action_count - 1))
-                    scaled_reward = float(np.clip(reward, -1.0, 1.0))
                     one_hot = tf.one_hot([bounded_action], self.action_count)
                     log_probs = tf.math.log(action_pred + 1e-8)
                     policy_loss = -scaled_reward * tf.reduce_mean(
@@ -284,9 +403,14 @@ class RemoteBrain:
                     total_loss += policy_loss
 
                 if use_prediction:
-                    next_obs = np.asarray(next_observation, dtype=np.float32).reshape(1, -1)
                     prediction_loss = tf.reduce_mean(tf.square(prediction - next_obs))
                     total_loss += self.prediction_weight * prediction_loss
+
+                total_loss = tf.where(
+                    tf.math.is_finite(total_loss),
+                    total_loss,
+                    tf.constant(0.0, dtype=tf.float32),
+                )
 
             gradients = tape.gradient(total_loss, self.model.trainable_variables)
             grads_and_vars = [
@@ -294,10 +418,13 @@ class RemoteBrain:
                 for grad, var in zip(gradients, self.model.trainable_variables)
                 if grad is not None
             ]
-            if grads_and_vars:
-                self.optimizer.apply_gradients(grads_and_vars)
+            cleaned_grads, dropped = self._filter_gradients(grads_and_vars)
+            if dropped:
+                app.logger.warning("Skipped %d gradient tensors due to non-finite values", dropped)
+            if cleaned_grads:
+                self.optimizer.apply_gradients(cleaned_grads)
 
-            return bool(grads_and_vars)
+            return bool(cleaned_grads)
 
     def copy_from(self, other):
         if other is self:
