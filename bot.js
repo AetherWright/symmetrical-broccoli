@@ -253,6 +253,30 @@ const STAGNATION_MUTATION_THRESHOLD = 3
 const DIVERSITY_WINDOW = 60
 const MAX_BOTS = Math.max(BOT_COUNT, parseInt(process.env.BOT_MAX ?? '8', 10))
 const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
+const DOWNTREND_GENERATION_WINDOW = (() => {
+  const raw = Number.parseInt(process.env.BOT_DOWNTREND_WINDOW ?? '4', 10)
+  return Number.isFinite(raw) && raw >= 2 ? Math.max(3, raw) : 4
+})()
+const DOWNTREND_SLOPE_THRESHOLD = (() => {
+  const raw = Number.parseFloat(process.env.BOT_DOWNTREND_SLOPE ?? '0.35')
+  return Number.isFinite(raw) ? Math.max(0.05, raw) : 0.35
+})()
+const DOWNTREND_MARGIN = (() => {
+  const raw = Number.parseFloat(process.env.BOT_DOWNTREND_MARGIN ?? '0.3')
+  return Number.isFinite(raw) ? Math.max(0, raw) : 0.3
+})()
+const DOWNTREND_STREAK_LIMIT = (() => {
+  const raw = Number.parseInt(process.env.BOT_DOWNTREND_STREAK ?? '2', 10)
+  return Number.isFinite(raw) && raw >= 1 ? raw : 2
+})()
+const DOWNTREND_MIN_AGE_GENERATIONS = (() => {
+  const raw = Number.parseInt(process.env.BOT_DOWNTREND_MIN_AGE ?? '3', 10)
+  return Number.isFinite(raw) && raw >= 1 ? raw : 3
+})()
+const DOWNTREND_RETIRE_LIMIT = (() => {
+  const raw = Number.parseInt(process.env.BOT_DOWNTREND_RETIRE ?? '2', 10)
+  return Number.isFinite(raw) && raw >= 1 ? raw : 2
+})()
 const MAX_USERNAME_LENGTH = 16
 const RESOURCE_TYPES = ['wood', 'stone', 'ore', 'crafted']
 
@@ -263,6 +287,7 @@ const contexts = []
 const usedNames = new Set()
 const lineageStats = new Map()
 const lineageCounters = new Map([[LINEAGE_ROOT_NAME, 0]])
+let birthCounter = 0
 let globalRunning = true
 let baselineBrain = null
 let baselineReady = null
@@ -1461,6 +1486,63 @@ function updateStagnation(context, reward) {
   }
 }
 
+function updateGenerationTrend(context) {
+  if (!context?.rewardTrend) return
+
+  const history = context.rewardTrend.generationHistory
+  history.push(context.generationReward)
+  if (history.length > DOWNTREND_GENERATION_WINDOW) {
+    history.splice(0, history.length - DOWNTREND_GENERATION_WINDOW)
+  }
+
+  const previousFlag = context.rewardTrend.flaggedDownward ?? false
+
+  if (history.length < 2) {
+    context.rewardTrend.downwardStreak = 0
+    context.rewardTrend.flaggedDownward = false
+    context.rewardTrend.lastSlope = 0
+    context.rewardTrend.lastWindow = history.slice()
+    return
+  }
+
+  const first = history[0]
+  const last = history[history.length - 1]
+  const slope = (last - first) / (history.length - 1 || 1)
+  const netDrop = first - last
+  const trendingDown = slope <= -DOWNTREND_SLOPE_THRESHOLD && netDrop >= DOWNTREND_MARGIN
+
+  if (trendingDown) {
+    context.rewardTrend.downwardStreak = (context.rewardTrend.downwardStreak ?? 0) + 1
+  } else {
+    context.rewardTrend.downwardStreak = 0
+  }
+
+  context.rewardTrend.flaggedDownward = context.rewardTrend.downwardStreak >= DOWNTREND_STREAK_LIMIT
+  context.rewardTrend.lastSlope = slope
+  context.rewardTrend.lastWindow = history.slice()
+  context.rewardTrend.lastNetDrop = netDrop
+  context.rewardTrend.lastUpdatedGeneration = baselineState.generation
+
+  if (!previousFlag && context.rewardTrend.flaggedDownward) {
+    const snapshot = context.rewardTrend.lastWindow.map(value => value.toFixed(2)).join(' → ')
+    console.log(
+      `[${label(context)}] Reward downtrend detected (window ${snapshot || 'n/a'}, slope ${slope.toFixed(3)}).`
+    )
+  } else if (previousFlag && !context.rewardTrend.flaggedDownward) {
+    const snapshot = context.rewardTrend.lastWindow.map(value => value.toFixed(2)).join(' → ')
+    console.log(`[${label(context)}] Reward downtrend cleared (window ${snapshot || 'n/a'}).`)
+  }
+}
+
+function shouldCullForDowntrend(context) {
+  if (!context?.rewardTrend?.flaggedDownward) return false
+  const age = (baselineState.generation ?? 0) - (context.birthGeneration ?? 0)
+  if (age < DOWNTREND_MIN_AGE_GENERATIONS) {
+    return false
+  }
+  return true
+}
+
 function computeReward(context, obs) {
   let reward = 0
 
@@ -1781,15 +1863,53 @@ async function synchronizeGeneration() {
     const retireList = contractionCount > 0 ? sorted.slice(-contractionCount) : []
 
     for (const ctx of contexts) {
+      updateGenerationTrend(ctx)
+    }
+
+    const retireReasons = new Map()
+    for (const retiree of retireList) {
+      if (retiree) {
+        retireReasons.set(retiree, 'dynamic-scaling')
+      }
+    }
+
+    const availableDowntrendSlots = Math.max(0, contexts.length - retireReasons.size - MIN_BOTS)
+    const downtrendRetirees = []
+    if (availableDowntrendSlots > 0) {
+      const downtrendCandidates = sorted
+        .filter(ctx => !retireReasons.has(ctx) && shouldCullForDowntrend(ctx))
+        .sort((a, b) => {
+          const ageOrder = (a.birthOrder ?? 0) - (b.birthOrder ?? 0)
+          if (ageOrder !== 0) return ageOrder
+          const slopeA = a.rewardTrend?.lastSlope ?? 0
+          const slopeB = b.rewardTrend?.lastSlope ?? 0
+          return slopeA - slopeB
+        })
+      const limit = Math.min(DOWNTREND_RETIRE_LIMIT, availableDowntrendSlots)
+      for (const candidate of downtrendCandidates.slice(0, limit)) {
+        retireReasons.set(candidate, 'reward-downtrend')
+        downtrendRetirees.push(candidate)
+      }
+    }
+
+    for (const ctx of contexts) {
       ctx.generationTicks = 0
       ctx.generationReward = 0
       ctx.readyForSync = false
     }
 
-    for (const retiree of retireList) {
-      if (retiree) {
-        await retireContext(retiree, 'dynamic-scaling')
-      }
+    for (const retiree of downtrendRetirees) {
+      const trend = retiree.rewardTrend
+      const slope = trend?.lastSlope ?? 0
+      const history = trend?.lastWindow ?? []
+      const snapshot = history.length ? history.map(value => value.toFixed(2)).join(' → ') : 'n/a'
+      console.log(
+        `[Baseline] Retiring ${label(retiree)} due to sustained reward downtrend (slope ${slope.toFixed(3)}, window ${snapshot}).`
+      )
+    }
+
+    for (const [retiree, reason] of retireReasons.entries()) {
+      await retireContext(retiree, reason)
     }
 
     const activeLineages = new Set()
@@ -2012,6 +2132,10 @@ function createContext(index, options = {}) {
     lineage: identity.lineage,
     lineageOrdinal: identity.ordinal,
     lineagePrestige: getLineagePrestige(identity.lineage),
+    birthOrder: birthCounter++,
+    birthGeneration: baselineState.generation ?? 0,
+    birthTick: baselineState.tickCount ?? 0,
+    birthTime: Date.now(),
     mode,
     feralFury: 0,
     bot,
@@ -2064,7 +2188,16 @@ function createContext(index, options = {}) {
     stagnation: {
       active: false,
       streak: 0,
-      lastMutation: 0
+      lastMutation: baselineState.generation ?? 0
+    },
+    rewardTrend: {
+      generationHistory: [],
+      downwardStreak: 0,
+      flaggedDownward: false,
+      lastSlope: 0,
+      lastWindow: [],
+      lastNetDrop: 0,
+      lastUpdatedGeneration: baselineState.generation ?? 0
     },
     morale: {
       value: MORALE_BASELINE,
