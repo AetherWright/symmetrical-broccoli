@@ -324,12 +324,22 @@ class RemoteBrain:
             os.makedirs(directory, exist_ok=True)
             with open(os.path.join(directory, "model.json"), "w", encoding="utf-8") as handle:
                 handle.write(self.model.to_json())
-            weights_path = os.path.join(directory, "weights.h5")
+            weights_path = os.path.join(directory, "weights.weights.h5")
+            legacy_path = os.path.join(directory, "weights.h5")
+            if os.path.exists(legacy_path) and legacy_path != weights_path:
+                try:
+                    os.remove(legacy_path)
+                except OSError:
+                    pass
             self.model.save_weights(weights_path)
 
     def load_weights(self, directory):
         with self._lock:
-            weights_path = os.path.join(directory, "weights.h5")
+            weights_path = os.path.join(directory, "weights.weights.h5")
+            if not os.path.exists(weights_path):
+                legacy_path = os.path.join(directory, "weights.h5")
+                if os.path.exists(legacy_path):
+                    weights_path = legacy_path
             if os.path.exists(weights_path):
                 self.model.load_weights(weights_path)
                 self.optimizer.sync_slow_variables(self.model.trainable_variables)
