@@ -130,15 +130,24 @@ class LookaheadOptimizer:
         self._fast_var_ids = {}
         self._step = 0
 
+    @staticmethod
+    def _read_variable(variable):
+        if hasattr(variable, "value"):
+            return variable.value()
+        if hasattr(variable, "read_value"):
+            return variable.read_value()
+        if hasattr(variable, "numpy"):
+            return tf.convert_to_tensor(variable.numpy())
+        return tf.convert_to_tensor(variable)
+
     def _ensure_slot_variables(self, variables):
         for var in variables:
             var_id = id(var)
             if var_id in self._fast_var_ids:
                 continue
             self._fast_vars.append(var)
-            self._slow_vars.append(
-                tf.Variable(var.read_value(), trainable=False)
-            )
+            initial_value = self._read_variable(var)
+            self._slow_vars.append(tf.Variable(initial_value, trainable=False))
             self._fast_var_ids[var_id] = len(self._fast_vars) - 1
 
     def apply_gradients(self, grads_and_vars):
@@ -152,10 +161,10 @@ class LookaheadOptimizer:
         self._step += 1
         if self.sync_period and self._step % self.sync_period == 0:
             for slow_var, fast_var in zip(self._slow_vars, self._fast_vars):
-                fast_value = fast_var.read_value()
-                slow_value = slow_var.read_value()
+                fast_value = self._read_variable(fast_var)
+                slow_value = self._read_variable(slow_var)
                 slow_var.assign(slow_value + (fast_value - slow_value) * self.slow_step_size)
-                fast_var.assign(slow_var.read_value())
+                fast_var.assign(self._read_variable(slow_var))
 
 
 def build_model(input_size, action_count):
