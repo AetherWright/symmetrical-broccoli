@@ -370,6 +370,206 @@ function noteRemoteBrainOnline(context) {
   context.waitingForBrain = false
 }
 
+function markBaselineWeightsHealthy(reason = 'unknown') {
+  baselineWeightsSuspect = false
+}
+
+function markContextWeightsHealthy(context, reason = 'unknown') {
+  if (!context) return
+  context.weightsSuspect = false
+  context.pendingWeightRecovery = null
+  context.weightRecoveryInFlight = null
+  context.lastWeightIssue = null
+  context.lastWeightRecovery = Date.now()
+  context.lastWeightRecoveryReason = reason
+  context.weightSkipNotified = false
+}
+
+function scheduleWeightRecovery(context, reason = 'unknown', details = {}) {
+  if (!context) return
+  const firstDetection = !context.weightsSuspect
+  context.weightsSuspect = true
+  context.lastWeightIssue = {
+    reason,
+    details,
+    detectedAt: Date.now()
+  }
+  context.weightSkipNotified = false
+  if (
+    !context.pendingWeightRecovery ||
+    context.pendingWeightRecovery.reason !== reason
+  ) {
+    context.pendingWeightRecovery = {
+      reason,
+      details,
+      attempts: 0,
+      scheduledAt: Date.now()
+    }
+  }
+  if (firstDetection) {
+    console.warn(
+      `[${label(context)}] Detected suspect brain weights (${reason}); scheduling recovery.`
+    )
+  }
+}
+
+function gatherCleanBrainSources({ exclude = [] } = {}) {
+  const excludeSet = new Set(
+    Array.isArray(exclude) ? exclude.filter(Boolean) : [exclude].filter(Boolean)
+  )
+  const sources = []
+  for (const ctx of contexts) {
+    if (!ctx?.brain?.id) continue
+    if (excludeSet.has(ctx)) continue
+    if (ctx.weightsSuspect) continue
+    sources.push(ctx.brain)
+  }
+  if (baselineBrain && baselineBrain.id && !baselineWeightsSuspect) {
+    sources.push(baselineBrain)
+  }
+  return sources
+}
+
+async function rebuildContextWeights(context, reason = 'unknown', details = {}) {
+  if (!context?.brain?.id) {
+    return { success: false, sourceCount: 0, mode: 'none' }
+  }
+
+  const exclude = new Set([context])
+  let sources = gatherCleanBrainSources({ exclude })
+
+  if (!sources.length) {
+    try {
+      await ensureBaselineReady()
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        throw err
+      }
+      console.error('[Baseline] Baseline not ready for weight recovery:', err)
+    }
+    if (baselineBrain && baselineBrain.id && !baselineWeightsSuspect) {
+      sources = [baselineBrain]
+    }
+  }
+
+  if (!sources.length) {
+    const fallbackStd =
+      deriveMutationStddev(null, { jitter: true }) ?? NEW_BRAIN_MUTATION_STDDEV
+    if (!Number.isFinite(fallbackStd) || fallbackStd <= 0) {
+      return { success: false, sourceCount: 0, mode: 'none' }
+    }
+    try {
+      const stddev = Math.min(
+        NEW_BRAIN_MUTATION_MAX,
+        Math.max(0.01, fallbackStd)
+      )
+      console.warn(
+        `[${label(context)}] No clean brain sources available; applying fallback mutation for ${reason}.`
+      )
+      await mutateWeights(context.brain, stddev)
+      return { success: true, sourceCount: 0, mode: 'mutate' }
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        throw err
+      }
+      console.error(
+        `[${label(context)}] Fallback mutation during weight recovery failed:`,
+        err
+      )
+      return { success: false, sourceCount: 0, mode: 'mutate-failed' }
+    }
+  }
+
+  try {
+    if (sources.length === 1) {
+      await copyWeights(context.brain, sources[0])
+      return { success: true, sourceCount: 1, mode: 'copy' }
+    }
+    await averageWeights(context.brain, sources)
+    return { success: true, sourceCount: sources.length, mode: 'average' }
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      throw err
+    }
+    console.error(
+      `[${label(context)}] Failed to rebuild weights from ${sources.length} clean source(s):`,
+      err
+    )
+    return { success: false, sourceCount: sources.length, mode: 'average-failed' }
+  }
+}
+
+async function attemptWeightRecovery(context, trigger = 'tick') {
+  if (!context?.pendingWeightRecovery) {
+    return false
+  }
+  if (context.weightRecoveryInFlight) {
+    return context.weightRecoveryInFlight
+  }
+
+  if (!isRemoteBrainConnected()) {
+    const status = getRemoteBrainStatus()
+    console.warn(
+      `[${label(context)}] Weight recovery deferred (${context.pendingWeightRecovery.reason}, trigger=${trigger}) while remote brain unavailable (${describeRemoteRetry(status)}).`
+    )
+    return false
+  }
+
+  const pending = context.pendingWeightRecovery
+  context.weightRecoveryInFlight = (async () => {
+    let outcome
+    try {
+      outcome = await rebuildContextWeights(context, pending.reason, pending.details)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        const status = getRemoteBrainStatus()
+        console.warn(
+          `[${label(context)}] Weight recovery postponed (${pending.reason}, trigger=${trigger}) while remote brain unavailable (${describeRemoteRetry(status)}).`
+        )
+      } else {
+        console.error(
+          `[${label(context)}] Weight recovery failed during ${pending.reason}:`,
+          err
+        )
+      }
+      context.pendingWeightRecovery = pending
+      return false
+    }
+
+    if (outcome?.success) {
+      markContextWeightsHealthy(context, pending.reason)
+      const sourceNote =
+        outcome.mode === 'copy' || outcome.mode === 'average'
+          ? ` from ${outcome.sourceCount} clean source${
+              outcome.sourceCount === 1 ? '' : 's'
+            }`
+          : ''
+      const modeLabel =
+        outcome.mode === 'mutate'
+          ? 'via fallback mutation'
+          : `via ${outcome.mode}`
+      console.warn(
+        `[${label(context)}] Rebuilt brain weights ${modeLabel}${sourceNote} after ${pending.reason} (trigger=${trigger}).`
+      )
+      return true
+    }
+
+    pending.attempts = (pending.attempts ?? 0) + 1
+    pending.lastAttemptAt = Date.now()
+    context.pendingWeightRecovery = pending
+    console.warn(
+      `[${label(context)}] Weight recovery attempt #${pending.attempts} did not succeed (${pending.reason}, trigger=${trigger}).`
+    )
+    return false
+  })()
+
+  try {
+    return await context.weightRecoveryInFlight
+  } finally {
+    context.weightRecoveryInFlight = null
+  }
+}
+
 const CRAFTING_ACTIONS = {
   craft_planks: { item: 'oak_planks', amount: 4, allowPartial: true, reward: 0.6 },
   craft_sticks: { item: 'stick', amount: 4, allowPartial: true, reward: 0.45 },
@@ -473,6 +673,7 @@ let birthCounter = 0
 let globalRunning = true
 let baselineBrain = null
 let baselineReady = null
+let baselineWeightsSuspect = false
 let deferredBaselineSaveReason = null
 let nextBaselineSaveLogAt = 0
 const GLOBAL_RESOURCE_POOL = {
@@ -753,6 +954,7 @@ async function initializeBaselineBrain() {
     }
   }
 
+  markBaselineWeightsHealthy('init')
   return baselineBrain
 }
 
@@ -981,6 +1183,7 @@ async function ensureContextBrain(context) {
     }
 
     context.brain = brain
+    markContextWeightsHealthy(context, 'init')
     return brain
   })()
 
@@ -1248,6 +1451,7 @@ async function performPopulationCrossover(sortedContexts) {
   try {
     await averageWeights(baselineBrain, clones)
     await mutateWeights(baselineBrain, 0.015)
+    markBaselineWeightsHealthy('population-crossover')
     console.log(`[Baseline] Applied population crossover with ${clones.length} companion models.`)
   } catch (err) {
     if (isRemoteBrainUnavailableError(err)) {
@@ -2397,6 +2601,19 @@ async function tickLoop(context) {
       return
     }
 
+    if (context.weightsSuspect || context.pendingWeightRecovery) {
+      await attemptWeightRecovery(context, 'tick')
+      if (context.weightsSuspect) {
+        if (!context.weightSkipNotified) {
+          console.warn(
+            `[${label(context)}] Brain weights suspect; deferring tick until recovery completes.`
+          )
+          context.weightSkipNotified = true
+        }
+        return
+      }
+    }
+
     const brain = await ensureContextBrain(context)
     if (!brain) {
       console.warn(`[${label(context)}] Brain not ready, skipping tick.`)
@@ -2441,19 +2658,56 @@ async function tickLoop(context) {
     if (context.lastObs && context.lastAction != null) {
       const lastObsValid = vectorHasFiniteValues(context.lastObs)
       if (lastObsValid) {
-        trained = await trainBrain(
+        const trainOutcome = await trainBrain(
           brain,
           context.lastObs,
           context.lastAction,
           reward,
           observation
         )
+        trained = Boolean(trainOutcome?.trained)
+        if (trainOutcome && trainOutcome.weightsOk === false) {
+          const trainDetails = {
+            ...(trainOutcome.sanitization ?? {}),
+            trigger: 'train'
+          }
+          scheduleWeightRecovery(context, 'train-non-finite', trainDetails)
+          console.warn(
+            `[${label(context)}] Non-finite weights detected after training; deferring tick until recovery.`
+          )
+          return
+        }
       } else {
         console.warn(`[${label(context)}] Skipping training due to invalid previous observation values.`)
       }
     }
 
-    const { action, prediction } = await chooseAction(brain, observation, effectiveEpsilon)
+    const actionResult = await chooseAction(brain, observation, effectiveEpsilon)
+    const remotePolicyReplaced = Number.parseInt(
+      actionResult?.sanitization?.remote?.policy?.replaced ?? 0,
+      10
+    )
+    const predictionReplaced = actionResult?.sanitization?.prediction?.replaced ?? 0
+    if (
+      actionResult?.weightsOk === false ||
+      (Number.isFinite(predictionReplaced) && predictionReplaced > 0) ||
+      (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0)
+    ) {
+      const actionDetails = {
+        observation: actionResult?.sanitization?.observation ?? {},
+        prediction: actionResult?.sanitization?.prediction ?? {},
+        remote: actionResult?.sanitization?.remote ?? {},
+        trigger: 'act'
+      }
+      scheduleWeightRecovery(context, 'act-non-finite', actionDetails)
+      console.warn(
+        `[${label(context)}] Non-finite prediction output detected; deferring tick until recovery.`
+      )
+      return
+    }
+
+    const action = actionResult.action
+    const prediction = actionResult.prediction
     const sanitizedPrediction = Array.isArray(prediction)
       ? prediction.map(value => sanitizeScalar(value, OBS_VALUE_CLAMP, 0))
       : null
@@ -2567,7 +2821,7 @@ async function synchronizeGeneration() {
 
     const templateSources = []
     for (const candidate of sorted) {
-      if (candidate?.brain?.id) {
+      if (candidate?.brain?.id && !candidate.weightsSuspect) {
         templateSources.push(candidate.brain)
       }
       if (templateSources.length >= TEMPLATE_TOP_BRAINS) {
@@ -2578,6 +2832,7 @@ async function synchronizeGeneration() {
     if (templateSources.length) {
       try {
         await averageWeights(baselineBrain, templateSources)
+        markBaselineWeightsHealthy('template-average')
         console.log(
           `[Baseline] Updated template from top ${templateSources.length} brain${
             templateSources.length === 1 ? '' : 's'
@@ -2604,6 +2859,7 @@ async function synchronizeGeneration() {
       console.log('[Baseline] Stagnation detected — triggering meta-mutation and epsilon reset.')
       try {
         await mutateWeights(baselineBrain, 0.05)
+        markBaselineWeightsHealthy('stagnation-mutate')
         for (const ctx of contexts) {
           ctx.epsilon = Math.min(0.9, Math.max(ctx.epsilon, EPSILON_START))
           ctx.epsilonBoost = Math.max(ctx.epsilonBoost, EPSILON_STAGNATION_BOOST)
@@ -2783,15 +3039,20 @@ async function synchronizeGeneration() {
     const spawnRequests = Math.max(0, expansionCount + retireReasons.size)
     const availableSpawnSlots = Math.min(Math.max(0, MAX_BOTS - contexts.length), spawnRequests)
     if (availableSpawnSlots > 0) {
-      const parentPool = contexts
-        .slice()
-        .sort((a, b) => (rewardSnapshot.get(b) ?? 0) - (rewardSnapshot.get(a) ?? 0))
-      const fallbackPool = sorted.filter(ctx => !retireReasons.has(ctx))
+      const rewardCompare = (a, b) => (rewardSnapshot.get(b) ?? 0) - (rewardSnapshot.get(a) ?? 0)
+      let parentPool = contexts.filter(ctx => !ctx.weightsSuspect).sort(rewardCompare)
+      if (!parentPool.length) {
+        parentPool = contexts.slice().sort(rewardCompare)
+      }
+      let fallbackPool = sorted.filter(ctx => !retireReasons.has(ctx) && !ctx.weightsSuspect)
+      if (!fallbackPool.length) {
+        fallbackPool = sorted.filter(ctx => !retireReasons.has(ctx))
+      }
       if (!parentPool.length && fallbackPool.length) {
-        parentPool.push(...fallbackPool)
+        parentPool = fallbackPool.slice()
       }
       if (!parentPool.length) {
-        parentPool.push(...sorted)
+        parentPool = sorted.slice()
       }
 
       let spawnIndex = contexts.length
@@ -3169,6 +3430,13 @@ function createContext(index, options = {}) {
     feralFury: 0,
     bot,
     brain: null,
+    weightsSuspect: false,
+    pendingWeightRecovery: null,
+    weightRecoveryInFlight: null,
+    lastWeightIssue: null,
+    lastWeightRecovery: Date.now(),
+    lastWeightRecoveryReason: 'init',
+    weightSkipNotified: false,
     pendingMutations: [],
     epsilon: EPSILON_START,
     epsilonBoost: 0,

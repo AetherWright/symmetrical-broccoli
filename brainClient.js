@@ -268,15 +268,15 @@ export async function createBrain(inputSize, actionCount) {
 
 export async function chooseAction(brain, observation, epsilon = 0.1) {
   const brainId = ensureBrainId(brain)
-  const sanitized = sanitizeObservationPayload(observation, {
+  const sanitizedObservation = sanitizeObservationPayload(observation, {
     expectedLength: brain.inputSize,
     label: 'observation'
   })
-  if (!Array.isArray(sanitized.values)) {
+  if (!Array.isArray(sanitizedObservation.values)) {
     throw new Error('Observation must be an array-like payload')
   }
   const payload = {
-    observation: sanitized.values,
+    observation: sanitizedObservation.values,
     epsilon: clampEpsilon(epsilon),
     bot_id: brain.owner ?? null
   }
@@ -284,13 +284,34 @@ export async function chooseAction(brain, observation, epsilon = 0.1) {
   if (!Number.isInteger(result?.action)) {
     throw new Error('Remote brain did not return a valid action index')
   }
-  const prediction = Array.isArray(result?.prediction)
+  const sanitizedPrediction = Array.isArray(result?.prediction)
     ? sanitizeObservationPayload(result.prediction, {
         expectedLength: brain.inputSize,
         label: 'prediction'
-      }).values
-    : null
-  return { action: result.action, prediction }
+      })
+    : { values: null, replaced: 0, clipped: 0, adjusted: false }
+  const observationSummary = {
+    replaced: sanitizedObservation.replaced ?? 0,
+    clipped: sanitizedObservation.clipped ?? 0,
+    adjusted: Boolean(sanitizedObservation.adjusted)
+  }
+  const predictionSummary = {
+    replaced: sanitizedPrediction.replaced ?? 0,
+    clipped: sanitizedPrediction.clipped ?? 0,
+    adjusted: Boolean(sanitizedPrediction.adjusted)
+  }
+  const sanitization = {
+    observation: observationSummary,
+    prediction: predictionSummary,
+    remote: result?.sanitized ?? {}
+  }
+  const weightsOk = result?.weights_ok !== false
+  return {
+    action: result.action,
+    prediction: sanitizedPrediction.values,
+    weightsOk,
+    sanitization
+  }
 }
 
 export async function trainBrain(brain, observation, actionIndex, reward, nextObservation) {
@@ -301,21 +322,51 @@ export async function trainBrain(brain, observation, actionIndex, reward, nextOb
   })
   if (!Array.isArray(sanitizedObservation.values)) {
     console.warn('[RemoteBrain] Skipping training due to invalid observation payload.')
-    return false
+    return {
+      trained: false,
+      weightsOk: true,
+      droppedGradients: 0,
+      sanitization: {
+        observation: {
+          replaced: sanitizedObservation.replaced ?? 0,
+          clipped: sanitizedObservation.clipped ?? 0,
+          adjusted: Boolean(sanitizedObservation.adjusted)
+        },
+        nextObservation: { replaced: 0, clipped: 0, adjusted: false },
+        remote: {}
+      }
+    }
   }
   const sanitizedNext = nextObservation != null
     ? sanitizeObservationPayload(nextObservation, {
         expectedLength: brain.inputSize,
         label: 'next_observation'
       })
-    : { values: null }
+    : { values: null, replaced: 0, clipped: 0, adjusted: false }
   const { value: sanitizedAction, adjusted: actionAdjusted } = sanitizeActionIndex(
     actionIndex,
     brain.actionCount
   )
   if (actionIndex != null && sanitizedAction == null) {
     console.warn('[RemoteBrain] Skipping training due to invalid action index.')
-    return false
+    return {
+      trained: false,
+      weightsOk: true,
+      droppedGradients: 0,
+      sanitization: {
+        observation: {
+          replaced: sanitizedObservation.replaced ?? 0,
+          clipped: sanitizedObservation.clipped ?? 0,
+          adjusted: Boolean(sanitizedObservation.adjusted)
+        },
+        nextObservation: {
+          replaced: sanitizedNext.replaced ?? 0,
+          clipped: sanitizedNext.clipped ?? 0,
+          adjusted: Boolean(sanitizedNext.adjusted)
+        },
+        remote: {}
+      }
+    }
   }
   if (actionAdjusted) {
     console.warn('[RemoteBrain] Adjusted action index to stay within range.')
@@ -328,7 +379,26 @@ export async function trainBrain(brain, observation, actionIndex, reward, nextOb
     bot_id: brain.owner ?? null
   }
   const result = await request(`/api/brains/${brainId}/train`, { body: payload })
-  return Boolean(result?.trained)
+  return {
+    trained: Boolean(result?.trained),
+    weightsOk: result?.weights_ok !== false,
+    droppedGradients: Number.isFinite(result?.dropped_gradients)
+      ? result.dropped_gradients
+      : 0,
+    sanitization: {
+      observation: {
+        replaced: sanitizedObservation.replaced ?? 0,
+        clipped: sanitizedObservation.clipped ?? 0,
+        adjusted: Boolean(sanitizedObservation.adjusted)
+      },
+      nextObservation: {
+        replaced: sanitizedNext.replaced ?? 0,
+        clipped: sanitizedNext.clipped ?? 0,
+        adjusted: Boolean(sanitizedNext.adjusted)
+      },
+      remote: result?.sanitized ?? {}
+    }
+  }
 }
 
 export async function saveBrain(brain, dir) {

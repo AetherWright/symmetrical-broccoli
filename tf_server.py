@@ -292,29 +292,53 @@ class RemoteBrain:
         self._lock = threading.RLock()
 
     def _prepare_observation(self, vector, label):
-        prepared, _, _, _ = _sanitize_vector(vector, expected_size=self.input_size, label=label)
+        prepared, replaced, clipped, adjusted = _sanitize_vector(
+            vector, expected_size=self.input_size, label=label
+        )
         if prepared is None:
             raise ValueError(f"{label} payload missing")
-        return prepared.reshape(1, -1)
+        metadata = {
+            "replaced": int(replaced),
+            "clipped": int(clipped),
+            "adjusted": bool(adjusted),
+        }
+        metadata["sanitized"] = bool(replaced or clipped or adjusted)
+        return prepared.reshape(1, -1), metadata
 
     def _sanitize_prediction_output(self, tensor):
         array = np.asarray(tensor, dtype=np.float32).reshape(-1)
-        if not np.all(np.isfinite(array)):
+        finite_mask = np.isfinite(array)
+        replaced = int(array.size - np.count_nonzero(finite_mask))
+        if replaced:
             app.logger.warning("Sanitized prediction output due to non-finite values")
-        array = np.nan_to_num(array, nan=0.0, posinf=OBS_CLAMP, neginf=-OBS_CLAMP)
+        cleaned = np.nan_to_num(array, nan=0.0, posinf=OBS_CLAMP, neginf=-OBS_CLAMP)
+        clipped = 0
         if OBS_CLAMP > 0:
-            array = np.clip(array, -OBS_CLAMP, OBS_CLAMP)
-        if array.size != self.input_size:
+            clipped_array = np.clip(cleaned, -OBS_CLAMP, OBS_CLAMP)
+            clipped = int(np.count_nonzero(clipped_array != cleaned))
+        else:
+            clipped_array = cleaned
+        adjusted = False
+        if clipped_array.size != self.input_size:
+            adjusted = True
             app.logger.warning(
                 "Adjusted prediction output size from %d to %d",
-                array.size,
+                clipped_array.size,
                 self.input_size,
             )
-            if array.size > self.input_size:
-                array = array[: self.input_size]
+            if clipped_array.size > self.input_size:
+                clipped_array = clipped_array[: self.input_size]
             else:
-                array = np.pad(array, (0, self.input_size - array.size), constant_values=0.0)
-        return array.astype(np.float32, copy=False).tolist()
+                clipped_array = np.pad(
+                    clipped_array, (0, self.input_size - clipped_array.size), constant_values=0.0
+                )
+        metadata = {
+            "replaced": replaced,
+            "clipped": clipped,
+            "adjusted": adjusted,
+        }
+        metadata["sanitized"] = bool(replaced or clipped or adjusted)
+        return clipped_array.astype(np.float32, copy=False).tolist(), metadata
 
     @staticmethod
     def _filter_gradients(grads_and_vars):
@@ -332,26 +356,68 @@ class RemoteBrain:
             cleaned.append((grad, var))
         return cleaned, dropped
 
+    def _weights_are_finite(self):
+        for weight in self.model.get_weights():
+            if not np.all(np.isfinite(weight)):
+                return False
+        return True
+
     def choose_action(self, observation, epsilon):
         with self._lock:
             try:
-                obs = self._prepare_observation(observation, "observation")
+                obs, obs_meta = self._prepare_observation(observation, "observation")
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
             action_probs, prediction = self.model(obs, training=False)
-            probs = np.clip(action_probs.numpy().flatten(), 1e-8, 1.0)
-            probs = probs / probs.sum()
-            predicted_next = self._sanitize_prediction_output(prediction.numpy())
-            if np.random.random() < epsilon:
+            raw_probs = action_probs.numpy().astype(np.float32, copy=False).reshape(-1)
+            replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
+            sanitized_policy = replaced > 0
+            if sanitized_policy:
+                app.logger.warning("Sanitized action probabilities due to non-finite values")
+            safe_probs = np.nan_to_num(
+                raw_probs,
+                nan=1.0 / max(1, self.action_count),
+                posinf=1.0,
+                neginf=1.0,
+            )
+            safe_probs = np.clip(safe_probs, 1e-8, 1.0)
+            total = float(np.sum(safe_probs))
+            if not np.isfinite(total) or total <= 0:
+                sanitized_policy = True
+                safe_probs = np.full(self.action_count, 1.0 / max(1, self.action_count), dtype=np.float32)
+            else:
+                safe_probs = safe_probs / total
+            if not np.all(np.isfinite(safe_probs)):
+                sanitized_policy = True
+                safe_probs = np.nan_to_num(safe_probs, nan=1.0 / max(1, self.action_count))
+            policy_meta = {
+                "replaced": int(replaced),
+                "fallback": bool(sanitized_policy),
+            }
+            predicted_next, prediction_meta = self._sanitize_prediction_output(prediction.numpy())
+            weights_ok = policy_meta["replaced"] == 0 and prediction_meta["replaced"] == 0
+            rand = float(np.random.random())
+            exploration = rand < epsilon
+            if exploration:
                 action_index = int(np.random.randint(0, self.action_count))
             else:
-                action_index = int(np.argmax(probs))
-            return action_index, predicted_next
+                action_index = int(np.argmax(safe_probs))
+            return {
+                "action": action_index,
+                "prediction": predicted_next,
+                "weights_ok": bool(weights_ok),
+                "sanitized": {
+                    "observation": obs_meta,
+                    "policy": policy_meta,
+                    "prediction": prediction_meta,
+                    "exploration": bool(exploration),
+                },
+            }
 
     def train(self, observation, action_index, reward, next_observation):
         with self._lock:
             try:
-                obs = self._prepare_observation(observation, "observation")
+                obs, obs_meta = self._prepare_observation(observation, "observation")
             except ValueError:
                 app.logger.warning("Skipping train call due to missing observation payload")
                 return False
@@ -383,9 +449,12 @@ class RemoteBrain:
                     scaled_reward = float(np.clip(reward_value, -1.0, 1.0))
 
             next_obs = None
+            next_meta = None
             if use_prediction:
                 try:
-                    next_obs = self._prepare_observation(next_observation, "next_observation")
+                    next_obs, next_meta = self._prepare_observation(
+                        next_observation, "next_observation"
+                    )
                 except ValueError:
                     app.logger.warning("Skipping prediction loss due to invalid next observation payload")
                     use_prediction = False
@@ -421,10 +490,29 @@ class RemoteBrain:
             cleaned_grads, dropped = self._filter_gradients(grads_and_vars)
             if dropped:
                 app.logger.warning("Skipped %d gradient tensors due to non-finite values", dropped)
+            weights_ok = True
             if cleaned_grads:
                 self.optimizer.apply_gradients(cleaned_grads)
+                weights_ok = self._weights_are_finite()
+                if not weights_ok:
+                    app.logger.error("Model weights contain non-finite values after training step")
 
-            return bool(cleaned_grads)
+            return {
+                "trained": bool(cleaned_grads),
+                "weights_ok": bool(weights_ok),
+                "dropped_gradients": int(dropped),
+                "sanitized": {
+                    "observation": obs_meta,
+                    "next_observation": next_meta
+                    if next_meta is not None
+                    else {
+                        "replaced": 0,
+                        "clipped": 0,
+                        "adjusted": False,
+                        "sanitized": False,
+                    },
+                },
+            }
 
     def copy_from(self, other):
         if other is self:
@@ -698,15 +786,26 @@ def choose_action_endpoint(brain_id):
         return jsonify({"error": "Observation must be a list"}), 400
     epsilon = float(payload.get("epsilon", 0.1))
     try:
-        action, prediction = _execute("act", brain.choose_action, observation, epsilon)
+        result = _execute("act", brain.choose_action, observation, epsilon)
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 503
-    log_request(
-        payload.get("bot_id"),
-        "act",
-        {**payload, "action": action, "prediction": prediction}
-    )
-    return jsonify({"action": action, "prediction": prediction})
+    if isinstance(result, dict):
+        response_payload = {
+            "action": int(result.get("action", 0)),
+            "prediction": result.get("prediction"),
+            "weights_ok": bool(result.get("weights_ok", True)),
+            "sanitized": result.get("sanitized") or {},
+        }
+    else:
+        action, prediction = result
+        response_payload = {
+            "action": int(action),
+            "prediction": prediction,
+            "weights_ok": True,
+            "sanitized": {},
+        }
+    log_request(payload.get("bot_id"), "act", {**payload, **response_payload})
+    return jsonify(response_payload)
 
 
 @app.post("/api/brains/<brain_id>/train")
@@ -720,18 +819,27 @@ def train_endpoint(brain_id):
         return jsonify({"error": "Observation must be a list"}), 400
     next_observation = payload.get("next_observation")
     try:
-        trained = _execute(
+        result = _execute(
             "train",
             brain.train,
             observation,
             payload.get("action"),
             payload.get("reward"),
-            next_observation if isinstance(next_observation, (list, tuple)) else None
+            next_observation if isinstance(next_observation, (list, tuple)) else None,
         )
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 503
-    log_request(payload.get("bot_id"), "train", payload)
-    return jsonify({"trained": bool(trained)})
+    if isinstance(result, dict):
+        response_payload = {
+            "trained": bool(result.get("trained")),
+            "weights_ok": bool(result.get("weights_ok", True)),
+            "dropped_gradients": int(result.get("dropped_gradients", 0)),
+            "sanitized": result.get("sanitized") or {},
+        }
+    else:
+        response_payload = {"trained": bool(result), "weights_ok": True}
+    log_request(payload.get("bot_id"), "train", {**payload, **response_payload})
+    return jsonify(response_payload)
 
 
 @app.post("/api/brains/<brain_id>/copy")
