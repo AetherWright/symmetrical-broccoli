@@ -120,8 +120,10 @@ WORKERS = EndpointWorkerPool(ENDPOINT_WORKER_LIMITS)
 atexit.register(WORKERS.shutdown)
 
 BRAIN_CONFIG = {
-    "hidden_units": 64,
-    "dropout_rate": 0.2
+    "hidden_units": 128,
+    "mid_units": 96,
+    "shared_units": 64,
+    "dropout_rate": 0.25,
 }
 
 
@@ -197,11 +199,27 @@ class LookaheadOptimizer:
 
 def build_model(input_size, action_count):
     inputs = tf.keras.Input(shape=(input_size,), name="observation")
-    x = tf.keras.layers.BatchNormalization()(inputs)
-    x = tf.keras.layers.Dense(BRAIN_CONFIG["hidden_units"], activation="relu")(x)
-    x = tf.keras.layers.Dropout(BRAIN_CONFIG["dropout_rate"])(x)
+    x = tf.keras.layers.BatchNormalization(name="input_batchnorm")(inputs)
+    x = tf.keras.layers.Dense(
+        BRAIN_CONFIG["hidden_units"],
+        activation="relu",
+        name="hidden_dense_1"
+    )(x)
+    x = tf.keras.layers.Dropout(
+        BRAIN_CONFIG["dropout_rate"],
+        name="hidden_dropout_1"
+    )(x)
+    x = tf.keras.layers.Dense(
+        BRAIN_CONFIG["mid_units"],
+        activation="relu",
+        name="hidden_dense_2"
+    )(x)
+    x = tf.keras.layers.Dropout(
+        BRAIN_CONFIG["dropout_rate"],
+        name="hidden_dropout_2"
+    )(x)
     shared = tf.keras.layers.Dense(
-        max(1, BRAIN_CONFIG["hidden_units"] // 2),
+        max(1, BRAIN_CONFIG["shared_units"]),
         activation="relu",
         name="shared_dense"
     )(x)

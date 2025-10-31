@@ -27,7 +27,7 @@ import {
 // ----------------------------
 const MC_HOST = 'localhost'
 const MC_PORT = 25565
-const BOT_COUNT = Math.max(2, parseInt(process.env.BOT_COUNT ?? '3', 10))
+const BOT_COUNT = Math.max(2, parseInt(process.env.BOT_COUNT ?? '10', 10))
 const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '200', 10))
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
