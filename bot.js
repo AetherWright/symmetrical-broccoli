@@ -106,6 +106,101 @@ const ARMOR_SLOT_BONUS = {
   feet: 20
 }
 
+function readNumberEnv(name, fallback, { min = -Infinity, max = Infinity } = {}) {
+  const raw = Number.parseFloat(process.env[name] ?? '')
+  if (!Number.isFinite(raw)) {
+    return fallback
+  }
+  return Math.min(max, Math.max(min, raw))
+}
+
+const TEMPLATE_TOP_BRAINS = Math.max(1, Math.floor(readNumberEnv('TOP_TEMPLATE_BRAINS', 3, { min: 1 })))
+const OLDEST_RETIRE_PER_GENERATION = Math.max(
+  1,
+  Math.floor(readNumberEnv('OLDEST_RETIRE_PER_GENERATION', 2, { min: 1 }))
+)
+const NEW_BRAIN_MUTATION_STDDEV = readNumberEnv('NEW_BRAIN_MUTATION_STDDEV', 0.02, { min: 0 })
+const NEW_BRAIN_MUTATION_JITTER = readNumberEnv('NEW_BRAIN_MUTATION_JITTER', 0.01, { min: 0 })
+const NEW_BRAIN_MUTATION_MAX = Math.max(
+  NEW_BRAIN_MUTATION_STDDEV,
+  readNumberEnv('NEW_BRAIN_MUTATION_MAX', 0.08, { min: 0 })
+)
+const MUTATION_REWARD_FACTOR = readNumberEnv('REWARD_MUTATION_FACTOR', 0.002, { min: 0 })
+const OBS_VALUE_CLAMP = readNumberEnv('OBS_VALUE_CLAMP', 1000, { min: 1 })
+const MAX_REWARD_MAGNITUDE = readNumberEnv('MAX_REWARD_MAGNITUDE', 50, { min: 1 })
+
+function sanitizeScalar(value, clamp = OBS_VALUE_CLAMP, fallback = 0) {
+  if (!Number.isFinite(value)) {
+    return fallback
+  }
+  if (clamp > 0) {
+    if (value > clamp) return clamp
+    if (value < -clamp) return -clamp
+  }
+  return value
+}
+
+function sanitizeVector(vector, clamp = OBS_VALUE_CLAMP) {
+  if (!vector || typeof vector.length !== 'number') {
+    return vector
+  }
+  for (let i = 0; i < vector.length; i++) {
+    vector[i] = sanitizeScalar(vector[i], clamp, 0)
+  }
+  return vector
+}
+
+function vectorHasFiniteValues(vector) {
+  if (!vector || typeof vector.length !== 'number') return false
+  for (let i = 0; i < vector.length; i++) {
+    if (!Number.isFinite(vector[i])) {
+      return false
+    }
+  }
+  return true
+}
+
+function clampReward(value) {
+  if (!Number.isFinite(value)) {
+    return 0
+  }
+  const limit = MAX_REWARD_MAGNITUDE
+  if (value > limit) return limit
+  if (value < -limit) return -limit
+  return value
+}
+
+function deriveMutationStddev(preferred, { jitter = true } = {}) {
+  let base = Number.isFinite(preferred) && preferred >= 0 ? preferred : NEW_BRAIN_MUTATION_STDDEV
+  if (!Number.isFinite(base) || base < 0) {
+    base = NEW_BRAIN_MUTATION_STDDEV
+  }
+  let result = base
+  if (jitter && NEW_BRAIN_MUTATION_JITTER > 0) {
+    result += (Math.random() - 0.5) * NEW_BRAIN_MUTATION_JITTER
+  }
+  if (!Number.isFinite(result) || result <= 0) {
+    return null
+  }
+  if (NEW_BRAIN_MUTATION_MAX > 0) {
+    result = Math.min(NEW_BRAIN_MUTATION_MAX, result)
+  }
+  return result
+}
+
+function enqueuePendingMutation(context, stddev) {
+  if (!context) return
+  if (!Number.isFinite(stddev) || stddev <= 0) {
+    return
+  }
+  const normalized = Math.min(NEW_BRAIN_MUTATION_MAX, Math.max(0, stddev))
+  if (normalized <= 0) return
+  if (!Array.isArray(context.pendingMutations)) {
+    context.pendingMutations = []
+  }
+  context.pendingMutations.push(normalized)
+}
+
 const pipelineAsync = promisify(pipeline)
 
 class RotatingCompressedLogger {
@@ -781,16 +876,60 @@ async function ensureContextBrain(context) {
   if (!baselineBrain) {
     throw new Error('Baseline brain failed to initialize')
   }
-  if (!context.brain || context.brain.id !== baselineBrain.id) {
-    const brainRef = {
-      id: baselineBrain.id,
-      inputSize: baselineBrain.inputSize,
-      actionCount: baselineBrain.actionCount,
-      owner: label(context)
-    }
-    context.brain = brainRef
+
+  if (context.brain && context.brain.id) {
+    context.brain.owner = label(context)
+    return context.brain
   }
-  return context.brain
+
+  if (context.waitingForBrain) {
+    return context.waitingForBrain
+  }
+
+  context.waitingForBrain = (async () => {
+    const brain = await createBrain(OBS_SIZE, ACTIONS.length)
+    brain.owner = label(context)
+
+    if (baselineBrain && baselineBrain.id && brain.id && brain.id !== baselineBrain.id) {
+      try {
+        await copyWeights(brain, baselineBrain)
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err)) {
+          throw err
+        }
+        console.error(`[${label(context)}] Failed to seed brain from baseline:`, err)
+      }
+    }
+
+    if (!Array.isArray(context.pendingMutations)) {
+      context.pendingMutations = []
+    }
+
+    while (context.pendingMutations.length) {
+      const stddev = context.pendingMutations.shift()
+      if (!Number.isFinite(stddev) || stddev <= 0) {
+        continue
+      }
+      try {
+        await mutateWeights(brain, Math.min(NEW_BRAIN_MUTATION_MAX, Math.max(0, stddev)))
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err)) {
+          context.pendingMutations.unshift(stddev)
+          throw err
+        }
+        console.error(`[${label(context)}] Failed to mutate fresh brain:`, err)
+      }
+    }
+
+    context.brain = brain
+    return brain
+  })()
+
+  try {
+    return await context.waitingForBrain
+  } finally {
+    context.waitingForBrain = null
+  }
 }
 
 function computeNoveltyKey(vector) {
@@ -1155,7 +1294,7 @@ function gatherObservations(context) {
   const diversityRatio = Math.min(1, GLOBAL_RESOURCE_POOL.diversity.size / RESOURCE_TYPES.length)
   obs[43] = diversityRatio
 
-  return obs
+  return sanitizeVector(obs)
 }
 
 async function equipBestTool(context, preferredKeywords = []) {
@@ -2128,10 +2267,16 @@ function computeReward(context, obs) {
   }
 
   updateCooperationScore(context)
-  reward += Math.max(-0.3, Math.min(0.3, context.cooperationScore * 0.5)) * rewardProfile.cooperation
-  reward += (context.behaviorEntropy - 0.5) * 0.1 * rewardProfile.entropy
-  reward += Math.min(0.25, context.currentChainScore * 0.2) * rewardProfile.skill
+  const cooperation = Number.isFinite(context.cooperationScore) ? context.cooperationScore : 0
+  const entropy = Number.isFinite(context.behaviorEntropy) ? context.behaviorEntropy : 0
+  const chainScore = Number.isFinite(context.currentChainScore) ? context.currentChainScore : 0
+  reward += Math.max(-0.3, Math.min(0.3, cooperation * 0.5)) * rewardProfile.cooperation
+  reward += (entropy - 0.5) * 0.1 * rewardProfile.entropy
+  reward += Math.min(0.25, chainScore * 0.2) * rewardProfile.skill
 
+  if (!Number.isFinite(context.blockReward)) {
+    context.blockReward = 0
+  }
   const consumedBlockReward = context.blockReward
   reward += consumedBlockReward * rewardProfile.resource
   context.blockReward = 0
@@ -2146,12 +2291,13 @@ function computeReward(context, obs) {
   reward += lineageBonus
 
   if (context.mode === 'feral') {
-    const fury = context.feralFury ?? 0
+    const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
     reward += Math.min(0.5, fury * 0.08) * rewardProfile.feral
     reward -= Math.max(0, context.cooperationScore) * 0.2
     context.feralFury = Math.max(0, fury * 0.92)
   } else {
-    context.feralFury = Math.max(0, (context.feralFury ?? 0) * 0.85)
+    const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
+    context.feralFury = Math.max(0, fury * 0.85)
   }
 
   reward -= 0.02
@@ -2164,7 +2310,7 @@ function computeReward(context, obs) {
   context.lineagePrestige = getLineagePrestige(context.lineage)
 
   context.lastPos = { ...pos }
-  return reward
+  return clampReward(reward)
 }
 
 async function tickLoop(context) {
@@ -2192,9 +2338,18 @@ async function tickLoop(context) {
       return
     }
 
-    await ensureContextBrain(context)
+    const brain = await ensureContextBrain(context)
+    if (!brain) {
+      console.warn(`[${label(context)}] Brain not ready, skipping tick.`)
+      return
+    }
 
     const observation = gatherObservations(context)
+    sanitizeVector(observation)
+    if (!vectorHasFiniteValues(observation)) {
+      console.warn(`[${label(context)}] Observation contained invalid values; skipping tick.`)
+      return
+    }
     if (Array.isArray(context.lastPrediction) && context.lastPrediction.length === observation.length) {
       let mse = 0
       for (let i = 0; i < observation.length; i++) {
@@ -2205,7 +2360,8 @@ async function tickLoop(context) {
     } else {
       context.lastPredictionError = null
     }
-    const reward = computeReward(context, observation)
+    let reward = computeReward(context, observation)
+    reward = clampReward(reward)
 
     if (context.stagnation.active && context.stagnation.streak >= STAGNATION_WINDOW / 2) {
       context.epsilonBoost = Math.max(context.epsilonBoost, EPSILON_STAGNATION_BOOST)
@@ -2224,16 +2380,24 @@ async function tickLoop(context) {
 
     let trained = false
     if (context.lastObs && context.lastAction != null) {
-      trained = await trainBrain(
-        context.brain,
-        context.lastObs,
-        context.lastAction,
-        reward,
-        observation
-      )
+      const lastObsValid = vectorHasFiniteValues(context.lastObs)
+      if (lastObsValid) {
+        trained = await trainBrain(
+          brain,
+          context.lastObs,
+          context.lastAction,
+          reward,
+          observation
+        )
+      } else {
+        console.warn(`[${label(context)}] Skipping training due to invalid previous observation values.`)
+      }
     }
 
-    const { action, prediction } = await chooseAction(context.brain, observation, effectiveEpsilon)
+    const { action, prediction } = await chooseAction(brain, observation, effectiveEpsilon)
+    const sanitizedPrediction = Array.isArray(prediction)
+      ? prediction.map(value => sanitizeScalar(value, OBS_VALUE_CLAMP, 0))
+      : null
     await executeAction(context, action)
 
     const actionLabel = ACTIONS[action] ?? String(action)
@@ -2242,7 +2406,7 @@ async function tickLoop(context) {
     context.prevAction = context.lastAction
     context.lastObs = observation
     context.lastAction = action
-    context.lastPrediction = Array.isArray(prediction) ? prediction : null
+    context.lastPrediction = sanitizedPrediction
 
     context.tickCount += 1
     context.generationTicks += 1
@@ -2327,6 +2491,10 @@ async function synchronizeGeneration() {
   try {
     const sorted = [...contexts].sort((a, b) => b.generationReward - a.generationReward)
     const topTwo = sorted.slice(0, 2)
+    const rewardSnapshot = new Map()
+    for (const ctx of sorted) {
+      rewardSnapshot.set(ctx, ctx.generationReward ?? 0)
+    }
     await ensureBaselineReady()
 
     baselineState.generation += 1
@@ -2337,6 +2505,34 @@ async function synchronizeGeneration() {
 
     const topReward = sorted[0]?.generationReward ?? -Infinity
     const averageReward = contexts.reduce((sum, ctx) => sum + ctx.generationReward, 0) / contexts.length
+
+    const templateSources = []
+    for (const candidate of sorted) {
+      if (candidate?.brain?.id) {
+        templateSources.push(candidate.brain)
+      }
+      if (templateSources.length >= TEMPLATE_TOP_BRAINS) {
+        break
+      }
+    }
+
+    if (templateSources.length) {
+      try {
+        await averageWeights(baselineBrain, templateSources)
+        console.log(
+          `[Baseline] Updated template from top ${templateSources.length} brain${
+            templateSources.length === 1 ? '' : 's'
+          }.`
+        )
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err)) {
+          throw err
+        }
+        console.error('[Baseline] Failed to average top brains into template:', err)
+      }
+    } else {
+      console.log('[Baseline] Skipped template averaging — no trained brains available.')
+    }
 
     if (topReward > bestGenerationReward + 0.5) {
       bestGenerationReward = topReward
@@ -2447,6 +2643,27 @@ async function synchronizeGeneration() {
       }
     }
 
+    const oldestRetirees = []
+    const oldestSlots = Math.max(
+      0,
+      Math.min(OLDEST_RETIRE_PER_GENERATION, contexts.length - retireReasons.size - MIN_BOTS)
+    )
+    if (oldestSlots > 0) {
+      const oldestPool = sorted
+        .filter(ctx => !retireReasons.has(ctx))
+        .sort((a, b) => {
+          const genDelta = (a.birthGeneration ?? 0) - (b.birthGeneration ?? 0)
+          if (genDelta !== 0) return genDelta
+          const orderDelta = (a.birthOrder ?? 0) - (b.birthOrder ?? 0)
+          if (orderDelta !== 0) return orderDelta
+          return (a.birthTick ?? 0) - (b.birthTick ?? 0)
+        })
+      for (const candidate of oldestPool.slice(0, oldestSlots)) {
+        retireReasons.set(candidate, 'oldest')
+        oldestRetirees.push(candidate)
+      }
+    }
+
     for (const ctx of contexts) {
       ctx.generationTicks = 0
       ctx.generationReward = 0
@@ -2473,6 +2690,14 @@ async function synchronizeGeneration() {
       )
     }
 
+    for (const retiree of oldestRetirees) {
+      const ageGenerations = (baselineState.generation ?? 0) - (retiree.birthGeneration ?? 0)
+      const ageTicks = (baselineState.tickCount ?? 0) - (retiree.birthTick ?? 0)
+      console.log(
+        `[Baseline] Retiring ${label(retiree)} as oldest member (age ${ageGenerations} gen, ${ageTicks} ticks).`
+      )
+    }
+
     for (const [retiree, reason] of retireReasons.entries()) {
       await retireContext(retiree, reason)
     }
@@ -2496,9 +2721,33 @@ async function synchronizeGeneration() {
       ctx.lineagePrestige = getLineagePrestige(ctx.lineage)
     }
 
-    for (let i = 0; i < expansionCount; i++) {
-      const parentCandidate = topTwo[i % (topTwo.length || 1)] ?? sorted[0] ?? null
-      createContext(contexts.length + i, { parent: parentCandidate })
+    const spawnRequests = Math.max(0, expansionCount + retireReasons.size)
+    const availableSpawnSlots = Math.min(Math.max(0, MAX_BOTS - contexts.length), spawnRequests)
+    if (availableSpawnSlots > 0) {
+      const parentPool = contexts
+        .slice()
+        .sort((a, b) => (rewardSnapshot.get(b) ?? 0) - (rewardSnapshot.get(a) ?? 0))
+      const fallbackPool = sorted.filter(ctx => !retireReasons.has(ctx))
+      if (!parentPool.length && fallbackPool.length) {
+        parentPool.push(...fallbackPool)
+      }
+      if (!parentPool.length) {
+        parentPool.push(...sorted)
+      }
+
+      let spawnIndex = contexts.length
+      const topBaselineReward = Number.isFinite(topReward) ? topReward : 0
+      for (let i = 0; i < availableSpawnSlots; i++) {
+        const parentCandidate = parentPool[i % parentPool.length] ?? sorted[0] ?? null
+        const parentReward = rewardSnapshot.get(parentCandidate) ?? 0
+        const rewardGap = Math.max(0, topBaselineReward - parentReward)
+        const baseMutation = NEW_BRAIN_MUTATION_STDDEV + rewardGap * MUTATION_REWARD_FACTOR
+        let mutationStddev = deriveMutationStddev(baseMutation, { jitter: true })
+        if (!Number.isFinite(mutationStddev) || mutationStddev <= 0) {
+          mutationStddev = deriveMutationStddev(null, { jitter: true }) ?? NEW_BRAIN_MUTATION_STDDEV
+        }
+        createContext(spawnIndex++, { parent: parentCandidate, mutationStddev })
+      }
     }
 
     scheduleBaselineSave('generation')
@@ -2723,6 +2972,16 @@ function createContext(index, options = {}) {
     emotion[i] = MORALE_BASELINE
   }
 
+  const explicitMutation = Number.isFinite(options.mutationStddev) && options.mutationStddev >= 0
+    ? options.mutationStddev
+    : null
+  const primaryMutation = deriveMutationStddev(explicitMutation, { jitter: explicitMutation == null })
+  const extraMutations = Array.isArray(options.extraMutations)
+    ? options.extraMutations
+        .map(value => deriveMutationStddev(value, { jitter: false }))
+        .filter(value => Number.isFinite(value) && value > 0)
+    : []
+
   const context = {
     id: index,
     username,
@@ -2737,6 +2996,7 @@ function createContext(index, options = {}) {
     feralFury: 0,
     bot,
     brain: null,
+    pendingMutations: [],
     epsilon: EPSILON_START,
     epsilonBoost: 0,
     running: true,
@@ -2810,12 +3070,19 @@ function createContext(index, options = {}) {
     reconnectTimer: null,
     reconnecting: false,
     shuttingDown: false,
-    waitingForBrain: false,
+    waitingForBrain: null,
     remoteBrain: {
       offlineNotified: false,
       lastMessage: null,
       nextLogAt: 0
     }
+  }
+
+  if (Number.isFinite(primaryMutation) && primaryMutation > 0) {
+    enqueuePendingMutation(context, primaryMutation)
+  }
+  for (const extra of extraMutations) {
+    enqueuePendingMutation(context, extra)
   }
 
   setupBot(context)
@@ -2825,7 +3092,8 @@ function createContext(index, options = {}) {
 }
 
 for (let i = 0; i < BOT_COUNT; i++) {
-  createContext(i)
+  const seedMutation = deriveMutationStddev(null, { jitter: true }) ?? NEW_BRAIN_MUTATION_STDDEV
+  createContext(i, { mutationStddev: seedMutation })
 }
 
 process.stdin.resume()

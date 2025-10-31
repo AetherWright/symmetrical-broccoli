@@ -167,6 +167,25 @@ function toPlainList(observation) {
   return observation
 }
 
+function clampEpsilon(epsilon) {
+  if (!Number.isFinite(epsilon)) {
+    return 0.1
+  }
+  if (epsilon < 0) return 0
+  if (epsilon > 0.999) return 0.999
+  return epsilon
+}
+
+function sanitizeRewardValue(reward) {
+  if (!Number.isFinite(reward)) {
+    return 0
+  }
+  const limit = 1e6
+  if (reward > limit) return limit
+  if (reward < -limit) return -limit
+  return reward
+}
+
 export async function createBrain(inputSize, actionCount) {
   const payload = { input_size: inputSize, action_count: actionCount }
   const result = await request('/api/brains', { body: payload })
@@ -182,7 +201,7 @@ export async function chooseAction(brain, observation, epsilon = 0.1) {
   const brainId = ensureBrainId(brain)
   const payload = {
     observation: toPlainList(observation),
-    epsilon,
+    epsilon: clampEpsilon(epsilon),
     bot_id: brain.owner ?? null
   }
   const result = await request(`/api/brains/${brainId}/act`, { body: payload })
@@ -198,7 +217,7 @@ export async function trainBrain(brain, observation, actionIndex, reward, nextOb
   const payload = {
     observation: toPlainList(observation),
     action: actionIndex,
-    reward,
+    reward: sanitizeRewardValue(reward),
     next_observation: toPlainList(nextObservation),
     bot_id: brain.owner ?? null
   }
