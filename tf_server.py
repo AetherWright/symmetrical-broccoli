@@ -58,12 +58,15 @@ class RemoteBrain:
 
     def choose_action(self, observation, epsilon):
         obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
-        action_probs, _ = self.model(obs, training=False)
+        action_probs, prediction = self.model(obs, training=False)
         probs = np.clip(action_probs.numpy().flatten(), 1e-8, 1.0)
         probs = probs / probs.sum()
+        predicted_next = prediction.numpy().flatten().tolist()
         if np.random.random() < epsilon:
-            return int(np.random.randint(0, self.action_count))
-        return int(np.argmax(probs))
+            action_index = int(np.random.randint(0, self.action_count))
+        else:
+            action_index = int(np.argmax(probs))
+        return action_index, predicted_next
 
     def train(self, observation, action_index, reward, next_observation):
         obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
@@ -138,16 +141,34 @@ def log_request(bot_id, endpoint, payload):
             "reward": payload.get("reward"),
             "action": payload.get("action"),
             "epsilon": payload.get("epsilon"),
+            "prediction": payload.get("prediction")
         }
         STATUS["requests"].append(entry)
         STATUS["requests"] = STATUS["requests"][-50:]
         if bot_id:
-            STATUS["bots"].setdefault(bot_id, {})
-            STATUS["bots"][bot_id].update({
-                "last_seen": entry["timestamp"],
-                "last_reward": payload.get("reward"),
-                "last_action": payload.get("action")
-            })
+            bot_state = STATUS["bots"].setdefault(bot_id, {})
+            bot_state.update(
+                {
+                    "last_seen": entry["timestamp"],
+                    "last_action": payload.get("action"),
+                    "last_reward": payload.get("reward"),
+                    "epsilon": payload.get("epsilon")
+                }
+            )
+            if endpoint == "act":
+                bot_state["last_prediction"] = payload.get("prediction")
+            elif endpoint == "train":
+                next_obs = payload.get("next_observation")
+                last_pred = bot_state.get("last_prediction")
+                if (
+                    isinstance(next_obs, (list, tuple))
+                    and isinstance(last_pred, (list, tuple))
+                    and len(next_obs) == len(last_pred)
+                    and len(next_obs) > 0
+                ):
+                    diff = np.subtract(next_obs, last_pred)
+                    mse = float(np.mean(np.square(diff)))
+                    bot_state["prediction_mse"] = mse
 
 
 @app.post("/api/brains")
@@ -172,9 +193,13 @@ def choose_action_endpoint(brain_id):
     if not isinstance(observation, (list, tuple)):
         return jsonify({"error": "Observation must be a list"}), 400
     epsilon = float(payload.get("epsilon", 0.1))
-    action = brain.choose_action(observation, epsilon)
-    log_request(payload.get("bot_id"), "act", {**payload, "action": action})
-    return jsonify({"action": action})
+    action, prediction = brain.choose_action(observation, epsilon)
+    log_request(
+        payload.get("bot_id"),
+        "act",
+        {**payload, "action": action, "prediction": prediction}
+    )
+    return jsonify({"action": action, "prediction": prediction})
 
 
 @app.post("/api/brains/<brain_id>/train")

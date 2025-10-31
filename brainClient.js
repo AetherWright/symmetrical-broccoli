@@ -63,7 +63,8 @@ export async function chooseAction(brain, observation, epsilon = 0.1) {
   if (!Number.isInteger(result?.action)) {
     throw new Error('Remote brain did not return a valid action index')
   }
-  return result.action
+  const prediction = Array.isArray(result?.prediction) ? result.prediction : null
+  return { action: result.action, prediction }
 }
 
 export async function trainBrain(brain, observation, actionIndex, reward, nextObservation) {

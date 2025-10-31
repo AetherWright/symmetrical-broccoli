@@ -8,10 +8,7 @@ import {
   loadBrain,
   saveBrainState,
   loadBrainState,
-  DEFAULT_BRAIN_DIR,
-  copyWeights,
-  averageWeights,
-  mutateWeights
+  DEFAULT_BRAIN_DIR
 } from './brainClient.js'
 
 // ----------------------------
@@ -21,10 +18,6 @@ const MC_HOST = 'localhost'
 const MC_PORT = 25565
 const BOT_COUNT = Math.max(2, parseInt(process.env.BOT_COUNT ?? '3', 10))
 const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '200', 10))
-const MUTATION_STDDEV = Number.isFinite(Number(process.env.MUTATION_STDDEV))
-  ? Math.max(0.001, Number(process.env.MUTATION_STDDEV))
-  : 0.02
-
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
 const PREFIXES = ['', 'Mc', 'Von', 'De', "O'", 'El']
@@ -224,7 +217,7 @@ async function initializeBaselineBrain() {
     }
 
     if (baselineBrain) {
-      baselineBrain.owner = 'baseline'
+      baselineBrain.owner = 'hivemind'
     }
 
     const savedState = await loadBrainState(CHECKPOINT_DIR)
@@ -244,7 +237,7 @@ async function initializeBaselineBrain() {
     console.error('[Baseline] Failed to initialize from checkpoint:', err)
     baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
     if (baselineBrain) {
-      baselineBrain.owner = 'baseline'
+      baselineBrain.owner = 'hivemind'
     }
   }
 
@@ -264,7 +257,7 @@ async function ensureBaselineReady() {
     console.error('[Baseline] Initialization failed, recreating model:', err)
     baselineBrain = await createBrain(OBS_SIZE, ACTIONS.length)
     if (baselineBrain) {
-      baselineBrain.owner = 'baseline'
+      baselineBrain.owner = 'hivemind'
     }
     baselineReady = Promise.resolve(baselineBrain)
   }
@@ -338,17 +331,19 @@ async function flushPendingSave() {
 }
 
 async function ensureContextBrain(context) {
-  if (context.brain) return context.brain
   await ensureBaselineReady()
-  const brain = await createBrain(OBS_SIZE, ACTIONS.length)
-  brain.owner = label(context)
-  if (baselineBrain) {
-    await copyWeights(brain, baselineBrain)
+  if (!baselineBrain) {
+    throw new Error('Baseline brain failed to initialize')
   }
-  if (context.id > 0) {
-    await mutateWeights(brain, MUTATION_STDDEV)
+  if (!context.brain || context.brain.id !== baselineBrain.id) {
+    const brainRef = {
+      id: baselineBrain.id,
+      inputSize: baselineBrain.inputSize,
+      actionCount: baselineBrain.actionCount,
+      owner: label(context)
+    }
+    context.brain = brainRef
   }
-  context.brain = brain
   return context.brain
 }
 
@@ -781,6 +776,16 @@ async function tickLoop(context) {
     }
 
     const observation = gatherObservations(context)
+    if (Array.isArray(context.lastPrediction) && context.lastPrediction.length === observation.length) {
+      let mse = 0
+      for (let i = 0; i < observation.length; i++) {
+        const diff = (observation[i] ?? 0) - (context.lastPrediction[i] ?? 0)
+        mse += diff * diff
+      }
+      context.lastPredictionError = Math.sqrt(mse / observation.length)
+    } else {
+      context.lastPredictionError = null
+    }
     const reward = computeReward(context, observation)
 
     let trained = false
@@ -794,11 +799,12 @@ async function tickLoop(context) {
       )
     }
 
-    const action = await chooseAction(context.brain, observation, context.epsilon)
+    const { action, prediction } = await chooseAction(context.brain, observation, context.epsilon)
     await executeAction(context, action)
 
     context.lastObs = observation
     context.lastAction = action
+    context.lastPrediction = Array.isArray(prediction) ? prediction : null
 
     context.tickCount += 1
     context.generationTicks += 1
@@ -815,7 +821,10 @@ async function tickLoop(context) {
       context.epsilon = Math.max(EPSILON_MIN, context.epsilon * EPSILON_DECAY)
     }
 
-    console.log(`[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${context.epsilon.toFixed(3)}`)
+    const predictionNote = context.lastPredictionError != null
+      ? ` | PredErr: ${context.lastPredictionError.toFixed(3)}`
+      : ''
+    console.log(`[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${context.epsilon.toFixed(3)}${predictionNote}`)
     maybeTriggerAutosave()
     await maybeCompleteGeneration(context)
   } catch (err) {
@@ -853,27 +862,13 @@ async function synchronizeGeneration() {
     const topTwo = sorted.slice(0, 2)
     await ensureBaselineReady()
 
-    if (topTwo.length === 0) {
-      console.warn('[Baseline] No participants available for averaging.')
-      return
-    }
-
-    if (topTwo.length === 1) {
-      await copyWeights(baselineBrain, topTwo[0].brain)
-    } else {
-      await averageWeights(baselineBrain, topTwo.map(ctx => ctx.brain))
-    }
-
     baselineState.generation += 1
-    console.log(`[Baseline] Generation ${baselineState.generation} | Top rewards: ${topTwo.map(ctx => `${label(ctx)}=${ctx.generationReward.toFixed(2)}`).join(', ')}`)
+    const leaderboard = topTwo.length
+      ? topTwo.map(ctx => `${label(ctx)}=${ctx.generationReward.toFixed(2)}`).join(', ')
+      : 'n/a'
+    console.log(`[Baseline] Generation ${baselineState.generation} | Top rewards: ${leaderboard}`)
 
     for (const ctx of contexts) {
-      if (ctx.brain) {
-        await copyWeights(ctx.brain, baselineBrain)
-        if (!topTwo.includes(ctx)) {
-          await mutateWeights(ctx.brain, MUTATION_STDDEV)
-        }
-      }
       ctx.generationTicks = 0
       ctx.generationReward = 0
       ctx.readyForSync = false
@@ -964,6 +959,8 @@ function createContext(index) {
     registry: null,
     lastObs: null,
     lastAction: null,
+    lastPrediction: null,
+    lastPredictionError: null,
     lastPos: null,
     lastHealth: 20,
     lastFood: 20,
