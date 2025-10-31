@@ -6,7 +6,30 @@ import uuid
 
 import numpy as np
 import tensorflow as tf
+import tensorflow_addons as tfa
 from flask import Flask, jsonify, request
+
+ALLOWED_SEGMENT_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
+STORAGE_ROOT = os.environ.get("TF_SERVER_STORAGE_ROOT") or os.path.join(os.getcwd(), "tf_server_storage")
+os.makedirs(STORAGE_ROOT, exist_ok=True)
+
+
+def _sanitize_segment(value, fallback="default"):
+    if not value:
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    sanitized = "".join(ch for ch in text if ch in ALLOWED_SEGMENT_CHARS)
+    return sanitized or fallback
+
+
+def _resolve_storage_path(*segments, create=False):
+    parts = [_sanitize_segment(seg) for seg in segments if seg is not None]
+    directory = os.path.join(STORAGE_ROOT, *parts)
+    if create:
+        os.makedirs(directory, exist_ok=True)
+    return directory
 
 app = Flask(__name__)
 
@@ -53,8 +76,9 @@ class RemoteBrain:
         self.input_size = int(input_size)
         self.action_count = int(action_count)
         self.model = build_model(self.input_size, self.action_count)
-        self.action_optimizer = tf.keras.optimizers.RMSprop(5e-4)
-        self.prediction_optimizer = tf.keras.optimizers.Adam(1e-3)
+        nadam = tf.keras.optimizers.Nadam(learning_rate=2e-3)
+        self.optimizer = tfa.optimizers.Lookahead(nadam, sync_period=6, slow_step_size=0.5)
+        self.prediction_weight = tf.constant(1.0, dtype=tf.float32)
 
     def choose_action(self, observation, epsilon):
         obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
@@ -70,31 +94,42 @@ class RemoteBrain:
 
     def train(self, observation, action_index, reward, next_observation):
         obs = np.asarray(observation, dtype=np.float32).reshape(1, -1)
-        trained = False
 
-        if action_index is not None and reward is not None:
-            bounded_action = int(np.clip(int(action_index), 0, self.action_count - 1))
-            scaled_reward = float(np.clip(reward, -1.0, 1.0))
-            if scaled_reward != 0:
-                with tf.GradientTape() as tape:
-                    action_pred, _ = self.model(obs, training=True)
-                    one_hot = tf.one_hot([bounded_action], self.action_count)
-                    log_probs = tf.math.log(action_pred + 1e-8)
-                    loss = -scaled_reward * tf.reduce_mean(tf.reduce_sum(log_probs * one_hot, axis=-1))
-                gradients = tape.gradient(loss, self.model.trainable_variables)
-                self.action_optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-                trained = True
+        use_policy = action_index is not None and reward is not None
+        use_prediction = next_observation is not None
 
-        if next_observation is not None:
-            next_obs = np.asarray(next_observation, dtype=np.float32).reshape(1, -1)
-            with tf.GradientTape() as tape:
-                _, prediction = self.model(obs, training=True)
-                mse = tf.reduce_mean(tf.square(prediction - next_obs))
-            gradients = tape.gradient(mse, self.model.trainable_variables)
-            self.prediction_optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-            trained = True
+        if not (use_policy or use_prediction):
+            return False
 
-        return trained
+        with tf.GradientTape() as tape:
+            action_pred, prediction = self.model(obs, training=True)
+            total_loss = tf.constant(0.0, dtype=tf.float32)
+
+            if use_policy:
+                bounded_action = int(np.clip(int(action_index), 0, self.action_count - 1))
+                scaled_reward = float(np.clip(reward, -1.0, 1.0))
+                one_hot = tf.one_hot([bounded_action], self.action_count)
+                log_probs = tf.math.log(action_pred + 1e-8)
+                policy_loss = -scaled_reward * tf.reduce_mean(
+                    tf.reduce_sum(log_probs * one_hot, axis=-1)
+                )
+                total_loss += policy_loss
+
+            if use_prediction:
+                next_obs = np.asarray(next_observation, dtype=np.float32).reshape(1, -1)
+                prediction_loss = tf.reduce_mean(tf.square(prediction - next_obs))
+                total_loss += self.prediction_weight * prediction_loss
+
+        gradients = tape.gradient(total_loss, self.model.trainable_variables)
+        grads_and_vars = [
+            (grad, var)
+            for grad, var in zip(gradients, self.model.trainable_variables)
+            if grad is not None
+        ]
+        if grads_and_vars:
+            self.optimizer.apply_gradients(grads_and_vars)
+
+        return bool(grads_and_vars)
 
     def copy_from(self, other):
         self.model.set_weights(other.model.get_weights())
@@ -272,21 +307,21 @@ def save_endpoint(brain_id):
     if error:
         return error
     payload = request.get_json(force=True) or {}
-    path = payload.get("path")
-    if not path:
-        return jsonify({"error": "Path is required"}), 400
-    brain.save(path)
-    return jsonify({"status": "ok"})
+    label = payload.get("path") or brain_id
+    target_dir = _resolve_storage_path("brains", label, create=True)
+    brain.save(target_dir)
+    return jsonify({"status": "ok", "path": label})
 
 
 @app.post("/api/brains/load")
 def load_endpoint():
     payload = request.get_json(force=True) or {}
-    path = payload.get("path")
+    path_label = payload.get("path")
     input_size = int(payload.get("input_size", 0))
     action_count = int(payload.get("action_count", 0))
-    if not path or input_size <= 0 or action_count <= 0:
+    if not path_label or input_size <= 0 or action_count <= 0:
         return jsonify({"error": "Invalid load request"}), 400
+    path = _resolve_storage_path("brains", path_label, create=False)
     if not os.path.isdir(path):
         return jsonify({"error": "Checkpoint not found"}), 404
     brain_id = str(uuid.uuid4())
@@ -299,23 +334,24 @@ def load_endpoint():
 @app.post("/api/state/save")
 def save_state_endpoint():
     payload = request.get_json(force=True) or {}
-    path = payload.get("path")
-    if not path:
+    label = payload.get("path")
+    if not label:
         return jsonify({"error": "Path is required"}), 400
     state = payload.get("state") or {}
-    os.makedirs(path, exist_ok=True)
+    path = _resolve_storage_path("state", label, create=True)
     state_path = os.path.join(path, "brain_state.json")
     with open(state_path, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2)
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "path": label})
 
 
 @app.post("/api/state/load")
 def load_state_endpoint():
     payload = request.get_json(force=True) or {}
-    path = payload.get("path")
-    if not path:
+    label = payload.get("path")
+    if not label:
         return jsonify({"error": "Path is required"}), 400
+    path = _resolve_storage_path("state", label, create=False)
     state_path = os.path.join(path, "brain_state.json")
     if not os.path.exists(state_path):
         return jsonify({"state": None})
