@@ -41,6 +41,18 @@ function ensureBrainId(brain) {
   return brain.id
 }
 
+function toPlainList(observation) {
+  if (observation == null) return observation
+  if (Array.isArray(observation)) return observation
+  if (ArrayBuffer.isView(observation) && typeof observation.length === 'number') {
+    return Array.from(observation)
+  }
+  if (typeof observation === 'object' && typeof observation[Symbol.iterator] === 'function') {
+    return Array.from(observation)
+  }
+  return observation
+}
+
 export async function createBrain(inputSize, actionCount) {
   const payload = { input_size: inputSize, action_count: actionCount }
   const result = await request('/api/brains', { body: payload })
@@ -55,7 +67,7 @@ export async function createBrain(inputSize, actionCount) {
 export async function chooseAction(brain, observation, epsilon = 0.1) {
   const brainId = ensureBrainId(brain)
   const payload = {
-    observation,
+    observation: toPlainList(observation),
     epsilon,
     bot_id: brain.owner ?? null
   }
@@ -70,10 +82,10 @@ export async function chooseAction(brain, observation, epsilon = 0.1) {
 export async function trainBrain(brain, observation, actionIndex, reward, nextObservation) {
   const brainId = ensureBrainId(brain)
   const payload = {
-    observation,
+    observation: toPlainList(observation),
     action: actionIndex,
     reward,
-    next_observation: nextObservation,
+    next_observation: toPlainList(nextObservation),
     bot_id: brain.owner ?? null
   }
   const result = await request(`/api/brains/${brainId}/train`, { body: payload })
