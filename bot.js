@@ -1,5 +1,10 @@
 import mineflayer from 'mineflayer'
 import { Vec3 } from 'vec3'
+import fs from 'node:fs'
+import path from 'node:path'
+import { pipeline } from 'node:stream'
+import { promisify } from 'node:util'
+import zlib from 'node:zlib'
 import {
   createBrain,
   chooseAction,
@@ -8,7 +13,8 @@ import {
   loadBrain,
   saveBrainState,
   loadBrainState,
-  DEFAULT_BRAIN_DIR
+  DEFAULT_BRAIN_DIR,
+  mutateWeights
 } from './brainClient.js'
 
 // ----------------------------
@@ -21,6 +27,111 @@ const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
 const PREFIXES = ['', 'Mc', 'Von', 'De', "O'", 'El']
+
+const pipelineAsync = promisify(pipeline)
+
+class RotatingCompressedLogger {
+  constructor(directory, {
+    maxBytes = 512 * 1024,
+    maxAgeMs = 5 * 60 * 1000
+  } = {}) {
+    this.directory = directory
+    this.maxBytes = maxBytes
+    this.maxAgeMs = maxAgeMs
+    this.currentStream = null
+    this.currentGzip = null
+    this.currentPath = null
+    this.currentSize = 0
+    this.openedAt = 0
+    fs.mkdirSync(this.directory, { recursive: true })
+  }
+
+  _shouldRotate() {
+    if (!this.currentStream) return true
+    if (this.currentSize >= this.maxBytes) return true
+    if (Date.now() - this.openedAt >= this.maxAgeMs) return true
+    return false
+  }
+
+  async _rotate() {
+    if (this.currentGzip) {
+      await new Promise(resolve => {
+        this.currentGzip.once('finish', resolve)
+        this.currentGzip.end()
+      })
+      this.currentGzip = null
+      this.currentStream = null
+      this.currentPath = null
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const filename = `brain-${timestamp}.log.gz`
+    const filePath = path.join(this.directory, filename)
+    const fileStream = fs.createWriteStream(filePath, { flags: 'w' })
+    const gzip = zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED })
+    pipelineAsync(gzip, fileStream).catch(err => {
+      originalConsole.error('[Logger] Failed to pipeline log stream:', err)
+    })
+
+    this.currentStream = fileStream
+    this.currentGzip = gzip
+    this.currentPath = filePath
+    this.currentSize = 0
+    this.openedAt = Date.now()
+  }
+
+  async write(level, message) {
+    try {
+      if (this._shouldRotate()) {
+        await this._rotate()
+      }
+
+      if (!this.currentGzip) {
+        await this._rotate()
+      }
+
+      const line = `[${new Date().toISOString()}] [${level}] ${message}\n`
+      const buffer = Buffer.from(line, 'utf8')
+      this.currentSize += buffer.length
+      this.currentGzip.write(buffer)
+    } catch (err) {
+      originalConsole.error('[Logger] Failed to write log entry:', err)
+    }
+  }
+}
+
+const originalConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console)
+}
+
+const LOG_DIR = path.join(process.cwd(), 'logs')
+const logger = new RotatingCompressedLogger(LOG_DIR)
+
+async function mirrorToLog(level, args) {
+  try {
+    const message = args
+      .map(value => (typeof value === 'string' ? value : JSON.stringify(value)))
+      .join(' ')
+    await logger.write(level, message)
+  } catch (err) {
+    originalConsole.error('[Logger] Mirror failed:', err)
+  }
+}
+
+console.log = (...args) => {
+  originalConsole.log(...args)
+  mirrorToLog('INFO', args)
+}
+console.warn = (...args) => {
+  originalConsole.warn(...args)
+  mirrorToLog('WARN', args)
+}
+console.error = (...args) => {
+  originalConsole.error(...args)
+  mirrorToLog('ERROR', args)
+}
 
 const CRAFTING_ACTIONS = {
   craft_planks: { item: 'oak_planks', amount: 4, allowPartial: true, reward: 0.6 },
@@ -47,9 +158,13 @@ const ACTIONS = [
   'look_up',
   'look_down',
   'mine',
+  'mine_forward',
+  'strafe_mine_left',
+  'strafe_mine_right',
   'attack',
   'build',
   'build_above',
+  'build_forward',
   'use_item',
   ...Object.keys(CRAFTING_ACTIONS)
 ]
@@ -58,10 +173,20 @@ const TICK_RATE = 1000
 const EPSILON_START = 0.25
 const EPSILON_MIN = 0.05
 const EPSILON_DECAY = 0.999
+const EPSILON_STAGNATION_BOOST = 0.4
+const EPSILON_BOOST_DECAY = 0.995
 const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
-const OBS_SIZE = 22
+const OBS_SIZE = 34
+const NOVELTY_HASH_PRECISION = 2
+const NOVELTY_TARGET = 500
+const STAGNATION_WINDOW = 40
+const STAGNATION_VARIANCE_THRESHOLD = 0.0025
+const STAGNATION_MUTATION_THRESHOLD = 3
+const DIVERSITY_WINDOW = 60
+const MAX_BOTS = Math.max(BOT_COUNT, parseInt(process.env.BOT_MAX ?? '8', 10))
+const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
 const MAX_USERNAME_LENGTH = 16
 
 // ----------------------------
@@ -72,6 +197,14 @@ const usedNames = new Set()
 let globalRunning = true
 let baselineBrain = null
 let baselineReady = null
+const GLOBAL_RESOURCE_POOL = {
+  wood: 0,
+  stone: 0,
+  ore: 0,
+  crafted: 0,
+  totalContribution: 0,
+  totalWithdrawal: 0
+}
 let baselineState = {
   epsilon: EPSILON_START,
   tickCount: 0,
@@ -84,6 +217,8 @@ let lastSaveTime = Date.now()
 let saveInFlight = null
 let pendingSaveReason = null
 let generationSyncInFlight = false
+let stagnantGenerations = 0
+let bestGenerationReward = -Infinity
 
 // ----------------------------
 // HELPERS
@@ -209,7 +344,7 @@ function label(context) {
 
 async function initializeBaselineBrain() {
   try {
-    const loaded = await loadBrain(CHECKPOINT_DIR)
+    const loaded = await loadBrain(CHECKPOINT_DIR, OBS_SIZE, ACTIONS.length)
     if (loaded) {
       baselineBrain = loaded
     } else {
@@ -347,6 +482,116 @@ async function ensureContextBrain(context) {
   return context.brain
 }
 
+function computeNoveltyKey(vector) {
+  const values = Array.from(vector.slice(0, 16)).map(value => {
+    if (!Number.isFinite(value)) return 0
+    const precision = Math.pow(10, NOVELTY_HASH_PRECISION)
+    return Math.round(value * precision) / precision
+  })
+  return values.join('|')
+}
+
+function updateBehaviorEntropy(context, action) {
+  const counts = context.actionCounts
+  counts.set(action, (counts.get(action) ?? 0) + 1)
+  context.actionHistory.push(action)
+  if (context.actionHistory.length > DIVERSITY_WINDOW) {
+    const removed = context.actionHistory.shift()
+    const prev = counts.get(removed) ?? 0
+    if (prev <= 1) {
+      counts.delete(removed)
+    } else {
+      counts.set(removed, prev - 1)
+    }
+  }
+
+  const total = Array.from(counts.values()).reduce((sum, value) => sum + value, 0)
+  if (total > 0) {
+    let entropy = 0
+    for (const value of counts.values()) {
+      const p = value / total
+      entropy -= p * Math.log2(p)
+    }
+    const maxEntropy = Math.log2(ACTIONS.length)
+    context.behaviorEntropy = maxEntropy > 0 ? entropy / maxEntropy : 0
+  } else {
+    context.behaviorEntropy = 0
+  }
+}
+
+function updateSkillChains(context, reward) {
+  if (!context.actionHistory?.length) return
+  const historyLength = Math.min(4, context.actionHistory.length)
+  const sequence = context.actionHistory.slice(-historyLength).join('>')
+  if (!sequence) return
+  const record = context.skillChains.get(sequence) ?? { count: 0, total: 0 }
+  record.count += 1
+  record.total += reward
+  context.skillChains.set(sequence, record)
+  const average = record.total / record.count
+  context.currentChainScore = Math.max(0, Math.min(1, average))
+}
+
+function trackEnvironmentAwareness(context) {
+  try {
+    const { bot } = context
+    if (!bot?.entity?.position) return
+    const basePos = bot.entity.position
+    const below = bot.blockAt(basePos.offset(0, -1, 0))
+    const ahead = bot.blockAt(basePos.offset(0, 0, 1))
+    if (below?.name) {
+      context.visitedBlocks.add(below.name)
+    }
+    if (ahead?.name) {
+      context.visitedBlocks.add(ahead.name)
+    }
+    const biome = bot.entity?.biome?.name ?? bot.biome?.name
+    if (biome) {
+      context.visitedBiomes.add(biome)
+    }
+  } catch (err) {
+    console.warn(`[${label(context)}] Failed to sample environment:`, err?.message ?? err)
+  }
+}
+
+function trackNovelty(context, obs) {
+  const key = computeNoveltyKey(obs)
+  if (!context.visitedStates.has(key)) {
+    context.visitedStates.add(key)
+    context.noveltyCount += 1
+    context.noveltyFlag = true
+  } else {
+    context.noveltyFlag = false
+  }
+}
+
+function categorizeResource(name) {
+  if (!name) return null
+  if (name.includes('log') || name.includes('wood')) return 'wood'
+  if (name.includes('stone') || name.includes('cobblestone') || name.includes('gravel')) return 'stone'
+  if (name.includes('ore') || name.includes('ingot') || name.includes('coal') || name.includes('iron')) return 'ore'
+  return null
+}
+
+function registerContribution(context, amount) {
+  context.resourceLedger.contributed += amount
+  GLOBAL_RESOURCE_POOL.totalContribution += amount
+}
+
+function registerWithdrawal(context, amount) {
+  context.resourceLedger.withdrawn += amount
+  GLOBAL_RESOURCE_POOL.totalWithdrawal += amount
+}
+
+function updateCooperationScore(context) {
+  const contribution = context.resourceLedger.contributed
+  const withdrawal = context.resourceLedger.withdrawn
+  const totalContribution = GLOBAL_RESOURCE_POOL.totalContribution || 1
+  const totalWithdrawal = GLOBAL_RESOURCE_POOL.totalWithdrawal || 1
+  const fairness = contribution / totalContribution - withdrawal / totalWithdrawal
+  context.cooperationScore = fairness
+}
+
 function gatherObservations(context) {
   const { bot } = context
   const obs = new Float32Array(OBS_SIZE)
@@ -403,6 +648,26 @@ function gatherObservations(context) {
   obs[19] = Number(bot.quickBarSlot ?? 0)
   obs[20] = Number(bot.experience?.level ?? 0)
   obs[21] = Number(bot.experience?.progress ?? 0)
+
+  trackEnvironmentAwareness(context)
+  trackNovelty(context, obs)
+
+  const uniqueStateRatio = Math.min(1, context.visitedStates.size / NOVELTY_TARGET)
+  const uniqueBlocksRatio = Math.min(1, context.visitedBlocks.size / 200)
+  const uniqueBiomesRatio = Math.min(1, context.visitedBiomes.size / 32)
+  obs[22] = uniqueStateRatio
+  obs[23] = uniqueBlocksRatio
+  obs[24] = uniqueBiomesRatio
+
+  obs[25] = Math.min(1, context.resources.wood / 64)
+  obs[26] = Math.min(1, context.resources.stone / 128)
+  obs[27] = Math.min(1, context.resources.ore / 64)
+  obs[28] = Math.min(1, context.resources.crafted / 32)
+  obs[29] = Math.min(1, context.resourceLedger.contributed / 128)
+  obs[30] = Math.min(1, context.resourceLedger.withdrawn / 128)
+  obs[31] = Math.min(1, context.behaviorEntropy)
+  obs[32] = Math.min(1, context.currentChainScore)
+  obs[33] = context.stagnation.active ? 1 : 0
 
   return obs
 }
@@ -525,9 +790,51 @@ async function executeCraftAction(context, act) {
   const success = await craftItem(context, config.item, config)
   if (success) {
     context.blockReward += config.reward ?? 0.4
+    context.resources.crafted += config.amount ?? 1
+    GLOBAL_RESOURCE_POOL.crafted += config.amount ?? 1
+    registerWithdrawal(context, config.amount ?? 1)
+    updateCooperationScore(context)
     console.log(`[${label(context)}] Crafted ${config.item}`)
   } else {
     context.blockReward -= 0.03
+  }
+}
+
+async function performMining(context, { forward = false, strafe = 0 } = {}) {
+  const { bot } = context
+  const target = bot.blockAtCursor(5)
+  if (!target) {
+    context.blockReward -= 0.02
+    return
+  }
+
+  if (forward) {
+    bot.setControlState('forward', true)
+  }
+  if (strafe < 0) {
+    bot.setControlState('left', true)
+  } else if (strafe > 0) {
+    bot.setControlState('right', true)
+  }
+
+  const equipped = await equipBestTool(context, ['pickaxe', 'axe', 'shovel'])
+  if (!equipped) {
+    await equipBestTool(context, ['hand'])
+  }
+
+  try {
+    await bot.dig(target)
+    context.blockReward += 0.5
+    const resourceType = categorizeResource(target.name)
+    if (resourceType && typeof context.resources[resourceType] === 'number') {
+      context.resources[resourceType] += 1
+      GLOBAL_RESOURCE_POOL[resourceType] += 1
+      registerContribution(context, 1)
+      updateCooperationScore(context)
+    }
+  } catch (err) {
+    console.warn(`[${label(context)}] Mining failed:`, err?.message ?? err)
+    context.blockReward -= 0.05
   }
 }
 
@@ -602,25 +909,18 @@ async function executeAction(context, index) {
       case 'look_down':
         await lookBy(0, Math.PI / 8)
         break
-      case 'mine': {
-        const target = getTargetBlock()
-        if (target) {
-          const mined = await equipBestTool(context, ['pickaxe', 'axe', 'shovel'])
-          if (!mined) {
-            await equipBestTool(context, ['hand'])
-          }
-          try {
-            await bot.dig(target)
-            context.blockReward += 0.5
-          } catch (err) {
-            console.warn(`[${label(context)}] Mining failed:`, err?.message ?? err)
-            context.blockReward -= 0.05
-          }
-        } else {
-          context.blockReward -= 0.02
-        }
+      case 'mine':
+        await performMining(context)
         break
-      }
+      case 'mine_forward':
+        await performMining(context, { forward: true })
+        break
+      case 'strafe_mine_left':
+        await performMining(context, { strafe: -1 })
+        break
+      case 'strafe_mine_right':
+        await performMining(context, { strafe: 1 })
+        break
       case 'attack': {
         const entity = bot.nearestEntity()
         if (entity) {
@@ -645,6 +945,8 @@ async function executeAction(context, index) {
             try {
               await bot.placeBlock(target, new Vec3(0, 1, 0))
               context.blockReward += 0.25
+              registerWithdrawal(context, 1)
+              updateCooperationScore(context)
             } catch (err) {
               console.warn(`[${label(context)}] Build failed:`, err?.message ?? err)
               context.blockReward -= 0.02
@@ -671,10 +973,34 @@ async function executeAction(context, index) {
               try {
                 await bot.placeBlock(blockBelow, new Vec3(0, 1, 0))
                 context.blockReward += 0.2
+                registerWithdrawal(context, 1)
+                updateCooperationScore(context)
               } catch (err) {
                 console.warn(`[${label(context)}] Build above failed:`, err?.message ?? err)
                 context.blockReward -= 0.02
               }
+            }
+          }
+        } else {
+          context.blockReward -= 0.02
+        }
+        break
+      }
+      case 'build_forward': {
+        const target = getTargetBlock()
+        if (target) {
+          const success = await equipPlaceableBlock(context)
+          if (success) {
+            try {
+              await bot.placeBlock(target, new Vec3(1, 0, 0))
+              bot.setControlState('forward', true)
+              await sleep(200)
+              context.blockReward += 0.22
+              registerWithdrawal(context, 1)
+              updateCooperationScore(context)
+            } catch (err) {
+              console.warn(`[${label(context)}] Build forward failed:`, err?.message ?? err)
+              context.blockReward -= 0.02
             }
           }
         } else {
@@ -698,6 +1024,33 @@ async function executeAction(context, index) {
     }
   } finally {
     bot.clearControlStates()
+  }
+}
+
+function updateStagnation(context, reward) {
+  const history = context.rewardHistory
+  history.push(reward)
+  if (history.length > STAGNATION_WINDOW) {
+    history.shift()
+  }
+
+  if (history.length < 4) {
+    context.stagnation.active = false
+    return
+  }
+
+  const avg = history.reduce((sum, value) => sum + value, 0) / history.length
+  const variance = history.reduce((sum, value) => {
+    const diff = value - avg
+    return sum + diff * diff
+  }, 0) / history.length
+
+  if (variance < STAGNATION_VARIANCE_THRESHOLD) {
+    context.stagnation.streak += 1
+    context.stagnation.active = true
+  } else {
+    context.stagnation.streak = 0
+    context.stagnation.active = false
   }
 }
 
@@ -750,11 +1103,33 @@ function computeReward(context, obs) {
     reward -= (3 - nearestDist) * 0.05
   }
 
+  if (context.lastAction != null) {
+    if (context.prevAction === context.lastAction) {
+      context.repetitionStreak += 1
+    } else {
+      context.repetitionStreak = 0
+    }
+    const fatiguePenalty = Math.min(0.6, context.repetitionStreak * 0.05)
+    reward -= fatiguePenalty
+  }
+
+  if (context.noveltyFlag) {
+    reward += 0.12
+  }
+
+  updateCooperationScore(context)
+  reward += Math.max(-0.3, Math.min(0.3, context.cooperationScore * 0.5))
+  reward += (context.behaviorEntropy - 0.5) * 0.1
+  reward += Math.min(0.25, context.currentChainScore * 0.2)
+
   const consumedBlockReward = context.blockReward
   reward += consumedBlockReward
   context.blockReward = 0
 
   reward -= 0.02
+
+  updateStagnation(context, reward)
+  updateSkillChains(context, reward)
 
   context.lastPos = { ...pos }
   return reward
@@ -788,6 +1163,17 @@ async function tickLoop(context) {
     }
     const reward = computeReward(context, observation)
 
+    if (context.stagnation.active && context.stagnation.streak >= STAGNATION_WINDOW / 2) {
+      context.epsilonBoost = Math.max(context.epsilonBoost, EPSILON_STAGNATION_BOOST)
+    } else {
+      context.epsilonBoost *= EPSILON_BOOST_DECAY
+      if (context.epsilonBoost < 0.01) {
+        context.epsilonBoost = 0
+      }
+    }
+
+    const effectiveEpsilon = Math.min(0.95, Math.max(EPSILON_MIN, context.epsilon + context.epsilonBoost))
+
     let trained = false
     if (context.lastObs && context.lastAction != null) {
       trained = await trainBrain(
@@ -799,9 +1185,13 @@ async function tickLoop(context) {
       )
     }
 
-    const { action, prediction } = await chooseAction(context.brain, observation, context.epsilon)
+    const { action, prediction } = await chooseAction(context.brain, observation, effectiveEpsilon)
     await executeAction(context, action)
 
+    const actionLabel = ACTIONS[action] ?? String(action)
+    updateBehaviorEntropy(context, actionLabel)
+
+    context.prevAction = context.lastAction
     context.lastObs = observation
     context.lastAction = action
     context.lastPrediction = Array.isArray(prediction) ? prediction : null
@@ -821,10 +1211,19 @@ async function tickLoop(context) {
       context.epsilon = Math.max(EPSILON_MIN, context.epsilon * EPSILON_DECAY)
     }
 
+    if (context.epsilonBoost > 0) {
+      context.epsilonBoost *= EPSILON_BOOST_DECAY
+      if (context.epsilonBoost < 0.01) {
+        context.epsilonBoost = 0
+      }
+    }
+
     const predictionNote = context.lastPredictionError != null
       ? ` | PredErr: ${context.lastPredictionError.toFixed(3)}`
       : ''
-    console.log(`[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${context.epsilon.toFixed(3)}${predictionNote}`)
+    console.log(
+      `[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${effectiveEpsilon.toFixed(3)} | Entropy: ${context.behaviorEntropy.toFixed(2)}${predictionNote}`
+    )
     maybeTriggerAutosave()
     await maybeCompleteGeneration(context)
   } catch (err) {
@@ -868,10 +1267,68 @@ async function synchronizeGeneration() {
       : 'n/a'
     console.log(`[Baseline] Generation ${baselineState.generation} | Top rewards: ${leaderboard}`)
 
+    const topReward = sorted[0]?.generationReward ?? -Infinity
+    const averageReward = contexts.reduce((sum, ctx) => sum + ctx.generationReward, 0) / contexts.length
+
+    if (topReward > bestGenerationReward + 0.5) {
+      bestGenerationReward = topReward
+      stagnantGenerations = 0
+    } else {
+      stagnantGenerations += 1
+    }
+
+    if (stagnantGenerations >= STAGNATION_MUTATION_THRESHOLD) {
+      console.log('[Baseline] Stagnation detected — triggering meta-mutation and epsilon reset.')
+      try {
+        await mutateWeights(baselineBrain, 0.05)
+        for (const ctx of contexts) {
+          ctx.epsilon = Math.min(0.9, Math.max(ctx.epsilon, EPSILON_START))
+          ctx.epsilonBoost = Math.max(ctx.epsilonBoost, EPSILON_STAGNATION_BOOST)
+          ctx.stagnation.lastMutation = baselineState.generation
+        }
+      } catch (err) {
+        console.error('[Baseline] Meta-mutation failed:', err)
+      }
+      stagnantGenerations = 0
+    }
+
+    let expansionCount = 0
+    if (averageReward > 1 && contexts.length < MAX_BOTS) {
+      expansionCount = 1
+    }
+    if (averageReward > 3 && contexts.length + expansionCount < MAX_BOTS) {
+      expansionCount += 1
+    }
+    if (averageReward > 6 && contexts.length + expansionCount < MAX_BOTS) {
+      expansionCount += 1
+    }
+    expansionCount = Math.min(expansionCount, MAX_BOTS - contexts.length)
+
+    let contractionCount = 0
+    if (averageReward < -0.5 && contexts.length > MIN_BOTS) {
+      contractionCount = 1
+    }
+    if (averageReward < -2 && contexts.length - contractionCount > MIN_BOTS) {
+      contractionCount += 1
+    }
+    contractionCount = Math.min(contractionCount, contexts.length - MIN_BOTS)
+
+    const retireList = contractionCount > 0 ? sorted.slice(-contractionCount) : []
+
     for (const ctx of contexts) {
       ctx.generationTicks = 0
       ctx.generationReward = 0
       ctx.readyForSync = false
+    }
+
+    for (const retiree of retireList) {
+      if (retiree) {
+        await retireContext(retiree, 'dynamic-scaling')
+      }
+    }
+
+    for (let i = 0; i < expansionCount; i++) {
+      createContext(contexts.length + i)
     }
 
     scheduleBaselineSave('generation')
@@ -906,18 +1363,66 @@ function setupRewardTracking(context) {
       const count = collected?.metadata?.itemCount ?? collected?.count ?? 1
       const bonus = Math.max(0.3, (count || 1) * 0.15)
       context.blockReward += bonus
+      const itemName = collected?.name ?? collected?.metadata?.item?.name
+      const category = typeof itemName === 'string' ? categorizeResource(itemName) : null
+      if (category && typeof context.resources[category] === 'number') {
+        context.resources[category] += count
+        GLOBAL_RESOURCE_POOL[category] += count
+        registerContribution(context, count)
+        updateCooperationScore(context)
+      }
       console.log(`[${label(context)}] Collected item → +${bonus.toFixed(2)} reward`)
     }
   })
+}
+
+function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
+  if (!context || context.shuttingDown) return
+  if (context.reconnectTimer) return
+  context.running = false
+  if (context.tickTimer) {
+    clearTimeout(context.tickTimer)
+    context.tickTimer = null
+  }
+  context.reconnecting = true
+  context.reconnectAttempts = (context.reconnectAttempts ?? 0) + 1
+  const backoff = Math.min(30000, Math.floor(delay * context.reconnectAttempts))
+  console.warn(`[${label(context)}] Scheduling reconnect in ${backoff}ms (${reason}).`)
+  context.reconnectTimer = setTimeout(() => {
+    context.reconnectTimer = null
+    try {
+      context.bot?.removeAllListeners?.()
+    } catch (err) {
+      console.warn(`[${label(context)}] Failed to prune listeners before reconnect:`, err?.message ?? err)
+    }
+    try {
+      const newBot = mineflayer.createBot({
+        host: NETWORK_HOST,
+        port: NETWORK_PORT,
+        username: context.username
+      })
+      context.bot = newBot
+      context.running = true
+      context.reconnecting = false
+      context.reconnectAttempts = 0
+      setupBot(context)
+    } catch (err) {
+      console.error(`[${label(context)}] Reconnect attempt failed:`, err)
+      scheduleReconnect(context, 'retry', backoff * 1.5)
+    }
+  }, backoff)
 }
 
 function setupBot(context) {
   const username = context.username
   console.log(`[${username}] Connecting to ${NETWORK_HOST}:${NETWORK_PORT}`)
 
-  context.bot.once('spawn', () => {
+  const { bot } = context
+
+  bot.once('spawn', () => {
     console.log(`[${label(context)}] Spawned! Waiting for entity to initialize...`)
 
+    context.reconnecting = false
     context.registry = context.bot.registry ?? context.registry
     if (!context.registry) {
       console.warn(`[${label(context)}] Failed to load registry — crafting actions will be limited.`)
@@ -933,10 +1438,46 @@ function setupBot(context) {
     }, 500)
   })
 
-  context.bot.on('error', e => console.error(`[${label(context)}] Error:`, e))
-  context.bot.on('kicked', r => console.error(`[${label(context)}] Kicked:`, r))
+  const handleDisconnect = reason => {
+    console.warn(`[${label(context)}] Disconnected: ${reason}`)
+    scheduleReconnect(context, reason)
+  }
+
+  bot.once('end', () => handleDisconnect('end'))
+  bot.on('kicked', r => handleDisconnect(`kicked: ${r}`))
+  bot.on('error', e => {
+    console.error(`[${label(context)}] Error:`, e)
+    if (!context.reconnecting) {
+      scheduleReconnect(context, e?.message ?? 'error')
+    }
+  })
 
   setupRewardTracking(context)
+}
+
+async function retireContext(context, reason = 'retire') {
+  if (!context) return
+  context.running = false
+  context.shuttingDown = true
+  if (context.tickTimer) {
+    clearTimeout(context.tickTimer)
+    context.tickTimer = null
+  }
+  if (context.reconnectTimer) {
+    clearTimeout(context.reconnectTimer)
+    context.reconnectTimer = null
+  }
+  try {
+    context.bot?.removeAllListeners?.()
+    context.bot?.quit?.(safeDisconnectReason(`Retire: ${reason}`))
+  } catch (err) {
+    console.warn(`[${label(context)}] Failed to retire bot:`, err?.message ?? err)
+  }
+  context.bot = null
+  const idx = contexts.indexOf(context)
+  if (idx >= 0) {
+    contexts.splice(idx, 1)
+  }
 }
 
 function createContext(index) {
@@ -953,12 +1494,14 @@ function createContext(index) {
     bot,
     brain: null,
     epsilon: EPSILON_START,
+    epsilonBoost: 0,
     running: true,
     tickTimer: null,
     tickInFlight: false,
     registry: null,
     lastObs: null,
     lastAction: null,
+    prevAction: null,
     lastPrediction: null,
     lastPredictionError: null,
     lastPos: null,
@@ -971,7 +1514,39 @@ function createContext(index) {
     cumulativeReward: 0,
     generationTicks: 0,
     generationReward: 0,
-    readyForSync: false
+    readyForSync: false,
+    repetitionStreak: 0,
+    rewardHistory: [],
+    actionHistory: [],
+    actionCounts: new Map(),
+    behaviorEntropy: 0,
+    visitedStates: new Set(),
+    visitedBlocks: new Set(),
+    visitedBiomes: new Set(),
+    noveltyCount: 0,
+    noveltyFlag: false,
+    resources: {
+      wood: 0,
+      stone: 0,
+      ore: 0,
+      crafted: 0
+    },
+    resourceLedger: {
+      contributed: 0,
+      withdrawn: 0
+    },
+    cooperationScore: 0,
+    skillChains: new Map(),
+    currentChainScore: 0,
+    stagnation: {
+      active: false,
+      streak: 0,
+      lastMutation: 0
+    },
+    reconnectAttempts: 0,
+    reconnectTimer: null,
+    reconnecting: false,
+    shuttingDown: false
   }
 
   setupBot(context)
@@ -1020,6 +1595,7 @@ process.stdin.on('data', async data => {
     globalRunning = false
     for (const ctx of contexts) {
       ctx.running = false
+      ctx.shuttingDown = true
       if (ctx.tickTimer) {
         clearTimeout(ctx.tickTimer)
         ctx.tickTimer = null
@@ -1030,7 +1606,7 @@ process.stdin.on('data', async data => {
     await persistBaseline('shutdown')
     for (const ctx of contexts) {
       try {
-        ctx.bot.quit(safeDisconnectReason('Manual shutdown'))
+        ctx.bot?.quit?.(safeDisconnectReason('Manual shutdown'))
       } catch (err) {
         console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
       }
@@ -1045,6 +1621,7 @@ async function gracefulShutdown(reason = 'signal') {
     globalRunning = false
     for (const ctx of contexts) {
       ctx.running = false
+      ctx.shuttingDown = true
       if (ctx.tickTimer) {
         clearTimeout(ctx.tickTimer)
         ctx.tickTimer = null
@@ -1055,7 +1632,7 @@ async function gracefulShutdown(reason = 'signal') {
     await persistBaseline(reason)
     for (const ctx of contexts) {
       try {
-        ctx.bot.quit(safeDisconnectReason(`Shutdown: ${reason}`))
+        ctx.bot?.quit?.(safeDisconnectReason(`Shutdown: ${reason}`))
       } catch (err) {
         console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
       }
