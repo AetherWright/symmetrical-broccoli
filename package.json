@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "mineflayer": "^4.25.0"
+  }
+}
