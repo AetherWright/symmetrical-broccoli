@@ -941,12 +941,36 @@ const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
 const EMOTION_VECTOR_SIZE = 3
-const OBS_SIZE = 44
+const BASE_OBS_FEATURES = 44
+const MEMORY_REWARD_WINDOW = Math.max(
+  4,
+  Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 8, { min: 4, max: 32 }))
+)
+const MEMORY_ACTION_WINDOW = Math.max(
+  4,
+  Math.floor(readNumberEnv('BOT_MEMORY_ACTION_WINDOW', 8, { min: 4, max: 32 }))
+)
+const MEMORY_AGGREGATE_COUNT = 8
+const MEMORY_OBS_SIZE = MEMORY_REWARD_WINDOW + MEMORY_ACTION_WINDOW + MEMORY_AGGREGATE_COUNT
+const MEMORY_OBS_START = BASE_OBS_FEATURES
+const OBS_SIZE = BASE_OBS_FEATURES + MEMORY_OBS_SIZE
 const NOVELTY_HASH_PRECISION = 2
 const NOVELTY_TARGET = 500
 const STAGNATION_WINDOW = 40
 const STAGNATION_VARIANCE_THRESHOLD = 0.0025
 const STAGNATION_MUTATION_THRESHOLD = 3
+const MEMORY_SHORT_DECAY = readNumberEnv('BOT_MEMORY_SHORT_DECAY', 0.35, { min: 0.05, max: 0.95 })
+const MEMORY_LONG_DECAY = readNumberEnv('BOT_MEMORY_LONG_DECAY', 0.08, { min: 0.01, max: 0.6 })
+const MEMORY_VOLATILITY_DECAY = readNumberEnv('BOT_MEMORY_VOLATILITY_DECAY', 0.18, { min: 0.01, max: 0.6 })
+const REWARD_MEMORY_CLAMP = readNumberEnv('BOT_MEMORY_REWARD_CLAMP', 3, { min: 0.5, max: 10 })
+const ACTION_MEMORY_RATE = readNumberEnv('BOT_ACTION_MEMORY_RATE', 0.25, { min: 0.05, max: 0.95 })
+const ACTION_VALUE_CLAMP = readNumberEnv('BOT_ACTION_VALUE_CLAMP', 2, { min: 0.5, max: 8 })
+const ACTION_MEMORY_EPSILON = 0.001
+const DAMAGE_DEBT_DECAY = readNumberEnv('BOT_DAMAGE_DEBT_DECAY', 0.88, { min: 0.1, max: 0.999 })
+const DAMAGE_RECENT_DECAY = readNumberEnv('BOT_DAMAGE_RECENT_DECAY', 0.75, { min: 0.1, max: 0.999 })
+const DAMAGE_DEBT_WEIGHT = readNumberEnv('BOT_DAMAGE_DEBT_WEIGHT', 0.6, { min: 0, max: 5 })
+const DAMAGE_DEBT_PENALTY = readNumberEnv('BOT_DAMAGE_DEBT_PENALTY', 0.4, { min: 0, max: 5 })
+const DAMAGE_MEMORY_CLAMP = readNumberEnv('BOT_DAMAGE_MEMORY_CLAMP', 10, { min: 1, max: 40 })
 const DIVERSITY_WINDOW = 60
 const MAX_BOTS = Math.max(BOT_COUNT, parseInt(process.env.BOT_MAX ?? '8', 10))
 const LOW_REWARD_RETIRE_LIMIT = (() => {
@@ -1634,6 +1658,174 @@ function updateSkillChains(context, reward) {
   context.currentChainScore = Math.max(0, Math.min(1, average))
 }
 
+function limitMagnitude(value, limit) {
+  if (!Number.isFinite(value)) return 0
+  if (!Number.isFinite(limit) || limit <= 0) return value
+  if (value > limit) return limit
+  if (value < -limit) return -limit
+  return value
+}
+
+function limitPositive(value, limit) {
+  if (!Number.isFinite(value) || value <= 0) return 0
+  if (!Number.isFinite(limit) || limit <= 0) return Math.max(0, value)
+  return Math.min(limit, value)
+}
+
+function normalizeMagnitude(value, limit) {
+  if (!Number.isFinite(value) || !Number.isFinite(limit) || limit <= 0) return 0
+  const scaled = value / limit
+  if (scaled > 1) return 1
+  if (scaled < -1) return -1
+  return scaled
+}
+
+function normalizePositive(value, limit) {
+  if (!Number.isFinite(value) || value <= 0 || !Number.isFinite(limit) || limit <= 0) return 0
+  const scaled = value / limit
+  if (scaled > 1) return 1
+  if (scaled < 0) return 0
+  return scaled
+}
+
+function ensureTemporalMemoryState(context) {
+  if (!context) return
+  if (!Array.isArray(context.memoryRewards)) {
+    context.memoryRewards = []
+  }
+  if (!Array.isArray(context.memoryActions)) {
+    context.memoryActions = []
+  }
+  if (!(context.actionValueMemory instanceof Map)) {
+    context.actionValueMemory = new Map()
+  }
+  if (!Number.isFinite(context.recentRewardAvg)) {
+    context.recentRewardAvg = 0
+  }
+  if (!Number.isFinite(context.longRewardAvg)) {
+    context.longRewardAvg = 0
+  }
+  if (!Number.isFinite(context.rewardDrift)) {
+    context.rewardDrift = 0
+  }
+  if (!Number.isFinite(context.rewardVolatility)) {
+    context.rewardVolatility = 0
+  }
+  if (!Number.isFinite(context.actionMemoryBest)) {
+    context.actionMemoryBest = 0
+  }
+  if (!Number.isFinite(context.actionMemoryWorst)) {
+    context.actionMemoryWorst = 0
+  }
+  if (!Number.isFinite(context.damageDebt)) {
+    context.damageDebt = 0
+  }
+  if (!Number.isFinite(context.recentDamage)) {
+    context.recentDamage = 0
+  }
+}
+
+function pushBounded(list, value, limit) {
+  if (!Array.isArray(list)) return
+  list.push(value)
+  if (list.length > limit) {
+    list.splice(0, list.length - limit)
+  }
+}
+
+function updateTemporalMemory(context, reward) {
+  ensureTemporalMemoryState(context)
+  const rewardValue = Number.isFinite(reward) ? reward : 0
+  pushBounded(context.memoryRewards, rewardValue, MEMORY_REWARD_WINDOW)
+
+  const shortDecay = MEMORY_SHORT_DECAY
+  const longDecay = MEMORY_LONG_DECAY
+  const prevShort = context.recentRewardAvg
+  const prevLong = context.longRewardAvg
+  const newShort = prevShort * (1 - shortDecay) + rewardValue * shortDecay
+  const newLong = prevLong * (1 - longDecay) + rewardValue * longDecay
+  context.recentRewardAvg = limitMagnitude(newShort, REWARD_MEMORY_CLAMP)
+  context.longRewardAvg = limitMagnitude(newLong, REWARD_MEMORY_CLAMP)
+  context.rewardDrift = limitMagnitude(context.recentRewardAvg - context.longRewardAvg, REWARD_MEMORY_CLAMP)
+
+  const prevVolatility = context.rewardVolatility
+  const volatilityDelta = Math.abs(rewardValue - context.recentRewardAvg)
+  const newVolatility = prevVolatility * (1 - MEMORY_VOLATILITY_DECAY) + volatilityDelta * MEMORY_VOLATILITY_DECAY
+  context.rewardVolatility = limitPositive(newVolatility, REWARD_MEMORY_CLAMP)
+
+  const retention = 1 - ACTION_MEMORY_RATE
+  const entries = Array.from(context.actionValueMemory.entries())
+  for (const [key, entry] of entries) {
+    const base = Number.isFinite(entry?.value) ? entry.value : 0
+    const decayed = limitMagnitude(base * retention, ACTION_VALUE_CLAMP)
+    if (Math.abs(decayed) <= ACTION_MEMORY_EPSILON) {
+      context.actionValueMemory.delete(key)
+    } else {
+      entry.value = decayed
+      context.actionValueMemory.set(key, entry)
+    }
+  }
+
+  if (Number.isInteger(context.lastAction)) {
+    const key = context.lastAction
+    const entry = context.actionValueMemory.get(key) ?? { value: 0 }
+    const updated = limitMagnitude(entry.value + rewardValue * ACTION_MEMORY_RATE, ACTION_VALUE_CLAMP)
+    entry.value = updated
+    context.actionValueMemory.set(key, entry)
+  }
+
+  let best = -Infinity
+  let worst = Infinity
+  for (const entry of context.actionValueMemory.values()) {
+    const value = Number.isFinite(entry?.value) ? entry.value : 0
+    if (value > best) best = value
+    if (value < worst) worst = value
+  }
+  context.actionMemoryBest = best === -Infinity ? 0 : limitMagnitude(best, ACTION_VALUE_CLAMP)
+  context.actionMemoryWorst = worst === Infinity ? 0 : limitMagnitude(worst, ACTION_VALUE_CLAMP)
+}
+
+function recordActionMemory(context, actionIndex) {
+  if (!Number.isInteger(actionIndex)) return
+  ensureTemporalMemoryState(context)
+  pushBounded(context.memoryActions, actionIndex, MEMORY_ACTION_WINDOW)
+}
+
+function populateMemoryObservation(context, obs, startIndex) {
+  ensureTemporalMemoryState(context)
+  let index = startIndex
+
+  const rewards = context.memoryRewards
+  for (let i = 0; i < MEMORY_REWARD_WINDOW; i++) {
+    const sourceIndex = rewards.length - 1 - i
+    const value = sourceIndex >= 0 ? rewards[sourceIndex] : 0
+    obs[index++] = normalizeMagnitude(value, REWARD_MEMORY_CLAMP)
+  }
+
+  const actions = context.memoryActions
+  const actionNormalizer = Math.max(1, ACTIONS.length - 1)
+  for (let i = 0; i < MEMORY_ACTION_WINDOW; i++) {
+    const sourceIndex = actions.length - 1 - i
+    const value = sourceIndex >= 0 ? actions[sourceIndex] : -1
+    if (!Number.isFinite(value) || value < 0) {
+      obs[index++] = 0
+    } else {
+      obs[index++] = Math.max(0, Math.min(1, value / actionNormalizer))
+    }
+  }
+
+  obs[index++] = normalizeMagnitude(context.recentRewardAvg, REWARD_MEMORY_CLAMP)
+  obs[index++] = normalizeMagnitude(context.longRewardAvg, REWARD_MEMORY_CLAMP)
+  obs[index++] = normalizeMagnitude(context.rewardDrift, REWARD_MEMORY_CLAMP)
+  obs[index++] = normalizePositive(context.rewardVolatility, REWARD_MEMORY_CLAMP)
+  obs[index++] = normalizeMagnitude(context.actionMemoryBest, ACTION_VALUE_CLAMP)
+  obs[index++] = normalizeMagnitude(context.actionMemoryWorst, ACTION_VALUE_CLAMP)
+  obs[index++] = normalizePositive(context.damageDebt, DAMAGE_MEMORY_CLAMP)
+  obs[index++] = normalizePositive(context.recentDamage, DAMAGE_MEMORY_CLAMP)
+
+  return index
+}
+
 function trackEnvironmentAwareness(context) {
   try {
     const { bot } = context
@@ -1946,6 +2138,8 @@ function gatherObservations(context) {
   obs[42] = Math.max(0, Math.min(1, lineagePrestige))
   const diversityRatio = Math.min(1, GLOBAL_RESOURCE_POOL.diversity.size / RESOURCE_TYPES.length)
   obs[43] = diversityRatio
+
+  populateMemoryObservation(context, obs, MEMORY_OBS_START)
 
   return sanitizeVector(obs)
 }
@@ -2921,6 +3115,10 @@ function shouldCullForDowntrend(context) {
 function computeReward(context, obs) {
   let reward = 0
 
+  ensureTemporalMemoryState(context)
+  context.damageDebt = limitPositive((context.damageDebt ?? 0) * DAMAGE_DEBT_DECAY, DAMAGE_MEMORY_CLAMP)
+  context.recentDamage = limitPositive((context.recentDamage ?? 0) * DAMAGE_RECENT_DECAY, DAMAGE_MEMORY_CLAMP)
+
   const pos = { x: obs[0], y: obs[1], z: obs[2] }
   if (context.lastPos) {
     const dx = pos.x - context.lastPos.x
@@ -2936,7 +3134,10 @@ function computeReward(context, obs) {
   const health = obs[8]
   if (Number.isFinite(health)) {
     if (health < context.lastHealth) {
-      reward -= Math.min(1, (context.lastHealth - health) * 0.5)
+      const damage = Math.max(0, context.lastHealth - health)
+      reward -= Math.min(1.5, damage * 0.5)
+      context.damageDebt = limitPositive(context.damageDebt + damage * DAMAGE_DEBT_WEIGHT, DAMAGE_MEMORY_CLAMP)
+      context.recentDamage = limitPositive(context.recentDamage + damage, DAMAGE_MEMORY_CLAMP)
     } else if (health > context.lastHealth) {
       reward += Math.min(1, (health - context.lastHealth) * 0.5)
     }
@@ -3000,6 +3201,10 @@ function computeReward(context, obs) {
   if (achievementBonus !== 0) {
     reward += achievementBonus
     context.achievementReward = 0
+  }
+
+  if (context.damageDebt > 0) {
+    reward -= Math.min(2, context.damageDebt * DAMAGE_DEBT_PENALTY)
   }
 
   const pendingDeathPenalty = context.deathPenalty ?? 0
@@ -3088,6 +3293,8 @@ async function tickLoop(context) {
     let reward = computeReward(context, observation)
     reward = clampReward(reward)
 
+    updateTemporalMemory(context, reward)
+
     if (context.stagnation.active && context.stagnation.streak >= STAGNATION_WINDOW / 2) {
       context.epsilonBoost = Math.max(context.epsilonBoost, EPSILON_STAGNATION_BOOST)
     } else {
@@ -3160,6 +3367,8 @@ async function tickLoop(context) {
 
     const action = actionResult.action
     await executeAction(context, action)
+
+    recordActionMemory(context, action)
 
     const actionLabel = ACTIONS[action] ?? String(action)
     updateBehaviorEntropy(context, actionLabel)
@@ -4024,6 +4233,15 @@ function createContext(index, options = {}) {
     repetitionStreak: 0,
     rewardHistory: [],
     actionHistory: [],
+    memoryRewards: [],
+    memoryActions: [],
+    actionValueMemory: new Map(),
+    recentRewardAvg: 0,
+    longRewardAvg: 0,
+    rewardDrift: 0,
+    rewardVolatility: 0,
+    actionMemoryBest: 0,
+    actionMemoryWorst: 0,
     actionCounts: new Map(),
     behaviorEntropy: 0,
     visitedStates: new Set(),
@@ -4032,6 +4250,8 @@ function createContext(index, options = {}) {
     noveltyCount: 0,
     noveltyFlag: false,
     deathPenalty: 0,
+    damageDebt: 0,
+    recentDamage: 0,
     lastDeathAt: 0,
     resources: {
       wood: 0,
