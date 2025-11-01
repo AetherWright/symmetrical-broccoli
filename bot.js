@@ -5,6 +5,7 @@ import path from 'node:path'
 import { pipeline } from 'node:stream'
 import { promisify } from 'node:util'
 import zlib from 'node:zlib'
+import { performance } from 'node:perf_hooks'
 import {
   createBrain,
   chooseAction,
@@ -127,6 +128,15 @@ function readNumberEnv(name, fallback, { min = -Infinity, max = Infinity } = {})
   return Math.min(max, Math.max(min, raw))
 }
 
+const HEALTH_METRIC_WINDOW_MS = Math.max(
+  1000,
+  Math.floor(readNumberEnv('HEALTH_METRIC_WINDOW_MS', 300000, { min: 1000 }))
+)
+const HEALTH_SUMMARY_INTERVAL_MS = Math.max(
+  5000,
+  Math.floor(readNumberEnv('HEALTH_SUMMARY_INTERVAL_MS', 60000, { min: 5000 }))
+)
+
 const TEMPLATE_TOP_BRAINS = Math.max(1, Math.floor(readNumberEnv('TOP_TEMPLATE_BRAINS', 3, { min: 1 })))
 const OLDEST_RETIRE_PER_GENERATION = Math.max(
   1,
@@ -141,6 +151,184 @@ const NEW_BRAIN_MUTATION_MAX = Math.max(
 const MUTATION_REWARD_FACTOR = readNumberEnv('REWARD_MUTATION_FACTOR', 0.002, { min: 0 })
 const OBS_VALUE_CLAMP = readNumberEnv('OBS_VALUE_CLAMP', 1000, { min: 1 })
 const MAX_REWARD_MAGNITUDE = readNumberEnv('MAX_REWARD_MAGNITUDE', 50, { min: 1 })
+
+function monotonicNow() {
+  if (typeof performance?.now === 'function') {
+    return performance.now()
+  }
+  return Date.now()
+}
+
+function createRollingStats(windowMs = HEALTH_METRIC_WINDOW_MS) {
+  const entries = []
+
+  function prune(now = Date.now()) {
+    const cutoff = now - windowMs
+    while (entries.length && entries[0].time < cutoff) {
+      entries.shift()
+    }
+  }
+
+  return {
+    windowMs,
+    add(value) {
+      if (!Number.isFinite(value)) return
+      const now = Date.now()
+      prune(now)
+      entries.push({ time: now, value })
+    },
+    summary() {
+      prune(Date.now())
+      if (!entries.length) {
+        return { count: 0, sum: 0, avg: 0, min: 0, max: 0 }
+      }
+      let sum = 0
+      let min = Infinity
+      let max = -Infinity
+      for (const entry of entries) {
+        const val = entry.value
+        sum += val
+        if (val < min) min = val
+        if (val > max) max = val
+      }
+      return {
+        count: entries.length,
+        sum,
+        avg: sum / entries.length,
+        min,
+        max
+      }
+    }
+  }
+}
+
+const healthMetrics = {
+  tickDuration: createRollingStats(),
+  remoteFailures: createRollingStats(),
+  remoteRecoveries: createRollingStats(),
+  sanitization: {
+    actionObservation: createRollingStats(),
+    actionPrediction: createRollingStats(),
+    actionRemote: createRollingStats(),
+    trainObservation: createRollingStats(),
+    trainNextObservation: createRollingStats(),
+    trainRemote: createRollingStats()
+  },
+  droppedGradients: createRollingStats()
+}
+
+let nextHealthSummaryAt = Date.now() + HEALTH_SUMMARY_INTERVAL_MS
+
+function extractSanitizationCount(node, seen = new Set()) {
+  if (!node || typeof node !== 'object' || seen.has(node)) {
+    return 0
+  }
+  seen.add(node)
+
+  let total = 0
+  for (const [key, value] of Object.entries(node)) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      if (
+        key.includes('replace') ||
+        key.includes('clip') ||
+        key.includes('drop') ||
+        key.includes('nan') ||
+        key.includes('inf') ||
+        key.includes('adjust') ||
+        key.includes('pad') ||
+        key.includes('fill')
+      ) {
+        total += Math.abs(value)
+      }
+    } else if (typeof value === 'boolean') {
+      if (key.includes('adjust') || key.includes('replace') || key.includes('clip')) {
+        total += value ? 1 : 0
+      }
+    } else if (Array.isArray(value)) {
+      total += value.length
+    } else if (value && typeof value === 'object') {
+      total += extractSanitizationCount(value, seen)
+    }
+  }
+
+  return total
+}
+
+function recordSanitizationMetric(metric, summary) {
+  if (!metric || !summary) return
+  const total = extractSanitizationCount(summary)
+  if (total > 0) {
+    metric.add(total)
+  }
+}
+
+function recordActionSanitization(sanitization) {
+  if (!sanitization) return
+  recordSanitizationMetric(healthMetrics.sanitization.actionObservation, sanitization.observation)
+  recordSanitizationMetric(healthMetrics.sanitization.actionPrediction, sanitization.prediction)
+  recordSanitizationMetric(healthMetrics.sanitization.actionRemote, sanitization.remote)
+}
+
+function recordTrainingSanitization(sanitization) {
+  if (!sanitization) return
+  recordSanitizationMetric(healthMetrics.sanitization.trainObservation, sanitization.observation)
+  recordSanitizationMetric(healthMetrics.sanitization.trainNextObservation, sanitization.nextObservation)
+  recordSanitizationMetric(healthMetrics.sanitization.trainRemote, sanitization.remote)
+}
+
+function recordDroppedGradients(count) {
+  if (!Number.isFinite(count) || count <= 0) return
+  healthMetrics.droppedGradients.add(count)
+}
+
+function recordTickDuration(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return
+  healthMetrics.tickDuration.add(durationMs)
+}
+
+function recordRemoteOfflineEvent() {
+  healthMetrics.remoteFailures.add(1)
+}
+
+function recordRemoteRecoveryEvent() {
+  healthMetrics.remoteRecoveries.add(1)
+}
+
+function formatAggregate(summary) {
+  if (!summary || !summary.count) return '0'
+  const total = summary.sum
+  const formattedTotal = Number.isInteger(total) ? total : Number(total.toFixed(2))
+  return `${formattedTotal} (events ${summary.count})`
+}
+
+function maybeLogHealthSummary() {
+  const now = Date.now()
+  if (now < nextHealthSummaryAt) return
+  nextHealthSummaryAt = now + HEALTH_SUMMARY_INTERVAL_MS
+
+  const tickSummary = healthMetrics.tickDuration.summary()
+  const offlineSummary = healthMetrics.remoteFailures.summary()
+  const recoverySummary = healthMetrics.remoteRecoveries.summary()
+  const actionObsSummary = healthMetrics.sanitization.actionObservation.summary()
+  const actionPredSummary = healthMetrics.sanitization.actionPrediction.summary()
+  const actionRemoteSummary = healthMetrics.sanitization.actionRemote.summary()
+  const trainObsSummary = healthMetrics.sanitization.trainObservation.summary()
+  const trainNextSummary = healthMetrics.sanitization.trainNextObservation.summary()
+  const trainRemoteSummary = healthMetrics.sanitization.trainRemote.summary()
+  const droppedSummary = healthMetrics.droppedGradients.summary()
+
+  const windowSeconds = Math.round(HEALTH_METRIC_WINDOW_MS / 1000)
+  const tickAvg = tickSummary.count ? tickSummary.avg.toFixed(1) : 'n/a'
+  const tickMax = tickSummary.count ? tickSummary.max.toFixed(1) : 'n/a'
+
+  console.log(
+    `[Health] Last ${windowSeconds}s | Tick avg ${tickAvg}ms (max ${tickMax}ms, n=${tickSummary.count}) | ` +
+      `Remote offline ${formatAggregate(offlineSummary)} | Remote recoveries ${formatAggregate(recoverySummary)} | ` +
+      `Act sanitize obs=${formatAggregate(actionObsSummary)}, pred=${formatAggregate(actionPredSummary)}, remote=${formatAggregate(actionRemoteSummary)} | ` +
+      `Train sanitize obs=${formatAggregate(trainObsSummary)}, next=${formatAggregate(trainNextSummary)}, remote=${formatAggregate(trainRemoteSummary)} | ` +
+      `Dropped grads ${formatAggregate(droppedSummary)}`
+  )
+}
 
 function sanitizeScalar(value, clamp = OBS_VALUE_CLAMP, fallback = 0) {
   if (!Number.isFinite(value)) {
@@ -352,6 +540,9 @@ function noteRemoteBrainOffline(context, status, source) {
   if (!tracker.offlineNotified || tracker.lastMessage !== message || now >= tracker.nextLogAt) {
     const retryNote = describeRemoteRetry(status)
     console.warn(`[${label(context)}] Remote brain unavailable: ${message} (${retryNote}).`)
+    if (!tracker.offlineNotified) {
+      recordRemoteOfflineEvent()
+    }
     tracker.offlineNotified = true
     tracker.lastMessage = message
     tracker.nextLogAt = now + 5000
@@ -363,6 +554,7 @@ function noteRemoteBrainOnline(context) {
   const tracker = ensureRemoteBrainTracker(context)
   if (tracker.offlineNotified) {
     console.log(`[${label(context)}] Remote brain connection restored. Resuming ticks.`)
+    recordRemoteRecoveryEvent()
   }
   tracker.offlineNotified = false
   tracker.lastMessage = null
@@ -2642,6 +2834,7 @@ async function tickLoop(context) {
   if (!globalRunning || !context.running || context.tickInFlight) return
   context.tickInFlight = true
 
+  const tickStart = monotonicNow()
   let remoteUnavailable = false
   let remoteIssue = null
   try {
@@ -2728,6 +2921,10 @@ async function tickLoop(context) {
           observation
         )
         trained = Boolean(trainOutcome?.trained)
+        if (trainOutcome) {
+          recordTrainingSanitization(trainOutcome.sanitization)
+          recordDroppedGradients(trainOutcome.droppedGradients)
+        }
         if (trainOutcome && trainOutcome.weightsOk === false) {
           const trainDetails = {
             ...(trainOutcome.sanitization ?? {}),
@@ -2745,6 +2942,7 @@ async function tickLoop(context) {
     }
 
     const actionResult = await chooseAction(brain, observation, effectiveEpsilon)
+    recordActionSanitization(actionResult?.sanitization)
     const remotePolicyReplaced = Number.parseInt(
       actionResult?.sanitization?.remote?.policy?.replaced ?? 0,
       10
@@ -2824,6 +3022,8 @@ async function tickLoop(context) {
       console.error(`[${label(context)}] Tick error:`, err)
     }
   } finally {
+    recordTickDuration(monotonicNow() - tickStart)
+    maybeLogHealthSummary()
     context.tickInFlight = false
 
     if (remoteUnavailable) {
