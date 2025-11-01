@@ -372,6 +372,9 @@ export async function trainBrain(brain, observation, actionIndex, reward, nextOb
     droppedGradients: Number.isFinite(result?.dropped_gradients)
       ? result.dropped_gradients
       : 0,
+    clippedGradients: Number.isFinite(result?.clipped_gradients)
+      ? result.clipped_gradients
+      : 0,
     sanitization: {
       observation: {
         replaced: sanitizedObservation.replaced ?? 0,

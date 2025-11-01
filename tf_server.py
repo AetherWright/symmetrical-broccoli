@@ -146,6 +146,8 @@ BRAIN_CONFIG = {
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
+GRAD_CLIP_VALUE = abs(_read_float("TF_SERVER_GRADIENT_CLIP_VALUE", 100.0))
+WEIGHT_CLAMP = abs(_read_float("TF_SERVER_WEIGHT_CLAMP", 1e6))
 
 
 def _sanitize_vector(vector, expected_size=None, label="vector"):
@@ -511,6 +513,7 @@ class RemoteBrain:
     def _filter_gradients(grads_and_vars):
         cleaned = []
         dropped = 0
+        clipped = 0
         for grad, var in grads_and_vars:
             if grad is None:
                 continue
@@ -518,10 +521,105 @@ class RemoteBrain:
             finite = bool(tf.reduce_all(tf.math.is_finite(tensor)).numpy())
             if not finite:
                 dropped += 1
-                app.logger.warning("Dropped non-finite gradients for variable %s", getattr(var, "name", "?"))
+                app.logger.warning(
+                    "Dropped non-finite gradients for variable %s",
+                    getattr(var, "name", "?"),
+                )
                 continue
-            cleaned.append((grad, var))
-        return cleaned, dropped
+            clipped_grad = grad
+            if GRAD_CLIP_VALUE > 0:
+                clip_limit = tf.cast(GRAD_CLIP_VALUE, dtype=tensor.dtype)
+                exceeds = bool(
+                    tf.reduce_any(tf.math.greater(tf.math.abs(tensor), clip_limit)).numpy()
+                )
+                if exceeds:
+                    clipped_tensor = tf.clip_by_value(tensor, -clip_limit, clip_limit)
+                    if isinstance(grad, tf.IndexedSlices):
+                        clipped_grad = tf.IndexedSlices(
+                            clipped_tensor, grad.indices, grad.dense_shape
+                        )
+                    else:
+                        clipped_grad = clipped_tensor
+                    clipped += 1
+            cleaned.append((clipped_grad, var))
+        return cleaned, dropped, clipped
+
+    @staticmethod
+    def _sanitize_weight_list(weights):
+        sanitized_weights = []
+        replaced_total = 0
+        clipped_total = 0
+        sanitized_any = False
+        for weight in weights:
+            array = np.asarray(weight)
+            dtype = getattr(weight, "dtype", array.dtype)
+            invalid_mask = ~np.isfinite(array)
+            invalid_count = int(np.count_nonzero(invalid_mask))
+            clip_count = 0
+            clip_needed = False
+            if WEIGHT_CLAMP > 0:
+                clip_needed = bool(np.any(np.abs(array) > WEIGHT_CLAMP))
+            if invalid_count or clip_needed:
+                sanitized = array.astype(dtype, copy=True)
+                if invalid_count:
+                    sanitized[invalid_mask] = 0.0
+                if WEIGHT_CLAMP > 0:
+                    clip_mask = np.abs(sanitized) > WEIGHT_CLAMP
+                    clip_count = int(np.count_nonzero(clip_mask))
+                    if clip_count:
+                        np.clip(sanitized, -WEIGHT_CLAMP, WEIGHT_CLAMP, out=sanitized)
+                sanitized_weights.append(sanitized.astype(dtype, copy=False))
+                sanitized_any = True
+            else:
+                sanitized_weights.append(array.astype(dtype, copy=False))
+            replaced_total += invalid_count
+            clipped_total += clip_count
+        return sanitized_weights, {
+            "sanitized": bool(sanitized_any),
+            "replaced": int(replaced_total),
+            "clipped": int(clipped_total),
+        }
+
+    def _assign_weights(self, weights, reason):
+        sanitized_weights, meta = self._sanitize_weight_list(weights)
+        final_weights = []
+        for original, sanitized in zip(weights, sanitized_weights):
+            array = np.asarray(sanitized)
+            dtype = getattr(original, "dtype", array.dtype)
+            if array.dtype != dtype:
+                array = array.astype(dtype, copy=False)
+            final_weights.append(array)
+        self.model.set_weights(final_weights)
+        self.optimizer.sync_slow_variables(self.model.trainable_variables)
+        if meta["sanitized"]:
+            app.logger.warning(
+                "Sanitized %s weights (replaced=%d, clipped=%d)",
+                reason,
+                meta["replaced"],
+                meta["clipped"],
+            )
+        return meta
+
+    def _sanitize_model_weights(self, reason):
+        weights = self.model.get_weights()
+        sanitized_weights, meta = self._sanitize_weight_list(weights)
+        if meta["sanitized"]:
+            final_weights = []
+            for original, sanitized in zip(weights, sanitized_weights):
+                array = np.asarray(sanitized)
+                dtype = getattr(original, "dtype", array.dtype)
+                if array.dtype != dtype:
+                    array = array.astype(dtype, copy=False)
+                final_weights.append(array)
+            self.model.set_weights(final_weights)
+            self.optimizer.sync_slow_variables(self.model.trainable_variables)
+            app.logger.warning(
+                "Sanitized %s weights (replaced=%d, clipped=%d)",
+                reason,
+                meta["replaced"],
+                meta["clipped"],
+            )
+        return meta
 
     def _weights_are_finite(self):
         for weight in self.model.get_weights():
@@ -672,15 +770,24 @@ class RemoteBrain:
                 for grad, var in zip(gradients, self.model.trainable_variables)
                 if grad is not None
             ]
-            cleaned_grads, dropped = self._filter_gradients(grads_and_vars)
+            cleaned_grads, dropped, clipped_grads = self._filter_gradients(grads_and_vars)
             if dropped:
                 app.logger.warning("Skipped %d gradient tensors due to non-finite values", dropped)
             weights_ok = True
+            weight_meta = {"sanitized": False, "replaced": 0, "clipped": 0, "reason": "post-train"}
             if cleaned_grads:
                 self.optimizer.apply_gradients(cleaned_grads)
                 weights_ok = self._weights_are_finite()
                 if not weights_ok:
                     app.logger.error("Model weights contain non-finite values after training step")
+                weight_meta = self._sanitize_model_weights("post-train")
+                if weight_meta.get("sanitized"):
+                    if weight_meta.get("replaced"):
+                        weights_ok = False
+                    else:
+                        weights_ok = weights_ok and self._weights_are_finite()
+                else:
+                    weights_ok = weights_ok and self._weights_are_finite()
 
             hebbian_info = self._apply_hebbian_updates(scaled_reward if use_policy else 0.0)
 
@@ -688,10 +795,16 @@ class RemoteBrain:
                 "trained": bool(cleaned_grads),
                 "weights_ok": bool(weights_ok),
                 "dropped_gradients": int(dropped),
+                "clipped_gradients": int(clipped_grads),
                 "learning_rate": self._current_learning_rate(),
                 "sanitized": {
                     "observation": obs_meta,
                     "next_observation": next_meta,
+                    "weights": {
+                        "replaced": int(weight_meta.get("replaced", 0)),
+                        "clipped": int(weight_meta.get("clipped", 0)),
+                        "sanitized": bool(weight_meta.get("sanitized", False)),
+                    },
                 },
                 "hebbian": hebbian_info,
             }
@@ -703,8 +816,7 @@ class RemoteBrain:
         with first._lock:
             with second._lock:
                 weights = other.model.get_weights()
-                self.model.set_weights(weights)
-                self.optimizer.sync_slow_variables(self.model.trainable_variables)
+                self._assign_weights(weights, "copy")
 
     def average_from(self, sources):
         if not sources:
@@ -725,8 +837,7 @@ class RemoteBrain:
                 if averaged_layer.dtype != layer_stack.dtype:
                     averaged_layer = averaged_layer.astype(layer_stack.dtype)
                 averaged.append(averaged_layer)
-            self.model.set_weights(averaged)
-            self.optimizer.sync_slow_variables(self.model.trainable_variables)
+            self._assign_weights(averaged, "average")
 
     def mutate(self, stddev):
         with self._lock:
@@ -736,8 +847,7 @@ class RemoteBrain:
                 noise = np.random.normal(0, stddev, size=weight.shape).astype(weight.dtype, copy=False)
                 mutated_weight = (weight + noise).astype(weight.dtype, copy=False)
                 mutated.append(mutated_weight)
-            self.model.set_weights(mutated)
-            self.optimizer.sync_slow_variables(self.model.trainable_variables)
+            self._assign_weights(mutated, "mutate")
 
     def save(self, directory):
         with self._lock:
@@ -834,6 +944,12 @@ class RemoteBrain:
             try:
                 self.model.load_weights(weights_path)
                 loaded_info = {"status": "exact", "path": weights_path}
+                weight_meta = self._sanitize_model_weights("load")
+                if weight_meta.get("sanitized"):
+                    loaded_info["weight_sanitized"] = {
+                        "replaced": int(weight_meta.get("replaced", 0)),
+                        "clipped": int(weight_meta.get("clipped", 0)),
+                    }
                 app.logger.info("Restored weights exactly from %s", weights_path)
             except ValueError as exc:
                 app.logger.warning(
@@ -849,6 +965,12 @@ class RemoteBrain:
                         "status": "relaxed",
                         "path": weights_path,
                     }
+                    weight_meta = self._sanitize_model_weights("load-relaxed")
+                    if weight_meta.get("sanitized"):
+                        loaded_info["weight_sanitized"] = {
+                            "replaced": int(weight_meta.get("replaced", 0)),
+                            "clipped": int(weight_meta.get("clipped", 0)),
+                        }
                     app.logger.info("Restored compatible weights with skip_mismatch from %s", weights_path)
                 except (TypeError, ValueError) as relaxed_exc:
                     app.logger.info(
@@ -865,6 +987,12 @@ class RemoteBrain:
                             "loaded_variables": loaded_vars,
                             "attempted_variables": attempted,
                         }
+                        weight_meta = self._sanitize_model_weights("load-partial")
+                        if weight_meta.get("sanitized"):
+                            loaded_info["weight_sanitized"] = {
+                                "replaced": int(weight_meta.get("replaced", 0)),
+                                "clipped": int(weight_meta.get("clipped", 0)),
+                            }
                         app.logger.info(
                             "Partially restored %s/%s variables from %s",
                             loaded_vars,

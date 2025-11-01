@@ -226,7 +226,8 @@ const healthMetrics = {
     trainNextObservation: createRollingStats(),
     trainRemote: createRollingStats()
   },
-  droppedGradients: createRollingStats()
+  droppedGradients: createRollingStats(),
+  clippedGradients: createRollingStats()
 }
 
 let nextHealthSummaryAt = Date.now() + HEALTH_SUMMARY_INTERVAL_MS
@@ -292,6 +293,11 @@ function recordDroppedGradients(count) {
   healthMetrics.droppedGradients.add(count)
 }
 
+function recordClippedGradients(count) {
+  if (!Number.isFinite(count) || count <= 0) return
+  healthMetrics.clippedGradients.add(count)
+}
+
 function recordTickDuration(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs < 0) return
   healthMetrics.tickDuration.add(durationMs)
@@ -326,6 +332,7 @@ function maybeLogHealthSummary() {
   const trainNextSummary = healthMetrics.sanitization.trainNextObservation.summary()
   const trainRemoteSummary = healthMetrics.sanitization.trainRemote.summary()
   const droppedSummary = healthMetrics.droppedGradients.summary()
+  const clippedSummary = healthMetrics.clippedGradients.summary()
 
   const windowSeconds = Math.round(HEALTH_METRIC_WINDOW_MS / 1000)
   const tickAvg = tickSummary.count ? tickSummary.avg.toFixed(1) : 'n/a'
@@ -336,7 +343,7 @@ function maybeLogHealthSummary() {
       `Remote offline ${formatAggregate(offlineSummary)} | Remote recoveries ${formatAggregate(recoverySummary)} | ` +
       `Act sanitize obs=${formatAggregate(actionObsSummary)}, remote=${formatAggregate(actionRemoteSummary)} | ` +
       `Train sanitize obs=${formatAggregate(trainObsSummary)}, next=${formatAggregate(trainNextSummary)}, remote=${formatAggregate(trainRemoteSummary)} | ` +
-      `Dropped grads ${formatAggregate(droppedSummary)}`
+      `Dropped grads ${formatAggregate(droppedSummary)} | Clipped grads ${formatAggregate(clippedSummary)}`
   )
 }
 
@@ -3096,6 +3103,7 @@ async function tickLoop(context) {
         if (trainOutcome) {
           recordTrainingSanitization(trainOutcome.sanitization)
           recordDroppedGradients(trainOutcome.droppedGradients)
+          recordClippedGradients(trainOutcome.clippedGradients)
         }
         if (trainOutcome && trainOutcome.weightsOk === false) {
           const trainDetails = {
