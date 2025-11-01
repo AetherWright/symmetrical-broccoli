@@ -1837,6 +1837,63 @@ function isPassiveAnimal(entity) {
   return PASSIVE_ANIMAL_KEYWORDS.some(keyword => name.includes(keyword))
 }
 
+function isAttackableEntity(bot, entity, { maxDistance = 4.5 } = {}) {
+  if (!bot || !entity) return false
+  if (entity === bot.entity) return false
+  if (bot.entity?.uuid && entity.uuid && bot.entity.uuid === entity.uuid) return false
+  if (entity.isValid === false) return false
+  if (!bot.entity?.position || !entity.position) return false
+
+  let distance = Infinity
+  try {
+    distance = bot.entity.position.distanceTo(entity.position)
+  } catch (err) {
+    distance = Infinity
+  }
+
+  if (!Number.isFinite(distance) || distance > maxDistance) {
+    return false
+  }
+
+  if (typeof entity.health === 'number' && entity.health <= 0) {
+    return false
+  }
+
+  const type = (entity.type ?? '').toLowerCase()
+  const kind = (entity.kind ?? '').toLowerCase()
+  const name = (entity.name ?? entity.displayName ?? '').toLowerCase()
+
+  const attackableType =
+    type === 'mob' ||
+    type === 'player' ||
+    kind.includes('mob') ||
+    kind.includes('hostile') ||
+    kind.includes('neutral') ||
+    kind.includes('passive') ||
+    isPassiveAnimal(entity)
+
+  if (!attackableType && !name) {
+    return false
+  }
+
+  if (!attackableType) {
+    const forbiddenKeywords = ['item', 'projectile', 'xp_orb', 'boat', 'minecart']
+    if (forbiddenKeywords.some(keyword => name.includes(keyword) || type.includes(keyword))) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function findAttackTarget(context, options = {}) {
+  const bot = context?.bot
+  if (!bot?.entity) return null
+  const candidate = bot.nearestEntity(entity => isAttackableEntity(bot, entity, options))
+  if (!candidate) return null
+  return isAttackableEntity(bot, candidate, options) ? candidate : null
+}
+
 function isAnimalFoodItem(name = '') {
   const normalized = name.toLowerCase()
   return (
@@ -2260,8 +2317,8 @@ async function executeAction(context, index) {
         await performMining(context, { strafe: 1 })
         break
       case 'attack': {
-        const entity = bot.nearestEntity()
-        if (entity) {
+        const entity = findAttackTarget(context)
+        if (entity && isAttackableEntity(bot, entity)) {
           const hungerBefore = Number(bot.food ?? 20)
           try {
             await bot.attack(entity)
@@ -2283,6 +2340,11 @@ async function executeAction(context, index) {
               context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.1)
             }
           }
+        } else if (entity) {
+          console.debug(
+            `[${label(context)}] Skipping attack on invalid target ${entity.name ?? entity.displayName ?? entity.type ?? 'entity'}.`
+          )
+          context.blockReward -= 0.02
         } else {
           context.blockReward -= 0.01
           if (context.mode === 'feral') {
