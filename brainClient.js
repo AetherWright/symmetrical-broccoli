@@ -29,6 +29,41 @@ const remoteState = {
   lastFailureAt: 0
 }
 
+export function getRemoteStateSnapshot() {
+  return {
+    connected: Boolean(remoteState.connected),
+    failureCount: Number(remoteState.failureCount) || 0,
+    retryDelay: Number(remoteState.retryDelay) || MIN_RETRY_DELAY_MS,
+    blockUntil: Number(remoteState.blockUntil) || 0,
+    lastError: remoteState.lastError ?? null,
+    lastFailureAt: Number(remoteState.lastFailureAt) || 0
+  }
+}
+
+export function applyRemoteStateSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return
+  }
+  if (typeof snapshot.connected === 'boolean') {
+    remoteState.connected = snapshot.connected
+  }
+  if (Number.isFinite(snapshot.failureCount)) {
+    remoteState.failureCount = snapshot.failureCount
+  }
+  if (Number.isFinite(snapshot.retryDelay)) {
+    remoteState.retryDelay = Math.max(MIN_RETRY_DELAY_MS, snapshot.retryDelay)
+  }
+  if (Number.isFinite(snapshot.blockUntil)) {
+    remoteState.blockUntil = snapshot.blockUntil
+  }
+  if (typeof snapshot.lastError === 'string' || snapshot.lastError === null) {
+    remoteState.lastError = snapshot.lastError
+  }
+  if (Number.isFinite(snapshot.lastFailureAt)) {
+    remoteState.lastFailureAt = snapshot.lastFailureAt
+  }
+}
+
 function computeNextDelay(delay) {
   const next = delay * 2
   return Math.min(MAX_RETRY_DELAY_MS, Math.max(MIN_RETRY_DELAY_MS, next))

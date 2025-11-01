@@ -8,8 +8,6 @@ import zlib from 'node:zlib'
 import { performance } from 'node:perf_hooks'
 import {
   createBrain,
-  chooseAction,
-  trainBrain,
   saveBrain,
   loadBrain,
   saveBrainState,
@@ -22,6 +20,12 @@ import {
   getRemoteBrainStatus,
   RemoteBrainUnavailableError
 } from './brainClient.js'
+import {
+  chooseActionConcurrent,
+  trainBrainConcurrent,
+  shutdownBrainWorkerPool,
+  warmBrainWorkerPool
+} from './brainWorkerPool.js'
 
 // ----------------------------
 // CONFIG
@@ -164,6 +168,17 @@ const GENERATION_SURVIVOR_COUNT = Math.max(
   MIN_BOTS,
   Math.floor(readNumberEnv('GENERATION_SURVIVOR_COUNT', 3, { min: 1 }))
 )
+
+const brainWorkerPoolStatus = warmBrainWorkerPool()
+if (brainWorkerPoolStatus.enabled) {
+  console.log(
+    `[Brain] Remote worker pool enabled with ${brainWorkerPoolStatus.size} thread${
+      brainWorkerPoolStatus.size === 1 ? '' : 's'
+    }.`
+  )
+} else {
+  console.log('[Brain] Remote worker pool disabled; remote calls will run inline.')
+}
 
 function monotonicNow() {
   if (typeof performance?.now === 'function') {
@@ -3092,7 +3107,7 @@ async function tickLoop(context) {
     if (context.lastObs && context.lastAction != null) {
       const lastObsValid = vectorHasFiniteValues(context.lastObs)
       if (lastObsValid) {
-        const trainOutcome = await trainBrain(
+        const trainOutcome = await trainBrainConcurrent(
           brain,
           context.lastObs,
           context.lastAction,
@@ -3121,7 +3136,7 @@ async function tickLoop(context) {
       }
     }
 
-    const actionResult = await chooseAction(brain, observation, effectiveEpsilon)
+    const actionResult = await chooseActionConcurrent(brain, observation, effectiveEpsilon)
     recordActionSanitization(actionResult?.sanitization)
     const remotePolicyReplaced = Number.parseInt(
       actionResult?.sanitization?.remote?.policy?.replaced ?? 0,
@@ -4186,6 +4201,7 @@ process.stdin.on('data', async data => {
         console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
       }
     }
+    await shutdownBrainWorkerPool()
     process.exit(0)
   }
 })
@@ -4242,6 +4258,11 @@ async function gracefulShutdown(reason = 'signal') {
   } catch (err) {
     console.error('[Brain] Failed during graceful shutdown:', err)
   } finally {
+    try {
+      await shutdownBrainWorkerPool()
+    } catch (poolErr) {
+      console.warn('[Brain] Failed to shutdown brain worker pool:', poolErr)
+    }
     process.exit(0)
   }
 }

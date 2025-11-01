@@ -1,5 +1,6 @@
 import atexit
 import json
+import logging
 import os
 import threading
 import time
@@ -18,6 +19,57 @@ except ImportError:  # pragma: no cover - optional dependency
 ALLOWED_SEGMENT_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
 STORAGE_ROOT = os.environ.get("TF_SERVER_STORAGE_ROOT") or os.path.join(os.getcwd(), "tf_server_storage")
 os.makedirs(STORAGE_ROOT, exist_ok=True)
+
+LOGGER = logging.getLogger("tf_server")
+
+
+def _configure_tensorflow_devices():
+    info = {
+        "available": False,
+        "physical": 0,
+        "logical": 0,
+        "memory_growth": 0,
+        "names": [],
+    }
+    try:
+        tf.config.experimental.enable_tensor_float_32_execution(True)
+    except Exception:  # pragma: no cover - best effort
+        pass
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.warning("Unable to inspect GPU devices: %s", exc)
+        return info
+    if not gpus:
+        LOGGER.info("No GPU devices detected; TensorFlow will run on CPU.")
+        return info
+    info["available"] = True
+    info["physical"] = len(gpus)
+    info["names"] = [getattr(device, "name", str(device)) for device in gpus]
+    configured = 0
+    for device in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(device, True)
+            configured += 1
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Failed to enable memory growth for %s: %s", device, exc)
+    info["memory_growth"] = configured
+    try:
+        logical = tf.config.list_logical_devices("GPU")
+        info["logical"] = len(logical)
+        LOGGER.info(
+            "TensorFlow GPU acceleration enabled (%d physical, %d logical). Memory growth configured on %d device(s).",
+            info["physical"],
+            info["logical"],
+            configured,
+        )
+    except Exception:  # pragma: no cover - defensive
+        LOGGER.info(
+            "TensorFlow GPU acceleration enabled (%d physical GPU devices). Memory growth configured on %d device(s).",
+            info["physical"],
+            configured,
+        )
+    return info
 
 
 def _sanitize_segment(value, fallback="default"):
@@ -48,6 +100,9 @@ STATUS = {
     "bots": {},
     "workers": {}
 }
+
+GPU_INFO = _configure_tensorflow_devices()
+STATUS["accelerators"] = {"gpu": GPU_INFO}
 
 
 def _read_int(name, default):
