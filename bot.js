@@ -155,6 +155,14 @@ const MIN_CLEAN_BRAIN_SOURCES = Math.max(
 const MUTATION_REWARD_FACTOR = readNumberEnv('REWARD_MUTATION_FACTOR', 0.002, { min: 0 })
 const OBS_VALUE_CLAMP = readNumberEnv('OBS_VALUE_CLAMP', 1000, { min: 1 })
 const MAX_REWARD_MAGNITUDE = readNumberEnv('MAX_REWARD_MAGNITUDE', 50, { min: 1 })
+const ACHIEVEMENT_REWARD_BONUS = Math.max(
+  5,
+  readNumberEnv('ACHIEVEMENT_REWARD_BONUS', 25, { min: 5 })
+)
+const GENERATION_SURVIVOR_COUNT = Math.max(
+  MIN_BOTS,
+  Math.floor(readNumberEnv('GENERATION_SURVIVOR_COUNT', 3, { min: 1 }))
+)
 
 function monotonicNow() {
   if (typeof performance?.now === 'function') {
@@ -1136,6 +1144,72 @@ function ensureLineageRecord(name) {
     lineageStats.set(lineageName, stats)
   }
   return stats
+}
+
+function extractLineageBase(name) {
+  if (typeof name !== 'string' || !name) return ''
+  const normalized = name.trim()
+  const hyphenIndex = normalized.indexOf('-')
+  if (hyphenIndex > 0) {
+    return normalized.slice(0, hyphenIndex)
+  }
+  return normalized
+}
+
+function randomElement(list, fallback = '') {
+  if (!Array.isArray(list) || list.length === 0) {
+    return fallback
+  }
+  const idx = Math.floor(Math.random() * list.length)
+  const value = list[idx]
+  return value == null ? fallback : value
+}
+
+function generateRandomLineageBase() {
+  const prefix = randomElement(PREFIXES, '')
+  const core = randomElement(ROCK_PARTS, 'Basalt')
+  const suffix = randomElement(SUFFIXES, '')
+  let base = `${prefix ?? ''}${core ?? ''}${suffix ?? ''}`
+  if (Math.random() < 0.35) {
+    const extra = randomElement(ROCK_PARTS, '')
+    if (extra) {
+      base += extra
+    }
+  }
+  base = sanitizeNetworkString(base, {
+    fallback: LINEAGE_ROOT_NAME,
+    maxLength: Math.max(4, MAX_USERNAME_LENGTH - 2),
+    allowed: /[0-9A-Za-z_\-]/,
+    label: 'lineage'
+  })
+  if (!base) {
+    base = `Lineage${Math.floor(Math.random() * 10000)}`
+  }
+  return base
+}
+
+function combineLineageBases(primary, partner) {
+  const baseA = extractLineageBase(primary) || generateRandomLineageBase()
+  const baseB = extractLineageBase(partner)
+  if (!baseB || baseB === baseA) {
+    return baseA
+  }
+  const pivotA = Math.max(2, Math.floor(baseA.length / 2))
+  const pivotB = Math.max(2, Math.ceil(baseB.length / 2))
+  let combined = `${baseA.slice(0, pivotA)}${baseB.slice(Math.max(0, pivotB - 1))}`
+  if (!combined || combined.length < 4) {
+    combined = `${baseA}${baseB}`
+  }
+  combined = sanitizeNetworkString(combined, {
+    fallback: `${baseA}${baseB}`.slice(0, MAX_USERNAME_LENGTH),
+    maxLength: Math.max(4, MAX_USERNAME_LENGTH - 1),
+    allowed: /[0-9A-Za-z_\-]/,
+    label: 'lineage'
+  })
+  if (!combined) {
+    combined = generateRandomLineageBase()
+  }
+  return combined
 }
 
 function formatLineageName(base, ordinal) {
@@ -2903,6 +2977,12 @@ function computeReward(context, obs) {
   reward += consumedBlockReward * rewardProfile.resource
   context.blockReward = 0
 
+  const achievementBonus = context.achievementReward ?? 0
+  if (achievementBonus !== 0) {
+    reward += achievementBonus
+    context.achievementReward = 0
+  }
+
   const pendingDeathPenalty = context.deathPenalty ?? 0
   if (pendingDeathPenalty > 0) {
     reward -= pendingDeathPenalty
@@ -3170,6 +3250,12 @@ async function synchronizeGeneration() {
   generationSyncInFlight = true
   try {
     const sorted = [...contexts].sort((a, b) => b.generationReward - a.generationReward)
+    const survivorCount = Math.max(
+      MIN_BOTS,
+      Math.min(GENERATION_SURVIVOR_COUNT, sorted.length)
+    )
+    const survivorList = sorted.slice(0, survivorCount)
+    const survivorSet = new Set(survivorList)
     const topTwo = sorted.slice(0, 2)
     const rewardSnapshot = new Map()
     for (const ctx of sorted) {
@@ -3268,7 +3354,9 @@ async function synchronizeGeneration() {
     }
     contractionCount = Math.min(contractionCount, contexts.length - MIN_BOTS)
 
-    const retireList = contractionCount > 0 ? sorted.slice(-contractionCount) : []
+    const contractionCandidates = sorted.filter(ctx => !survivorSet.has(ctx))
+    const retireList =
+      contractionCount > 0 ? contractionCandidates.slice(-contractionCount) : []
 
     for (const ctx of contexts) {
       updateGenerationTrend(ctx)
@@ -3285,7 +3373,9 @@ async function synchronizeGeneration() {
     const downtrendRetirees = []
     if (availableDowntrendSlots > 0) {
       const downtrendCandidates = sorted
-        .filter(ctx => !retireReasons.has(ctx) && shouldCullForDowntrend(ctx))
+        .filter(
+          ctx => !retireReasons.has(ctx) && !survivorSet.has(ctx) && shouldCullForDowntrend(ctx)
+        )
         .sort((a, b) => {
           const ageOrder = (a.birthOrder ?? 0) - (b.birthOrder ?? 0)
           if (ageOrder !== 0) return ageOrder
@@ -3306,7 +3396,7 @@ async function synchronizeGeneration() {
       Math.min(LOW_REWARD_RETIRE_LIMIT, contexts.length - retireReasons.size - MIN_BOTS)
     )
     if (availableLowRewardSlots > 0) {
-      const eligible = sorted.filter(ctx => !retireReasons.has(ctx))
+      const eligible = sorted.filter(ctx => !retireReasons.has(ctx) && !survivorSet.has(ctx))
       const applyThreshold = Number.isFinite(LOW_REWARD_RETIRE_THRESHOLD)
       const thresholdCandidates = applyThreshold
         ? eligible.filter(ctx => (ctx.generationReward ?? 0) <= LOW_REWARD_RETIRE_THRESHOLD)
@@ -3332,7 +3422,7 @@ async function synchronizeGeneration() {
     )
     if (oldestSlots > 0) {
       const oldestPool = sorted
-        .filter(ctx => !retireReasons.has(ctx))
+        .filter(ctx => !retireReasons.has(ctx) && !survivorSet.has(ctx))
         .sort((a, b) => {
           const genDelta = (a.birthGeneration ?? 0) - (b.birthGeneration ?? 0)
           if (genDelta !== 0) return genDelta
@@ -3343,6 +3433,18 @@ async function synchronizeGeneration() {
       for (const candidate of oldestPool.slice(0, oldestSlots)) {
         retireReasons.set(candidate, 'oldest')
         oldestRetirees.push(candidate)
+      }
+    }
+
+    for (const survivor of survivorSet) {
+      retireReasons.delete(survivor)
+    }
+
+    const generationResetRetirees = []
+    for (const candidate of sorted) {
+      if (!survivorSet.has(candidate) && !retireReasons.has(candidate)) {
+        retireReasons.set(candidate, 'generation-reset')
+        generationResetRetirees.push(candidate)
       }
     }
 
@@ -3380,6 +3482,13 @@ async function synchronizeGeneration() {
       )
     }
 
+    for (const retiree of generationResetRetirees) {
+      const rank = sorted.indexOf(retiree) + 1
+      console.log(
+        `[Baseline] Retiring ${label(retiree)} due to generation reset (rank #${rank}).`
+      )
+    }
+
     for (const [retiree, reason] of retireReasons.entries()) {
       await retireContext(retiree, reason)
     }
@@ -3407,25 +3516,29 @@ async function synchronizeGeneration() {
     const availableSpawnSlots = Math.min(Math.max(0, MAX_BOTS - contexts.length), spawnRequests)
     if (availableSpawnSlots > 0) {
       const rewardCompare = (a, b) => (rewardSnapshot.get(b) ?? 0) - (rewardSnapshot.get(a) ?? 0)
-      let parentPool = contexts.filter(ctx => !ctx.weightsSuspect).sort(rewardCompare)
+      let parentPool = contexts
+        .filter(ctx => survivorSet.has(ctx) && !ctx.weightsSuspect)
+        .sort(rewardCompare)
       if (!parentPool.length) {
-        parentPool = contexts.slice().sort(rewardCompare)
+        parentPool = contexts.filter(ctx => survivorSet.has(ctx)).sort(rewardCompare)
       }
-      let fallbackPool = sorted.filter(ctx => !retireReasons.has(ctx) && !ctx.weightsSuspect)
+      let fallbackPool = survivorList.filter(ctx => !ctx.weightsSuspect)
       if (!fallbackPool.length) {
-        fallbackPool = sorted.filter(ctx => !retireReasons.has(ctx))
+        fallbackPool = survivorList.slice()
       }
       if (!parentPool.length && fallbackPool.length) {
         parentPool = fallbackPool.slice()
       }
       if (!parentPool.length) {
-        parentPool = sorted.slice()
+        parentPool = survivorList.slice()
       }
 
       let spawnIndex = contexts.length
       const topBaselineReward = Number.isFinite(topReward) ? topReward : 0
       for (let i = 0; i < availableSpawnSlots; i++) {
         const parentCandidate = parentPool[i % parentPool.length] ?? sorted[0] ?? null
+        const partnerCandidate =
+          parentPool[(i + 1) % parentPool.length] ?? survivorList[(i + 1) % survivorList.length] ?? null
         const parentReward = rewardSnapshot.get(parentCandidate) ?? 0
         const rewardGap = Math.max(0, topBaselineReward - parentReward)
         const baseMutation = NEW_BRAIN_MUTATION_STDDEV + rewardGap * MUTATION_REWARD_FACTOR
@@ -3433,7 +3546,13 @@ async function synchronizeGeneration() {
         if (!Number.isFinite(mutationStddev) || mutationStddev <= 0) {
           mutationStddev = deriveMutationStddev(null, { jitter: true }) ?? NEW_BRAIN_MUTATION_STDDEV
         }
-        createContext(spawnIndex++, { parent: parentCandidate, mutationStddev })
+        const partnerContext =
+          partnerCandidate && partnerCandidate !== parentCandidate ? partnerCandidate : null
+        createContext(spawnIndex++, {
+          parent: parentCandidate,
+          partner: partnerContext,
+          mutationStddev
+        })
       }
     }
 
@@ -3517,6 +3636,69 @@ function setupRewardTracking(context) {
         }
       }
       console.log(`[${label(context)}] Collected item → +${bonus.toFixed(2)} reward`)
+    }
+  })
+
+  const grantAchievementReward = (payload, source = 'achievement') => {
+    if (!payload && payload !== 0) return
+    if (!(context.achievements instanceof Set)) {
+      context.achievements = new Set()
+    }
+    let identifier = null
+    if (typeof payload === 'string') {
+      identifier = payload
+    } else if (payload) {
+      identifier =
+        payload.id ??
+        payload.advancement?.id ??
+        payload.achievement ??
+        payload.key ??
+        payload.name ??
+        (typeof payload.display?.title === 'string' ? payload.display.title : null) ??
+        (typeof payload.title === 'string' ? payload.title : null) ??
+        (typeof payload.advancement?.display?.title === 'string'
+          ? payload.advancement.display.title
+          : null)
+    }
+    if (!identifier || typeof identifier !== 'string') {
+      return
+    }
+    const normalized = identifier.toLowerCase()
+    if (context.achievements.has(normalized)) {
+      return
+    }
+    context.achievements.add(normalized)
+    context.achievementReward = (context.achievementReward ?? 0) + ACHIEVEMENT_REWARD_BONUS
+    const title =
+      (typeof payload?.display?.title === 'string' && payload.display.title) ||
+      (typeof payload?.title === 'string' && payload.title) ||
+      identifier
+    console.log(
+      `[${label(context)}] Unlocked ${title} (${source}) → +${ACHIEVEMENT_REWARD_BONUS.toFixed(2)} reward`
+    )
+  }
+
+  bot.on('achievement', data => {
+    try {
+      grantAchievementReward(data, 'achievement')
+    } catch (err) {
+      console.warn(`[${label(context)}] Failed processing achievement reward:`, err)
+    }
+  })
+
+  bot.on('advancementDone', data => {
+    try {
+      grantAchievementReward(data, 'advancement')
+    } catch (err) {
+      console.warn(`[${label(context)}] Failed processing advancement reward:`, err)
+    }
+  })
+
+  bot.on('advancement', data => {
+    try {
+      grantAchievementReward(data, 'advancement')
+    } catch (err) {
+      console.warn(`[${label(context)}] Failed processing advancement event:`, err)
     }
   })
 
@@ -3749,6 +3931,7 @@ async function handleFatalProcessError(source, error) {
 
 function createContext(index, options = {}) {
   const parent = options.parent ?? null
+  const partner = options.partner ?? null
   let mode = options.mode ?? null
   if (!mode) {
     if (parent?.mode === 'feral') {
@@ -3760,7 +3943,21 @@ function createContext(index, options = {}) {
     }
   }
 
-  const identity = allocateLineageIdentity({ parentLineage: parent?.lineage ?? LINEAGE_ROOT_NAME, mode })
+  let lineageBase = options.lineageBase ?? null
+  if (!lineageBase) {
+    if (parent?.lineage && partner?.lineage && partner.lineage !== parent.lineage) {
+      lineageBase = combineLineageBases(parent.lineage, partner.lineage)
+    } else if (parent?.lineage) {
+      lineageBase = parent.lineage
+    } else {
+      lineageBase = generateRandomLineageBase()
+    }
+  }
+  if (!lineageBase) {
+    lineageBase = LINEAGE_ROOT_NAME
+  }
+
+  const identity = allocateLineageIdentity({ parentLineage: lineageBase, mode })
   const username = identity.username
   const bot = mineflayer.createBot({
     host: NETWORK_HOST,
@@ -3821,6 +4018,7 @@ function createContext(index, options = {}) {
     lastFood: 20,
     lastInvTotal: 0,
     blockReward: 0,
+    achievementReward: 0,
     tickCount: 0,
     trainingSteps: 0,
     cumulativeReward: 0,
@@ -3883,6 +4081,13 @@ function createContext(index, options = {}) {
       offlineNotified: false,
       lastMessage: null,
       nextLogAt: 0
+    },
+    achievements: new Set(),
+    parents: {
+      primary: parent?.username ?? null,
+      primaryLineage: parent?.lineage ?? null,
+      partner: partner?.username ?? null,
+      partnerLineage: partner?.lineage ?? null
     }
   }
 
@@ -3895,7 +4100,23 @@ function createContext(index, options = {}) {
 
   setupBot(context)
   contexts.push(context)
-  console.log(`[${label(context)}] Born from lineage ${context.lineage}-${romanNumeral(context.lineageOrdinal)} (${context.mode}).`)
+  const parentLineageLabel = parent?.lineage
+    ? `${parent.lineage}-${romanNumeral(parent.lineageOrdinal ?? 1)}`
+    : null
+  const partnerLineageLabel = partner?.lineage
+    ? `${partner.lineage}-${romanNumeral(partner.lineageOrdinal ?? 1)}`
+    : null
+  const crossoverLabel =
+    partnerLineageLabel && parentLineageLabel && partnerLineageLabel !== parentLineageLabel
+      ? ` via crossover with ${partner?.username ?? partnerLineageLabel}`
+      : ''
+  const lineageLabel = `${context.lineage}-${romanNumeral(context.lineageOrdinal)}`
+  const parentLabel = parent?.username ?? 'baseline'
+  console.log(
+    `[${label(context)}] Born from lineage ${lineageLabel} (${context.mode}). Parent ${parentLabel}${
+      crossoverLabel || ''
+    }.`
+  )
   return context
 }
 
