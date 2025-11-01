@@ -702,167 +702,353 @@ class RemoteBrain:
             "decay_rates": decay_rates,
         }
 
-    def choose_action(self, observation, epsilon):
+    def choose_actions_batch(self, observations, epsilons):
         with self._lock:
-            try:
-                obs, obs_meta = self._prepare_observation(observation, "observation")
-            except ValueError as exc:
-                raise RuntimeError(str(exc)) from exc
-            action_probs = self.model(obs, training=False)
-            raw_probs = action_probs.numpy().astype(np.float32, copy=False).reshape(-1)
-            replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
-            sanitized_policy = replaced > 0
-            if sanitized_policy:
-                app.logger.warning("Sanitized action probabilities due to non-finite values")
-            safe_probs = np.nan_to_num(
-                raw_probs,
-                nan=1.0 / max(1, self.action_count),
-                posinf=1.0,
-                neginf=1.0,
-            )
-            safe_probs = np.clip(safe_probs, 1e-8, 1.0)
-            total = float(np.sum(safe_probs))
-            if not np.isfinite(total) or total <= 0:
-                sanitized_policy = True
-                safe_probs = np.full(self.action_count, 1.0 / max(1, self.action_count), dtype=np.float32)
-            else:
-                safe_probs = safe_probs / total
-            if not np.all(np.isfinite(safe_probs)):
-                sanitized_policy = True
-                safe_probs = np.nan_to_num(safe_probs, nan=1.0 / max(1, self.action_count))
-            policy_meta = {
-                "replaced": int(replaced),
-                "fallback": bool(sanitized_policy),
-            }
-            policy_meta["sanitized"] = bool(policy_meta["replaced"] or policy_meta["fallback"])
-            weights_ok = policy_meta["replaced"] == 0
-            rand = float(np.random.random())
-            exploration = rand < epsilon
-            if exploration:
-                action_index = int(np.random.randint(0, self.action_count))
-            else:
-                action_index = int(np.argmax(safe_probs))
-            return {
-                "action": action_index,
-                "weights_ok": bool(weights_ok),
-                "sanitized": {
-                    "observation": obs_meta,
-                    "policy": policy_meta,
-                    "exploration": bool(exploration),
-                },
-            }
-
-    def train(self, observation, action_index, reward, next_observation):
-        with self._lock:
-            try:
-                obs, obs_meta = self._prepare_observation(observation, "observation")
-            except ValueError:
-                app.logger.warning("Skipping train call due to missing observation payload")
-                return False
-
-            use_policy = action_index is not None and reward is not None
-
-            if not use_policy:
-                return False
-
-            bounded_action = None
-            scaled_reward = 0.0
-            if use_policy:
-                try:
-                    bounded_action = int(action_index)
-                except (TypeError, ValueError):
-                    app.logger.warning("Received invalid action index: %s", action_index)
-                    use_policy = False
-                else:
-                    bounded_action = int(np.clip(bounded_action, 0, self.action_count - 1))
+            count = len(observations)
+            results = [None] * count
+            valid_entries = []
+            for index, observation in enumerate(observations):
+                epsilon = 0.1
+                if index < len(epsilons):
                     try:
-                        reward_value = float(reward)
+                        epsilon = float(epsilons[index])
                     except (TypeError, ValueError):
-                        app.logger.warning("Received invalid reward value: %s", reward)
-                        reward_value = 0.0
-                    if not np.isfinite(reward_value):
-                        app.logger.warning("Reward contained non-finite value: %s", reward)
-                        reward_value = 0.0
-                    scaled_reward = float(np.clip(reward_value, -1.0, 1.0))
-
-            next_meta = {
-                "replaced": 0,
-                "clipped": 0,
-                "adjusted": False,
-                "sanitized": False,
-            }
-            if next_observation is not None:
+                        epsilon = 0.1
                 try:
-                    _, next_meta = self._prepare_observation(
-                        next_observation, "next_observation"
+                    obs, obs_meta = self._prepare_observation(observation, "observation")
+                except ValueError as exc:
+                    results[index] = {"error": str(exc)}
+                    continue
+                valid_entries.append(
+                    {
+                        "index": index,
+                        "epsilon": float(np.clip(epsilon, 0.0, 0.999)),
+                        "tensor": obs.reshape(-1),
+                        "meta": obs_meta,
+                    }
+                )
+            if valid_entries:
+                batch = np.stack([entry["tensor"] for entry in valid_entries], axis=0).astype(
+                    np.float32, copy=False
+                )
+                action_probs = self.model(batch, training=False)
+                probs_np = action_probs.numpy().astype(np.float32, copy=False)
+                for entry, row in zip(valid_entries, probs_np):
+                    raw_probs = row.astype(np.float32, copy=False).reshape(-1)
+                    replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
+                    sanitized_policy = replaced > 0
+                    safe_probs = np.nan_to_num(
+                        raw_probs,
+                        nan=1.0 / max(1, self.action_count),
+                        posinf=1.0,
+                        neginf=1.0,
                     )
+                    safe_probs = np.clip(safe_probs, 1e-8, 1.0)
+                    total = float(np.sum(safe_probs))
+                    if not np.isfinite(total) or total <= 0:
+                        sanitized_policy = True
+                        safe_probs = np.full(
+                            self.action_count,
+                            1.0 / max(1, self.action_count),
+                            dtype=np.float32,
+                        )
+                    else:
+                        safe_probs = safe_probs / total
+                    if not np.all(np.isfinite(safe_probs)):
+                        sanitized_policy = True
+                        safe_probs = np.nan_to_num(
+                            safe_probs,
+                            nan=1.0 / max(1, self.action_count),
+                        )
+                    if sanitized_policy:
+                        app.logger.warning(
+                            "Sanitized action probabilities due to non-finite values"
+                        )
+                    weights_ok = replaced == 0
+                    exploration = float(np.random.random()) < entry["epsilon"]
+                    if exploration:
+                        action_index = int(np.random.randint(0, self.action_count))
+                    else:
+                        action_index = int(np.argmax(safe_probs))
+                    policy_meta = {
+                        "replaced": int(replaced),
+                        "fallback": bool(sanitized_policy),
+                    }
+                    policy_meta["sanitized"] = bool(
+                        policy_meta["replaced"] or policy_meta["fallback"]
+                    )
+                    results[entry["index"]] = {
+                        "action": action_index,
+                        "weights_ok": bool(weights_ok),
+                        "sanitized": {
+                            "observation": entry["meta"],
+                            "policy": policy_meta,
+                            "exploration": bool(exploration),
+                        },
+                    }
+            for index, value in enumerate(results):
+                if value is None:
+                    results[index] = {"error": "Observation could not be processed"}
+            return results
+
+    def choose_action(self, observation, epsilon):
+        batch = self.choose_actions_batch([observation], [epsilon])
+        if not batch:
+            raise RuntimeError("Failed to compute action")
+        result = batch[0]
+        if result.get("error"):
+            raise RuntimeError(str(result["error"]))
+        return result
+
+    def train_batch(self, observations, actions, rewards, next_observations):
+        with self._lock:
+            count = len(observations)
+            results = [None] * count
+            valid_entries = []
+            for index, observation in enumerate(observations):
+                try:
+                    obs, obs_meta = self._prepare_observation(observation, "observation")
                 except ValueError:
-                    app.logger.warning(
-                        "Skipping next observation sanitization due to invalid payload"
-                    )
+                    app.logger.warning("Skipping train call due to missing observation payload")
+                    results[index] = {
+                        "trained": False,
+                        "weights_ok": True,
+                        "dropped_gradients": 0,
+                        "clipped_gradients": 0,
+                        "sanitized": {
+                            "observation": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "adjusted": False,
+                                "sanitized": False,
+                            },
+                            "next_observation": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "adjusted": False,
+                                "sanitized": False,
+                            },
+                            "weights": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "sanitized": False,
+                            },
+                        },
+                    }
+                    continue
 
-            with tf.GradientTape() as tape:
-                action_pred = self.model(obs, training=True)
-                total_loss = tf.constant(0.0, dtype=tf.float32)
+                bounded_action = None
+                reward_value = rewards[index] if index < len(rewards) else None
+                action_value = actions[index] if index < len(actions) else None
+                if action_value is None or reward_value is None:
+                    results[index] = {
+                        "trained": False,
+                        "weights_ok": True,
+                        "dropped_gradients": 0,
+                        "clipped_gradients": 0,
+                        "sanitized": {
+                            "observation": obs_meta,
+                            "next_observation": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "adjusted": False,
+                                "sanitized": False,
+                            },
+                            "weights": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "sanitized": False,
+                            },
+                        },
+                    }
+                    continue
+                try:
+                    bounded_action = int(action_value)
+                except (TypeError, ValueError):
+                    app.logger.warning("Received invalid action index: %s", action_value)
+                    results[index] = {
+                        "trained": False,
+                        "weights_ok": True,
+                        "dropped_gradients": 0,
+                        "clipped_gradients": 0,
+                        "sanitized": {
+                            "observation": obs_meta,
+                            "next_observation": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "adjusted": False,
+                                "sanitized": False,
+                            },
+                            "weights": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "sanitized": False,
+                            },
+                        },
+                    }
+                    continue
+                bounded_action = int(np.clip(bounded_action, 0, self.action_count - 1))
+                try:
+                    reward_float = float(reward_value)
+                except (TypeError, ValueError):
+                    app.logger.warning("Received invalid reward value: %s", reward_value)
+                    reward_float = 0.0
+                if not np.isfinite(reward_float):
+                    app.logger.warning("Reward contained non-finite value: %s", reward_value)
+                    reward_float = 0.0
+                scaled_reward = float(np.clip(reward_float, -1.0, 1.0))
 
-                if use_policy:
-                    one_hot = tf.one_hot([bounded_action], self.action_count)
-                    log_probs = tf.math.log(action_pred + 1e-8)
-                    policy_loss = -scaled_reward * tf.reduce_mean(
-                        tf.reduce_sum(log_probs * one_hot, axis=-1)
-                    )
-                    total_loss += policy_loss
+                next_meta = {
+                    "replaced": 0,
+                    "clipped": 0,
+                    "adjusted": False,
+                    "sanitized": False,
+                }
+                if index < len(next_observations):
+                    next_observation = next_observations[index]
+                    if next_observation is not None:
+                        try:
+                            _, next_meta = self._prepare_observation(
+                                next_observation, "next_observation"
+                            )
+                        except ValueError:
+                            app.logger.warning(
+                                "Skipping next observation sanitization due to invalid payload"
+                            )
 
-                total_loss = tf.where(
-                    tf.math.is_finite(total_loss),
-                    total_loss,
-                    tf.constant(0.0, dtype=tf.float32),
+                valid_entries.append(
+                    {
+                        "index": index,
+                        "obs": obs.reshape(-1),
+                        "obs_meta": obs_meta,
+                        "next_meta": next_meta,
+                        "action": bounded_action,
+                        "reward": scaled_reward,
+                    }
                 )
 
-            gradients = tape.gradient(total_loss, self.model.trainable_variables)
-            grads_and_vars = [
-                (grad, var)
-                for grad, var in zip(gradients, self.model.trainable_variables)
-                if grad is not None
-            ]
-            cleaned_grads, dropped, clipped_grads = self._filter_gradients(grads_and_vars)
-            if dropped:
-                app.logger.warning("Skipped %d gradient tensors due to non-finite values", dropped)
-            weights_ok = True
-            weight_meta = {"sanitized": False, "replaced": 0, "clipped": 0, "reason": "post-train"}
-            if cleaned_grads:
-                self.optimizer.apply_gradients(cleaned_grads)
-                weights_ok = self._weights_are_finite()
-                if not weights_ok:
-                    app.logger.error("Model weights contain non-finite values after training step")
-                weight_meta = self._sanitize_model_weights("post-train")
-                if weight_meta.get("sanitized"):
-                    if weight_meta.get("replaced"):
-                        weights_ok = False
+            if valid_entries:
+                obs_matrix = np.stack([entry["obs"] for entry in valid_entries], axis=0).astype(
+                    np.float32, copy=False
+                )
+                actions_tensor = tf.convert_to_tensor(
+                    [entry["action"] for entry in valid_entries], dtype=tf.int32
+                )
+                rewards_tensor = tf.convert_to_tensor(
+                    [entry["reward"] for entry in valid_entries], dtype=tf.float32
+                )
+
+                with tf.GradientTape() as tape:
+                    action_pred = self.model(obs_matrix, training=True)
+                    total_loss = tf.constant(0.0, dtype=tf.float32)
+                    one_hot = tf.one_hot(actions_tensor, self.action_count)
+                    log_probs = tf.math.log(action_pred + 1e-8)
+                    policy_loss = -tf.reduce_mean(
+                        tf.reduce_sum(log_probs * one_hot, axis=-1) * rewards_tensor
+                    )
+                    total_loss += policy_loss
+                    total_loss = tf.where(
+                        tf.math.is_finite(total_loss),
+                        total_loss,
+                        tf.constant(0.0, dtype=tf.float32),
+                    )
+
+                gradients = tape.gradient(total_loss, self.model.trainable_variables)
+                grads_and_vars = [
+                    (grad, var)
+                    for grad, var in zip(gradients, self.model.trainable_variables)
+                    if grad is not None
+                ]
+                cleaned_grads, dropped, clipped_grads = self._filter_gradients(grads_and_vars)
+                if dropped:
+                    app.logger.warning(
+                        "Skipped %d gradient tensors due to non-finite values", dropped
+                    )
+                weights_ok = True
+                weight_meta = {
+                    "sanitized": False,
+                    "replaced": 0,
+                    "clipped": 0,
+                    "reason": "post-train-batch",
+                }
+                if cleaned_grads:
+                    self.optimizer.apply_gradients(cleaned_grads)
+                    weights_ok = self._weights_are_finite()
+                    if not weights_ok:
+                        app.logger.error(
+                            "Model weights contain non-finite values after training step"
+                        )
+                    weight_meta = self._sanitize_model_weights("post-train-batch")
+                    if weight_meta.get("sanitized"):
+                        if weight_meta.get("replaced"):
+                            weights_ok = False
+                        else:
+                            weights_ok = weights_ok and self._weights_are_finite()
                     else:
                         weights_ok = weights_ok and self._weights_are_finite()
-                else:
-                    weights_ok = weights_ok and self._weights_are_finite()
 
-            hebbian_info = self._apply_hebbian_updates(scaled_reward if use_policy else 0.0)
+                mean_reward = float(np.mean([entry["reward"] for entry in valid_entries]))
+                hebbian_info = self._apply_hebbian_updates(mean_reward)
+                current_lr = self._current_learning_rate()
 
-            return {
-                "trained": bool(cleaned_grads),
-                "weights_ok": bool(weights_ok),
-                "dropped_gradients": int(dropped),
-                "clipped_gradients": int(clipped_grads),
-                "learning_rate": self._current_learning_rate(),
-                "sanitized": {
-                    "observation": obs_meta,
-                    "next_observation": next_meta,
-                    "weights": {
-                        "replaced": int(weight_meta.get("replaced", 0)),
-                        "clipped": int(weight_meta.get("clipped", 0)),
-                        "sanitized": bool(weight_meta.get("sanitized", False)),
-                    },
-                },
-                "hebbian": hebbian_info,
-            }
+                for entry in valid_entries:
+                    results[entry["index"]] = {
+                        "trained": bool(cleaned_grads),
+                        "weights_ok": bool(weights_ok),
+                        "dropped_gradients": int(dropped),
+                        "clipped_gradients": int(clipped_grads),
+                        "learning_rate": current_lr,
+                        "sanitized": {
+                            "observation": entry["obs_meta"],
+                            "next_observation": entry["next_meta"],
+                            "weights": {
+                                "replaced": int(weight_meta.get("replaced", 0)),
+                                "clipped": int(weight_meta.get("clipped", 0)),
+                                "sanitized": bool(weight_meta.get("sanitized", False)),
+                            },
+                        },
+                        "hebbian": hebbian_info,
+                    }
+
+            for index, value in enumerate(results):
+                if value is None:
+                    results[index] = {
+                        "trained": False,
+                        "weights_ok": True,
+                        "dropped_gradients": 0,
+                        "clipped_gradients": 0,
+                        "sanitized": {
+                            "observation": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "adjusted": False,
+                                "sanitized": False,
+                            },
+                            "next_observation": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "adjusted": False,
+                                "sanitized": False,
+                            },
+                            "weights": {
+                                "replaced": 0,
+                                "clipped": 0,
+                                "sanitized": False,
+                            },
+                        },
+                    }
+            return results
+
+    def train(self, observation, action_index, reward, next_observation):
+        batch = self.train_batch(
+            [observation],
+            [action_index],
+            [reward],
+            [next_observation],
+        )
+        if not batch:
+            return False
+        return batch[0]
 
     def copy_from(self, other):
         if other is self:
@@ -1187,6 +1373,158 @@ def train_endpoint(brain_id):
         response_payload = {"trained": bool(result), "weights_ok": True}
     log_request(payload.get("bot_id"), "train", {**payload, **response_payload})
     return jsonify(response_payload)
+
+
+@app.post("/api/brains/batch_act")
+def batch_act_endpoint():
+    payload = request.get_json(force=True) or {}
+    requests = payload.get("requests")
+    if not isinstance(requests, list):
+        return jsonify({"error": "Requests must be a list"}), 400
+    results = [None] * len(requests)
+    grouped = {}
+    for index, item in enumerate(requests):
+        brain_id = item.get("brain_id")
+        if not brain_id:
+            results[index] = {"error": "Missing brain_id"}
+            continue
+        grouped.setdefault(brain_id, []).append((index, item))
+    for brain_id, entries in grouped.items():
+        brain = BRAINS.get(brain_id)
+        if brain is None:
+            for index, _ in entries:
+                results[index] = {"error": "Unknown brain"}
+            continue
+        observations = []
+        epsilons = []
+        valid_indices = []
+        for index, item in entries:
+            observation = item.get("observation")
+            if not isinstance(observation, (list, tuple)):
+                results[index] = {"error": "Observation must be a list"}
+                continue
+            observations.append(observation)
+            epsilons.append(item.get("epsilon", 0.1))
+            valid_indices.append(index)
+        if not observations:
+            continue
+        try:
+            brain_results = _execute("act", brain.choose_actions_batch, observations, epsilons)
+        except RuntimeError as exc:
+            for index in valid_indices:
+                results[index] = {"error": str(exc)}
+            continue
+        for offset, index in enumerate(valid_indices):
+            entry_result = brain_results[offset] if offset < len(brain_results) else None
+            if not isinstance(entry_result, dict) or entry_result.get("error"):
+                results[index] = {
+                    "error": entry_result.get("error") if isinstance(entry_result, dict) else "Failed to compute action",
+                }
+                continue
+            response_payload = {
+                "action": int(entry_result.get("action", 0)),
+                "weights_ok": bool(entry_result.get("weights_ok", True)),
+                "sanitized": entry_result.get("sanitized") or {},
+            }
+            results[index] = response_payload
+        for index, item in entries:
+            response_payload = results[index] or {}
+            log_request(
+                item.get("bot_id"),
+                "act",
+                {**item, **response_payload},
+            )
+    for index, value in enumerate(results):
+        if value is None:
+            results[index] = {"error": "Request was not processed"}
+    return jsonify({"results": results})
+
+
+@app.post("/api/brains/batch_train")
+def batch_train_endpoint():
+    payload = request.get_json(force=True) or {}
+    requests = payload.get("requests")
+    if not isinstance(requests, list):
+        return jsonify({"error": "Requests must be a list"}), 400
+    results = [None] * len(requests)
+    grouped = {}
+    for index, item in enumerate(requests):
+        brain_id = item.get("brain_id")
+        if not brain_id:
+            results[index] = {"error": "Missing brain_id"}
+            continue
+        grouped.setdefault(brain_id, []).append((index, item))
+    for brain_id, entries in grouped.items():
+        brain = BRAINS.get(brain_id)
+        if brain is None:
+            for index, _ in entries:
+                results[index] = {"error": "Unknown brain"}
+            continue
+        observations = []
+        actions = []
+        rewards = []
+        next_observations = []
+        valid_indices = []
+        for index, item in entries:
+            observation = item.get("observation")
+            if not isinstance(observation, (list, tuple)):
+                results[index] = {
+                    "trained": False,
+                    "weights_ok": True,
+                    "dropped_gradients": 0,
+                    "clipped_gradients": 0,
+                    "sanitized": {
+                        "observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
+                        "next_observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
+                        "weights": {"replaced": 0, "clipped": 0, "sanitized": False},
+                    },
+                }
+                continue
+            observations.append(observation)
+            actions.append(item.get("action"))
+            rewards.append(item.get("reward"))
+            next_observations.append(item.get("next_observation"))
+            valid_indices.append(index)
+        if not observations:
+            continue
+        try:
+            brain_results = _execute(
+                "train",
+                brain.train_batch,
+                observations,
+                actions,
+                rewards,
+                next_observations,
+            )
+        except RuntimeError as exc:
+            for index in valid_indices:
+                results[index] = {"error": str(exc)}
+            continue
+        for offset, index in enumerate(valid_indices):
+            entry_result = brain_results[offset] if offset < len(brain_results) else None
+            if not isinstance(entry_result, dict):
+                results[index] = {"error": "Failed to process training request"}
+                continue
+            results[index] = {
+                "trained": bool(entry_result.get("trained")),
+                "weights_ok": bool(entry_result.get("weights_ok", True)),
+                "dropped_gradients": int(entry_result.get("dropped_gradients", 0)),
+                "clipped_gradients": int(entry_result.get("clipped_gradients", 0)),
+                "learning_rate": entry_result.get("learning_rate"),
+                "hebbian": entry_result.get("hebbian"),
+                "sanitized": entry_result.get("sanitized") or {},
+            }
+        for index, item in entries:
+            response_payload = results[index] or {}
+            log_request(
+                item.get("bot_id"),
+                "train",
+                {**item, **response_payload},
+            )
+    for index, value in enumerate(results):
+        if value is None:
+            results[index] = {"error": "Request was not processed"}
+    return jsonify({"results": results})
 
 
 @app.post("/api/brains/<brain_id>/copy")

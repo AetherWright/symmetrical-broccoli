@@ -256,6 +256,17 @@ function sanitizeObservationPayload(vector, { expectedLength = null, label = 'ob
   return { values: sanitized, replaced, clipped, adjusted }
 }
 
+function summarizeSanitization(meta) {
+  if (!meta) {
+    return { replaced: 0, clipped: 0, adjusted: false }
+  }
+  return {
+    replaced: meta.replaced ?? 0,
+    clipped: meta.clipped ?? 0,
+    adjusted: Boolean(meta.adjusted)
+  }
+}
+
 function sanitizeActionIndex(action, actionCount) {
   if (!Number.isInteger(action)) {
     return { value: null, adjusted: false }
@@ -290,6 +301,217 @@ function sanitizeRewardValue(reward) {
   return reward
 }
 
+function makeDefaultTrainResult(sanitizedObservation, sanitizedNext) {
+  return {
+    trained: false,
+    weightsOk: true,
+    droppedGradients: 0,
+    clippedGradients: 0,
+    sanitization: {
+      observation: summarizeSanitization(sanitizedObservation),
+      nextObservation: summarizeSanitization(sanitizedNext),
+      remote: {}
+    }
+  }
+}
+
+export async function chooseActionsBatch(argsList) {
+  const results = new Array(argsList.length)
+  const payloads = []
+  const indexMap = []
+
+  for (let i = 0; i < argsList.length; i++) {
+    const [brain, observation, epsilon = 0.1] = argsList[i] ?? []
+    const brainId = ensureBrainId(brain)
+    const sanitizedObservation = sanitizeObservationPayload(observation, {
+      expectedLength: brain?.inputSize,
+      label: 'observation'
+    })
+    if (!Array.isArray(sanitizedObservation.values)) {
+      results[i] = {
+        ok: false,
+        error: new Error('Observation must be an array-like payload')
+      }
+      continue
+    }
+    payloads.push({
+      brain_id: brainId,
+      observation: sanitizedObservation.values,
+      epsilon: clampEpsilon(epsilon),
+      bot_id: brain?.owner ?? null
+    })
+    indexMap.push({
+      index: i,
+      observation: sanitizedObservation
+    })
+  }
+
+  if (payloads.length) {
+    let response
+    try {
+      response = await request('/api/brains/batch_act', { body: { requests: payloads } })
+    } catch (error) {
+      for (const entry of indexMap) {
+        results[entry.index] = { ok: false, error }
+      }
+      return results
+    }
+    const remoteResults = Array.isArray(response?.results) ? response.results : []
+    for (let i = 0; i < indexMap.length; i++) {
+      const { index, observation } = indexMap[i]
+      const remote = remoteResults[i]
+      if (!remote || remote.error) {
+        const err = remote?.error
+          ? new Error(remote.error)
+          : new Error('Remote brain batch action missing result')
+        results[index] = { ok: false, error: err }
+        continue
+      }
+      if (!Number.isInteger(remote.action)) {
+        results[index] = {
+          ok: false,
+          error: new Error('Remote brain did not return a valid action index')
+        }
+        continue
+      }
+      results[index] = {
+        ok: true,
+        value: {
+          action: remote.action,
+          weightsOk: remote.weights_ok !== false,
+          sanitization: {
+            observation: summarizeSanitization(observation),
+            remote: remote.sanitized ?? {}
+          }
+        }
+      }
+    }
+  }
+
+  for (let i = 0; i < results.length; i++) {
+    if (!results[i]) {
+      results[i] = {
+        ok: false,
+        error: new Error('Batch entry was not processed')
+      }
+    }
+  }
+
+  return results
+}
+
+export async function trainBrainsBatch(argsList) {
+  const results = new Array(argsList.length)
+  const payloads = []
+  const indexMap = []
+
+  for (let i = 0; i < argsList.length; i++) {
+    const [brain, observation, actionIndex, reward, nextObservation] = argsList[i] ?? []
+    const brainId = ensureBrainId(brain)
+    const sanitizedObservation = sanitizeObservationPayload(observation, {
+      expectedLength: brain?.inputSize,
+      label: 'observation'
+    })
+    if (!Array.isArray(sanitizedObservation.values)) {
+      console.warn('[RemoteBrain] Skipping training due to invalid observation payload.')
+      results[i] = {
+        ok: true,
+        value: makeDefaultTrainResult(sanitizedObservation, { replaced: 0, clipped: 0, adjusted: false })
+      }
+      continue
+    }
+    const sanitizedNext = nextObservation != null
+      ? sanitizeObservationPayload(nextObservation, {
+          expectedLength: brain?.inputSize,
+          label: 'next_observation'
+        })
+      : { values: null, replaced: 0, clipped: 0, adjusted: false }
+    const { value: sanitizedAction, adjusted: actionAdjusted } = sanitizeActionIndex(
+      actionIndex,
+      brain?.actionCount
+    )
+    if (actionIndex != null && sanitizedAction == null) {
+      console.warn('[RemoteBrain] Skipping training due to invalid action index.')
+      results[i] = {
+        ok: true,
+        value: makeDefaultTrainResult(sanitizedObservation, sanitizedNext)
+      }
+      continue
+    }
+    if (actionAdjusted) {
+      console.warn('[RemoteBrain] Adjusted action index to stay within range.')
+    }
+    payloads.push({
+      brain_id: brainId,
+      observation: sanitizedObservation.values,
+      action: sanitizedAction,
+      reward: sanitizeRewardValue(reward),
+      next_observation: Array.isArray(sanitizedNext.values) ? sanitizedNext.values : undefined,
+      bot_id: brain?.owner ?? null
+    })
+    indexMap.push({
+      index: i,
+      observation: sanitizedObservation,
+      nextObservation: sanitizedNext
+    })
+  }
+
+  if (payloads.length) {
+    let response
+    try {
+      response = await request('/api/brains/batch_train', { body: { requests: payloads } })
+    } catch (error) {
+      for (const entry of indexMap) {
+        results[entry.index] = { ok: false, error }
+      }
+      return results
+    }
+    const remoteResults = Array.isArray(response?.results) ? response.results : []
+    for (let i = 0; i < indexMap.length; i++) {
+      const { index, observation, nextObservation } = indexMap[i]
+      const remote = remoteResults[i]
+      if (!remote || remote.error) {
+        const err = remote?.error
+          ? new Error(remote.error)
+          : new Error('Remote brain batch train missing result')
+        results[index] = { ok: false, error: err }
+        continue
+      }
+      results[index] = {
+        ok: true,
+        value: {
+          trained: Boolean(remote.trained),
+          weightsOk: remote.weights_ok !== false,
+          droppedGradients: Number.isFinite(remote.dropped_gradients)
+            ? remote.dropped_gradients
+            : 0,
+          clippedGradients: Number.isFinite(remote.clipped_gradients)
+            ? remote.clipped_gradients
+            : 0,
+          learningRate: remote.learning_rate ?? null,
+          hebbian: remote.hebbian ?? null,
+          sanitization: {
+            observation: summarizeSanitization(observation),
+            nextObservation: summarizeSanitization(nextObservation),
+            remote: remote.sanitized ?? {}
+          }
+        }
+      }
+    }
+  }
+
+  for (let i = 0; i < results.length; i++) {
+    if (!results[i]) {
+      results[i] = {
+        ok: false,
+        error: new Error('Batch entry was not processed')
+      }
+    }
+  }
+
+  return results
+}
+
 export async function createBrain(inputSize, actionCount) {
   const payload = { input_size: inputSize, action_count: actionCount }
   const result = await request('/api/brains', { body: payload })
@@ -302,128 +524,25 @@ export async function createBrain(inputSize, actionCount) {
 }
 
 export async function chooseAction(brain, observation, epsilon = 0.1) {
-  const brainId = ensureBrainId(brain)
-  const sanitizedObservation = sanitizeObservationPayload(observation, {
-    expectedLength: brain.inputSize,
-    label: 'observation'
-  })
-  if (!Array.isArray(sanitizedObservation.values)) {
-    throw new Error('Observation must be an array-like payload')
+  const [result] = await chooseActionsBatch([[brain, observation, epsilon]])
+  if (!result || !result.ok) {
+    throw (result?.error ?? new Error('Failed to select action'))
   }
-  const payload = {
-    observation: sanitizedObservation.values,
-    epsilon: clampEpsilon(epsilon),
-    bot_id: brain.owner ?? null
-  }
-  const result = await request(`/api/brains/${brainId}/act`, { body: payload })
-  if (!Number.isInteger(result?.action)) {
-    throw new Error('Remote brain did not return a valid action index')
-  }
-  const observationSummary = {
-    replaced: sanitizedObservation.replaced ?? 0,
-    clipped: sanitizedObservation.clipped ?? 0,
-    adjusted: Boolean(sanitizedObservation.adjusted)
-  }
-  const sanitization = {
-    observation: observationSummary,
-    remote: result?.sanitized ?? {}
-  }
-  const weightsOk = result?.weights_ok !== false
-  return {
-    action: result.action,
-    weightsOk,
-    sanitization
-  }
+  return result.value
 }
 
 export async function trainBrain(brain, observation, actionIndex, reward, nextObservation) {
-  const brainId = ensureBrainId(brain)
-  const sanitizedObservation = sanitizeObservationPayload(observation, {
-    expectedLength: brain.inputSize,
-    label: 'observation'
-  })
-  if (!Array.isArray(sanitizedObservation.values)) {
-    console.warn('[RemoteBrain] Skipping training due to invalid observation payload.')
-    return {
-      trained: false,
-      weightsOk: true,
-      droppedGradients: 0,
-      sanitization: {
-        observation: {
-          replaced: sanitizedObservation.replaced ?? 0,
-          clipped: sanitizedObservation.clipped ?? 0,
-          adjusted: Boolean(sanitizedObservation.adjusted)
-        },
-        nextObservation: { replaced: 0, clipped: 0, adjusted: false },
-        remote: {}
-      }
-    }
+  const [result] = await trainBrainsBatch([[brain, observation, actionIndex, reward, nextObservation]])
+  if (!result) {
+    return makeDefaultTrainResult(
+      { replaced: 0, clipped: 0, adjusted: false },
+      { replaced: 0, clipped: 0, adjusted: false }
+    )
   }
-  const sanitizedNext = nextObservation != null
-    ? sanitizeObservationPayload(nextObservation, {
-        expectedLength: brain.inputSize,
-        label: 'next_observation'
-      })
-    : { values: null, replaced: 0, clipped: 0, adjusted: false }
-  const { value: sanitizedAction, adjusted: actionAdjusted } = sanitizeActionIndex(
-    actionIndex,
-    brain.actionCount
-  )
-  if (actionIndex != null && sanitizedAction == null) {
-    console.warn('[RemoteBrain] Skipping training due to invalid action index.')
-    return {
-      trained: false,
-      weightsOk: true,
-      droppedGradients: 0,
-      sanitization: {
-        observation: {
-          replaced: sanitizedObservation.replaced ?? 0,
-          clipped: sanitizedObservation.clipped ?? 0,
-          adjusted: Boolean(sanitizedObservation.adjusted)
-        },
-        nextObservation: {
-          replaced: sanitizedNext.replaced ?? 0,
-          clipped: sanitizedNext.clipped ?? 0,
-          adjusted: Boolean(sanitizedNext.adjusted)
-        },
-        remote: {}
-      }
-    }
+  if (!result.ok) {
+    throw result.error ?? new Error('Remote brain training failed')
   }
-  if (actionAdjusted) {
-    console.warn('[RemoteBrain] Adjusted action index to stay within range.')
-  }
-  const payload = {
-    observation: sanitizedObservation.values,
-    action: sanitizedAction,
-    reward: sanitizeRewardValue(reward),
-    next_observation: Array.isArray(sanitizedNext.values) ? sanitizedNext.values : undefined,
-    bot_id: brain.owner ?? null
-  }
-  const result = await request(`/api/brains/${brainId}/train`, { body: payload })
-  return {
-    trained: Boolean(result?.trained),
-    weightsOk: result?.weights_ok !== false,
-    droppedGradients: Number.isFinite(result?.dropped_gradients)
-      ? result.dropped_gradients
-      : 0,
-    clippedGradients: Number.isFinite(result?.clipped_gradients)
-      ? result.clipped_gradients
-      : 0,
-    sanitization: {
-      observation: {
-        replaced: sanitizedObservation.replaced ?? 0,
-        clipped: sanitizedObservation.clipped ?? 0,
-        adjusted: Boolean(sanitizedObservation.adjusted)
-      },
-      nextObservation: {
-        replaced: sanitizedNext.replaced ?? 0,
-        clipped: sanitizedNext.clipped ?? 0,
-        adjusted: Boolean(sanitizedNext.adjusted)
-      },
-      remote: result?.sanitized ?? {}
-    }
-  }
+  return result.value
 }
 
 export async function saveBrain(brain, dir) {

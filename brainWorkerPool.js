@@ -17,6 +17,7 @@ class BrainWorkerPool {
     this.queue = []
     this.nextJobId = 1
     this._destroyed = false
+    this.batchSize = Math.max(1, parseBatchSize())
     for (let i = 0; i < this.size; i += 1) {
       this._spawnWorker()
     }
@@ -57,7 +58,9 @@ class BrainWorkerPool {
     const terminations = this.workers.map(wrapper => {
       const { currentJob } = wrapper
       if (currentJob) {
-        currentJob.reject(pendingError)
+        for (const job of currentJob.jobs ?? []) {
+          job.reject(pendingError)
+        }
       }
       return wrapper.worker.terminate()
     })
@@ -87,25 +90,48 @@ class BrainWorkerPool {
       if (!this.queue.length) break
       if (!wrapper.free || wrapper.currentJob) continue
       const job = this.queue.shift()
-      wrapper.currentJob = job
+      const batch = [job]
+      while (
+        batch.length < this.batchSize &&
+        this.queue.length &&
+        this.queue[0].op === job.op
+      ) {
+        batch.push(this.queue.shift())
+      }
+      wrapper.currentJob = {
+        op: job.op,
+        jobs: batch,
+        id: job.id
+      }
       wrapper.free = false
       try {
-        wrapper.worker.postMessage({ id: job.id, op: job.op, args: job.args })
+        wrapper.worker.postMessage({
+          id: job.id,
+          op: job.op,
+          batch: batch.map(entry => ({ id: entry.id, args: entry.args }))
+        })
       } catch (error) {
         wrapper.free = true
+        const failedGroup = wrapper.currentJob
         wrapper.currentJob = null
-        job.reject(error)
+        if (failedGroup) {
+          for (const item of failedGroup.jobs) {
+            item.reject(error)
+          }
+        } else {
+          job.reject(error)
+        }
       }
     }
   }
 
   _handleMessage(wrapper, message) {
-    const { id, ok, result, error, remoteState } = message ?? {}
+    const { id, ok, result, results, error, remoteState } = message ?? {}
     if (remoteState) {
       applyRemoteStateSnapshot(remoteState)
     }
-    const job = wrapper.currentJob
-    if (!job || job.id !== id) {
+    const current = wrapper.currentJob
+    if (!current || current.id !== id) {
       wrapper.currentJob = null
       wrapper.free = true
       this._dispatch()
@@ -113,10 +139,38 @@ class BrainWorkerPool {
     }
     wrapper.currentJob = null
     wrapper.free = true
-    if (ok) {
-      job.resolve(result)
+    if (ok && Array.isArray(results) && results.length) {
+      const lookup = new Map(current.jobs.map(item => [item.id, item]))
+      for (const entry of results) {
+        const job = lookup.get(entry.id)
+        if (!job) {
+          continue
+        }
+        if (entry.ok) {
+          job.resolve(entry.result)
+        } else {
+          job.reject(deserializeError(entry.error))
+        }
+        lookup.delete(entry.id)
+      }
+      for (const remaining of lookup.values()) {
+        remaining.reject(new Error('Brain worker batch response missing result'))
+      }
+    } else if (current.jobs.length === 1) {
+      const [job] = current.jobs
+      if (ok) {
+        job.resolve(result)
+      } else {
+        job.reject(deserializeError(error))
+      }
     } else {
-      job.reject(deserializeError(error))
+      for (const job of current.jobs) {
+        if (ok) {
+          job.resolve(result)
+        } else {
+          job.reject(deserializeError(error))
+        }
+      }
     }
     this._dispatch()
   }
@@ -151,10 +205,13 @@ class BrainWorkerPool {
   }
 
   _rejectCurrentJob(wrapper, error) {
-    const job = wrapper.currentJob
+    const current = wrapper.currentJob
     wrapper.currentJob = null
     wrapper.free = true
-    if (job) {
+    if (!current) {
+      return
+    }
+    for (const job of current.jobs ?? []) {
       if (error) {
         job.reject(deserializeError(error))
       } else {
@@ -170,6 +227,19 @@ class BrainWorkerPool {
     }
   }
 }
+
+function parseBatchSize() {
+  const configured = process.env.BRAIN_BATCH_SIZE
+  if (configured != null) {
+    const parsed = Number.parseInt(configured, 10)
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed
+    }
+  }
+  return MAX_BATCH_SIZE_FALLBACK
+}
+
+const MAX_BATCH_SIZE_FALLBACK = 16
 
 function deserializeError(payload) {
   if (!payload) {
