@@ -127,10 +127,14 @@ WORKERS = EndpointWorkerPool(ENDPOINT_WORKER_LIMITS)
 atexit.register(WORKERS.shutdown)
 
 BRAIN_CONFIG = {
-    "hidden_units": 128,
-    "mid_units": 96,
-    "shared_units": 64,
-    "dropout_rate": 0.25,
+    "hidden_units": 192,
+    "mid_units": 144,
+    "shared_units": 96,
+    "dropout_rate": 0.3,
+    "hebbian_units": [160, 112],
+    "hebbian_learning_rate": 0.01,
+    "hebbian_decay_multiplier": 1.5,
+    "hebbian_clip": 0.75,
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
@@ -242,42 +246,202 @@ class LookaheadOptimizer:
                 fast_var.assign(self._read_variable(slow_var))
 
 
+class HebbianDense(tf.keras.layers.Layer):
+    def __init__(
+        self,
+        units,
+        activation="relu",
+        hebbian_learning_rate=0.01,
+        decay_multiplier=1.5,
+        clip=0.75,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.units = int(units)
+        self.activation = tf.keras.activations.get(activation)
+        self.hebbian_learning_rate = float(abs(hebbian_learning_rate))
+        self.decay_multiplier = float(abs(decay_multiplier))
+        self.clip = float(abs(clip))
+        self._last_input = None
+        self._last_output = None
+
+    def build(self, input_shape):
+        last_dim = int(input_shape[-1])
+        dtype = self.dtype or tf.float32
+        self.base_kernel = self.add_weight(
+            name="base_kernel",
+            shape=(last_dim, self.units),
+            initializer="glorot_uniform",
+            trainable=True,
+            dtype=dtype,
+        )
+        self.base_bias = self.add_weight(
+            name="base_bias",
+            shape=(self.units,),
+            initializer="zeros",
+            trainable=True,
+            dtype=dtype,
+        )
+        self.hebbian_kernel = self.add_weight(
+            name="hebbian_kernel",
+            shape=(last_dim, self.units),
+            initializer="zeros",
+            trainable=False,
+            dtype=dtype,
+        )
+        self.hebbian_bias = self.add_weight(
+            name="hebbian_bias",
+            shape=(self.units,),
+            initializer="zeros",
+            trainable=False,
+            dtype=dtype,
+        )
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        tensor = tf.cast(inputs, self.base_kernel.dtype)
+        combined_kernel = self.base_kernel + self.hebbian_kernel
+        combined_bias = self.base_bias + self.hebbian_bias
+        outputs = tf.linalg.matmul(tensor, combined_kernel)
+        outputs = tf.nn.bias_add(outputs, combined_bias)
+        if self.activation is not None:
+            outputs = self.activation(outputs)
+        if training:
+            self._last_input = tf.stop_gradient(tf.identity(tensor))
+            self._last_output = tf.stop_gradient(tf.identity(outputs))
+        return outputs
+
+    def _apply_decay(self):
+        if self.hebbian_learning_rate <= 0:
+            return 0.0
+        decay_rate = self.hebbian_learning_rate * self.decay_multiplier
+        decay_rate = min(0.95, max(0.0, decay_rate))
+        if decay_rate == 0:
+            return 0.0
+        keep_ratio = 1.0 - decay_rate
+        keep_ratio_tensor = tf.cast(keep_ratio, self.hebbian_kernel.dtype)
+        self.hebbian_kernel.assign(self.hebbian_kernel * keep_ratio_tensor)
+        self.hebbian_bias.assign(self.hebbian_bias * keep_ratio_tensor)
+        return float(decay_rate)
+
+    def update_hebbian(self, reinforcement):
+        decay_rate = self._apply_decay()
+        reinforcement = float(np.clip(reinforcement, -1.0, 1.0))
+        applied = False
+        if reinforcement != 0.0 and self._last_input is not None and self._last_output is not None:
+            lr = self.hebbian_learning_rate * reinforcement
+            pre = tf.cast(self._last_input, self.hebbian_kernel.dtype)
+            post = tf.cast(self._last_output, self.hebbian_kernel.dtype)
+            pre = tf.nn.l2_normalize(pre, axis=-1)
+            post = tf.nn.l2_normalize(post, axis=-1)
+            kernel_update = tf.einsum("bi,bj->ij", pre, post)
+            kernel_update /= tf.cast(tf.shape(pre)[0], self.hebbian_kernel.dtype)
+            bias_update = tf.reduce_mean(post, axis=0)
+            step = tf.cast(lr, self.hebbian_kernel.dtype)
+            self.hebbian_kernel.assign_add(kernel_update * step)
+            self.hebbian_bias.assign_add(bias_update * step)
+            applied = True
+        if self.clip > 0:
+            clip_value = tf.cast(self.clip, self.hebbian_kernel.dtype)
+            self.hebbian_kernel.assign(
+                tf.clip_by_value(self.hebbian_kernel, -clip_value, clip_value)
+            )
+            self.hebbian_bias.assign(
+                tf.clip_by_value(self.hebbian_bias, -clip_value, clip_value)
+            )
+        self._last_input = None
+        self._last_output = None
+        return {"applied": applied, "decay_rate": decay_rate}
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "units": self.units,
+                "activation": tf.keras.activations.serialize(self.activation),
+                "hebbian_learning_rate": self.hebbian_learning_rate,
+                "decay_multiplier": self.decay_multiplier,
+                "clip": self.clip,
+            }
+        )
+        return config
+
+
+tf.keras.utils.get_custom_objects()["HebbianDense"] = HebbianDense
+
+
 def build_model(input_size, action_count):
     inputs = tf.keras.Input(shape=(input_size,), name="observation")
     x = tf.keras.layers.BatchNormalization(name="input_batchnorm")(inputs)
     x = tf.keras.layers.Dense(
         BRAIN_CONFIG["hidden_units"],
         activation="relu",
-        name="hidden_dense_1"
+        name="hidden_dense_1",
     )(x)
     x = tf.keras.layers.Dropout(
-        BRAIN_CONFIG["dropout_rate"],
-        name="hidden_dropout_1"
+        BRAIN_CONFIG["dropout_rate"], name="hidden_dropout_1"
+    )(x)
+    hebbian_layers = []
+    hebbian_1 = HebbianDense(
+        BRAIN_CONFIG["hebbian_units"][0],
+        activation="relu",
+        hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
+        decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
+        clip=BRAIN_CONFIG["hebbian_clip"],
+        name="hebbian_dense_1",
+    )
+    x = hebbian_1(x)
+    hebbian_layers.append(hebbian_1)
+    x = tf.keras.layers.Dropout(
+        BRAIN_CONFIG["dropout_rate"], name="hebbian_dropout_1"
     )(x)
     x = tf.keras.layers.Dense(
         BRAIN_CONFIG["mid_units"],
         activation="relu",
-        name="hidden_dense_2"
+        name="hidden_dense_2",
     )(x)
     x = tf.keras.layers.Dropout(
-        BRAIN_CONFIG["dropout_rate"],
-        name="hidden_dropout_2"
+        BRAIN_CONFIG["dropout_rate"], name="hidden_dropout_2"
     )(x)
+    hebbian_2 = HebbianDense(
+        BRAIN_CONFIG["hebbian_units"][1],
+        activation="relu",
+        hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
+        decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
+        clip=BRAIN_CONFIG["hebbian_clip"],
+        name="hebbian_dense_2",
+    )
+    x = hebbian_2(x)
+    hebbian_layers.append(hebbian_2)
     shared = tf.keras.layers.Dense(
         max(1, BRAIN_CONFIG["shared_units"]),
         activation="relu",
-        name="shared_dense"
+        name="shared_dense",
     )(x)
+    shared = tf.keras.layers.Dropout(
+        BRAIN_CONFIG["dropout_rate"], name="shared_dropout"
+    )(shared)
+    policy_features = tf.keras.layers.Dense(
+        max(1, BRAIN_CONFIG["shared_units"]),
+        activation="relu",
+        name="policy_dense",
+    )(shared)
     policy_features = tf.keras.layers.Dropout(
         BRAIN_CONFIG["dropout_rate"], name="policy_features"
-    )(shared)
+    )(policy_features)
     action_head = tf.keras.layers.Dense(
         action_count, activation="softmax", name="action_head"
     )(policy_features)
+    prediction_features = tf.keras.layers.Dense(
+        max(input_size, BRAIN_CONFIG["mid_units"]),
+        activation="relu",
+        name="prediction_dense",
+    )(shared)
     prediction_head = tf.keras.layers.Dense(
         input_size, activation="linear", name="prediction_head"
-    )(policy_features)
+    )(prediction_features)
     model = tf.keras.Model(inputs=inputs, outputs=[action_head, prediction_head])
+    model._hebbian_layers = hebbian_layers  # type: ignore[attr-defined]
     return model
 
 
@@ -286,6 +450,7 @@ class RemoteBrain:
         self.input_size = int(input_size)
         self.action_count = int(action_count)
         self.model = build_model(self.input_size, self.action_count)
+        self.hebbian_layers = list(getattr(self.model, "_hebbian_layers", []))
         nadam = tf.keras.optimizers.Nadam(learning_rate=2e-3)
         self.optimizer = LookaheadOptimizer(nadam, sync_period=6, slow_step_size=0.5)
         self.prediction_weight = tf.constant(1.0, dtype=tf.float32)
@@ -361,6 +526,26 @@ class RemoteBrain:
             if not np.all(np.isfinite(weight)):
                 return False
         return True
+
+    def _apply_hebbian_updates(self, reinforcement):
+        if not self.hebbian_layers:
+            return {"layers": 0, "applied": 0, "decay_rates": []}
+        applied = 0
+        decay_rates = []
+        for layer in self.hebbian_layers:
+            result = layer.update_hebbian(reinforcement)
+            if not isinstance(result, dict):
+                continue
+            decay_rate = result.get("decay_rate")
+            if decay_rate is not None:
+                decay_rates.append(float(decay_rate))
+            if result.get("applied"):
+                applied += 1
+        return {
+            "layers": len(self.hebbian_layers),
+            "applied": applied,
+            "decay_rates": decay_rates,
+        }
 
     def choose_action(self, observation, epsilon):
         with self._lock:
@@ -497,6 +682,8 @@ class RemoteBrain:
                 if not weights_ok:
                     app.logger.error("Model weights contain non-finite values after training step")
 
+            hebbian_info = self._apply_hebbian_updates(scaled_reward if use_policy else 0.0)
+
             return {
                 "trained": bool(cleaned_grads),
                 "weights_ok": bool(weights_ok),
@@ -512,6 +699,7 @@ class RemoteBrain:
                         "sanitized": False,
                     },
                 },
+                "hebbian": hebbian_info,
             }
 
     def copy_from(self, other):
