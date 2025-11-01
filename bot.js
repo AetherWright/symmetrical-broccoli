@@ -29,6 +29,7 @@ import {
 const MC_HOST = 'localhost'
 const MC_PORT = 25565
 const BOT_COUNT = Math.max(2, parseInt(process.env.BOT_COUNT ?? '10', 10))
+const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
 const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '200', 10))
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
@@ -926,7 +927,6 @@ const STAGNATION_VARIANCE_THRESHOLD = 0.0025
 const STAGNATION_MUTATION_THRESHOLD = 3
 const DIVERSITY_WINDOW = 60
 const MAX_BOTS = Math.max(BOT_COUNT, parseInt(process.env.BOT_MAX ?? '8', 10))
-const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
 const LOW_REWARD_RETIRE_LIMIT = (() => {
   const raw = Number.parseInt(process.env.BOT_LOW_REWARD_RETIRE ?? '2', 10)
   if (!Number.isFinite(raw) || raw <= 0) return 0
