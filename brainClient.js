@@ -284,31 +284,18 @@ export async function chooseAction(brain, observation, epsilon = 0.1) {
   if (!Number.isInteger(result?.action)) {
     throw new Error('Remote brain did not return a valid action index')
   }
-  const sanitizedPrediction = Array.isArray(result?.prediction)
-    ? sanitizeObservationPayload(result.prediction, {
-        expectedLength: brain.inputSize,
-        label: 'prediction'
-      })
-    : { values: null, replaced: 0, clipped: 0, adjusted: false }
   const observationSummary = {
     replaced: sanitizedObservation.replaced ?? 0,
     clipped: sanitizedObservation.clipped ?? 0,
     adjusted: Boolean(sanitizedObservation.adjusted)
   }
-  const predictionSummary = {
-    replaced: sanitizedPrediction.replaced ?? 0,
-    clipped: sanitizedPrediction.clipped ?? 0,
-    adjusted: Boolean(sanitizedPrediction.adjusted)
-  }
   const sanitization = {
     observation: observationSummary,
-    prediction: predictionSummary,
     remote: result?.sanitized ?? {}
   }
   const weightsOk = result?.weights_ok !== false
   return {
     action: result.action,
-    prediction: sanitizedPrediction.values,
     weightsOk,
     sanitization
   }

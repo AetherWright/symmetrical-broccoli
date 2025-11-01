@@ -440,15 +440,7 @@ def build_model(input_size, action_count):
     action_head = tf.keras.layers.Dense(
         action_count, activation="softmax", name="action_head"
     )(policy_features)
-    prediction_features = tf.keras.layers.Dense(
-        max(input_size, BRAIN_CONFIG["mid_units"]),
-        activation="relu",
-        name="prediction_dense",
-    )(shared)
-    prediction_head = tf.keras.layers.Dense(
-        input_size, activation="linear", name="prediction_head"
-    )(prediction_features)
-    model = tf.keras.Model(inputs=inputs, outputs=[action_head, prediction_head])
+    model = tf.keras.Model(inputs=inputs, outputs=action_head)
     model._hebbian_layers = hebbian_layers  # type: ignore[attr-defined]
     return model
 
@@ -477,7 +469,6 @@ class RemoteBrain:
         )
         self.optimizer = LookaheadOptimizer(lion, sync_period=6, slow_step_size=0.5)
         self.learning_rate_schedule = cosine_schedule
-        self.prediction_weight = tf.constant(1.0, dtype=tf.float32)
         self._lock = threading.RLock()
 
     def _prepare_observation(self, vector, label):
@@ -515,41 +506,6 @@ class RemoteBrain:
             return float(value)
         except Exception:  # pragma: no cover - defensive
             return None
-
-    def _sanitize_prediction_output(self, tensor):
-        array = np.asarray(tensor, dtype=np.float32).reshape(-1)
-        finite_mask = np.isfinite(array)
-        replaced = int(array.size - np.count_nonzero(finite_mask))
-        if replaced:
-            app.logger.warning("Sanitized prediction output due to non-finite values")
-        cleaned = np.nan_to_num(array, nan=0.0, posinf=OBS_CLAMP, neginf=-OBS_CLAMP)
-        clipped = 0
-        if OBS_CLAMP > 0:
-            clipped_array = np.clip(cleaned, -OBS_CLAMP, OBS_CLAMP)
-            clipped = int(np.count_nonzero(clipped_array != cleaned))
-        else:
-            clipped_array = cleaned
-        adjusted = False
-        if clipped_array.size != self.input_size:
-            adjusted = True
-            app.logger.warning(
-                "Adjusted prediction output size from %d to %d",
-                clipped_array.size,
-                self.input_size,
-            )
-            if clipped_array.size > self.input_size:
-                clipped_array = clipped_array[: self.input_size]
-            else:
-                clipped_array = np.pad(
-                    clipped_array, (0, self.input_size - clipped_array.size), constant_values=0.0
-                )
-        metadata = {
-            "replaced": replaced,
-            "clipped": clipped,
-            "adjusted": adjusted,
-        }
-        metadata["sanitized"] = bool(replaced or clipped or adjusted)
-        return clipped_array.astype(np.float32, copy=False).tolist(), metadata
 
     @staticmethod
     def _filter_gradients(grads_and_vars):
@@ -599,7 +555,7 @@ class RemoteBrain:
                 obs, obs_meta = self._prepare_observation(observation, "observation")
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
-            action_probs, prediction = self.model(obs, training=False)
+            action_probs = self.model(obs, training=False)
             raw_probs = action_probs.numpy().astype(np.float32, copy=False).reshape(-1)
             replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
             sanitized_policy = replaced > 0
@@ -625,8 +581,8 @@ class RemoteBrain:
                 "replaced": int(replaced),
                 "fallback": bool(sanitized_policy),
             }
-            predicted_next, prediction_meta = self._sanitize_prediction_output(prediction.numpy())
-            weights_ok = policy_meta["replaced"] == 0 and prediction_meta["replaced"] == 0
+            policy_meta["sanitized"] = bool(policy_meta["replaced"] or policy_meta["fallback"])
+            weights_ok = policy_meta["replaced"] == 0
             rand = float(np.random.random())
             exploration = rand < epsilon
             if exploration:
@@ -635,12 +591,10 @@ class RemoteBrain:
                 action_index = int(np.argmax(safe_probs))
             return {
                 "action": action_index,
-                "prediction": predicted_next,
                 "weights_ok": bool(weights_ok),
                 "sanitized": {
                     "observation": obs_meta,
                     "policy": policy_meta,
-                    "prediction": prediction_meta,
                     "exploration": bool(exploration),
                 },
             }
@@ -654,9 +608,8 @@ class RemoteBrain:
                 return False
 
             use_policy = action_index is not None and reward is not None
-            use_prediction = next_observation is not None
 
-            if not (use_policy or use_prediction):
+            if not use_policy:
                 return False
 
             bounded_action = None
@@ -679,19 +632,24 @@ class RemoteBrain:
                         reward_value = 0.0
                     scaled_reward = float(np.clip(reward_value, -1.0, 1.0))
 
-            next_obs = None
-            next_meta = None
-            if use_prediction:
+            next_meta = {
+                "replaced": 0,
+                "clipped": 0,
+                "adjusted": False,
+                "sanitized": False,
+            }
+            if next_observation is not None:
                 try:
-                    next_obs, next_meta = self._prepare_observation(
+                    _, next_meta = self._prepare_observation(
                         next_observation, "next_observation"
                     )
                 except ValueError:
-                    app.logger.warning("Skipping prediction loss due to invalid next observation payload")
-                    use_prediction = False
+                    app.logger.warning(
+                        "Skipping next observation sanitization due to invalid payload"
+                    )
 
             with tf.GradientTape() as tape:
-                action_pred, prediction = self.model(obs, training=True)
+                action_pred = self.model(obs, training=True)
                 total_loss = tf.constant(0.0, dtype=tf.float32)
 
                 if use_policy:
@@ -701,10 +659,6 @@ class RemoteBrain:
                         tf.reduce_sum(log_probs * one_hot, axis=-1)
                     )
                     total_loss += policy_loss
-
-                if use_prediction:
-                    prediction_loss = tf.reduce_mean(tf.square(prediction - next_obs))
-                    total_loss += self.prediction_weight * prediction_loss
 
                 total_loss = tf.where(
                     tf.math.is_finite(total_loss),
@@ -737,14 +691,7 @@ class RemoteBrain:
                 "learning_rate": self._current_learning_rate(),
                 "sanitized": {
                     "observation": obs_meta,
-                    "next_observation": next_meta
-                    if next_meta is not None
-                    else {
-                        "replaced": 0,
-                        "clipped": 0,
-                        "adjusted": False,
-                        "sanitized": False,
-                    },
+                    "next_observation": next_meta,
                 },
                 "hebbian": hebbian_info,
             }
@@ -967,7 +914,6 @@ def log_request(bot_id, endpoint, payload):
             "reward": payload.get("reward"),
             "action": payload.get("action"),
             "epsilon": payload.get("epsilon"),
-            "prediction": payload.get("prediction")
         }
         STATUS["requests"].append(entry)
         STATUS["requests"] = STATUS["requests"][-50:]
@@ -979,23 +925,9 @@ def log_request(bot_id, endpoint, payload):
                     "last_seen": entry["timestamp"],
                     "last_action": payload.get("action"),
                     "last_reward": payload.get("reward"),
-                    "epsilon": payload.get("epsilon")
+                    "epsilon": payload.get("epsilon"),
                 }
             )
-            if endpoint == "act":
-                bot_state["last_prediction"] = payload.get("prediction")
-            elif endpoint == "train":
-                next_obs = payload.get("next_observation")
-                last_pred = bot_state.get("last_prediction")
-                if (
-                    isinstance(next_obs, (list, tuple))
-                    and isinstance(last_pred, (list, tuple))
-                    and len(next_obs) == len(last_pred)
-                    and len(next_obs) > 0
-                ):
-                    diff = np.subtract(next_obs, last_pred)
-                    mse = float(np.mean(np.square(diff)))
-                    bot_state["prediction_mse"] = mse
 
 
 @app.post("/api/brains")
@@ -1027,15 +959,12 @@ def choose_action_endpoint(brain_id):
     if isinstance(result, dict):
         response_payload = {
             "action": int(result.get("action", 0)),
-            "prediction": result.get("prediction"),
             "weights_ok": bool(result.get("weights_ok", True)),
             "sanitized": result.get("sanitized") or {},
         }
     else:
-        action, prediction = result
         response_payload = {
-            "action": int(action),
-            "prediction": prediction,
+            "action": int(result),
             "weights_ok": True,
             "sanitized": {},
         }

@@ -220,7 +220,6 @@ const healthMetrics = {
   remoteRecoveries: createRollingStats(),
   sanitization: {
     actionObservation: createRollingStats(),
-    actionPrediction: createRollingStats(),
     actionRemote: createRollingStats(),
     trainObservation: createRollingStats(),
     trainNextObservation: createRollingStats(),
@@ -277,7 +276,6 @@ function recordSanitizationMetric(metric, summary) {
 function recordActionSanitization(sanitization) {
   if (!sanitization) return
   recordSanitizationMetric(healthMetrics.sanitization.actionObservation, sanitization.observation)
-  recordSanitizationMetric(healthMetrics.sanitization.actionPrediction, sanitization.prediction)
   recordSanitizationMetric(healthMetrics.sanitization.actionRemote, sanitization.remote)
 }
 
@@ -322,7 +320,6 @@ function maybeLogHealthSummary() {
   const offlineSummary = healthMetrics.remoteFailures.summary()
   const recoverySummary = healthMetrics.remoteRecoveries.summary()
   const actionObsSummary = healthMetrics.sanitization.actionObservation.summary()
-  const actionPredSummary = healthMetrics.sanitization.actionPrediction.summary()
   const actionRemoteSummary = healthMetrics.sanitization.actionRemote.summary()
   const trainObsSummary = healthMetrics.sanitization.trainObservation.summary()
   const trainNextSummary = healthMetrics.sanitization.trainNextObservation.summary()
@@ -336,7 +333,7 @@ function maybeLogHealthSummary() {
   console.log(
     `[Health] Last ${windowSeconds}s | Tick avg ${tickAvg}ms (max ${tickMax}ms, n=${tickSummary.count}) | ` +
       `Remote offline ${formatAggregate(offlineSummary)} | Remote recoveries ${formatAggregate(recoverySummary)} | ` +
-      `Act sanitize obs=${formatAggregate(actionObsSummary)}, pred=${formatAggregate(actionPredSummary)}, remote=${formatAggregate(actionRemoteSummary)} | ` +
+      `Act sanitize obs=${formatAggregate(actionObsSummary)}, remote=${formatAggregate(actionRemoteSummary)} | ` +
       `Train sanitize obs=${formatAggregate(trainObsSummary)}, next=${formatAggregate(trainNextSummary)}, remote=${formatAggregate(trainRemoteSummary)} | ` +
       `Dropped grads ${formatAggregate(droppedSummary)}`
   )
@@ -3066,16 +3063,6 @@ async function tickLoop(context) {
       console.warn(`[${label(context)}] Observation contained invalid values; skipping tick.`)
       return
     }
-    if (Array.isArray(context.lastPrediction) && context.lastPrediction.length === observation.length) {
-      let mse = 0
-      for (let i = 0; i < observation.length; i++) {
-        const diff = (observation[i] ?? 0) - (context.lastPrediction[i] ?? 0)
-        mse += diff * diff
-      }
-      context.lastPredictionError = Math.sqrt(mse / observation.length)
-    } else {
-      context.lastPredictionError = null
-    }
     let reward = computeReward(context, observation)
     reward = clampReward(reward)
 
@@ -3132,30 +3119,23 @@ async function tickLoop(context) {
       actionResult?.sanitization?.remote?.policy?.replaced ?? 0,
       10
     )
-    const predictionReplaced = actionResult?.sanitization?.prediction?.replaced ?? 0
     if (
       actionResult?.weightsOk === false ||
-      (Number.isFinite(predictionReplaced) && predictionReplaced > 0) ||
       (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0)
     ) {
       const actionDetails = {
         observation: actionResult?.sanitization?.observation ?? {},
-        prediction: actionResult?.sanitization?.prediction ?? {},
         remote: actionResult?.sanitization?.remote ?? {},
         trigger: 'act'
       }
       scheduleWeightRecovery(context, 'act-non-finite', actionDetails)
       console.warn(
-        `[${label(context)}] Non-finite prediction output detected; deferring tick until recovery.`
+        `[${label(context)}] Non-finite action distribution detected; deferring tick until recovery.`
       )
       return
     }
 
     const action = actionResult.action
-    const prediction = actionResult.prediction
-    const sanitizedPrediction = Array.isArray(prediction)
-      ? prediction.map(value => sanitizeScalar(value, OBS_VALUE_CLAMP, 0))
-      : null
     await executeAction(context, action)
 
     const actionLabel = ACTIONS[action] ?? String(action)
@@ -3164,8 +3144,6 @@ async function tickLoop(context) {
     context.prevAction = context.lastAction
     context.lastObs = observation
     context.lastAction = action
-    context.lastPrediction = sanitizedPrediction
-
     context.tickCount += 1
     context.generationTicks += 1
     context.cumulativeReward += reward
@@ -3191,11 +3169,8 @@ async function tickLoop(context) {
       }
     }
 
-    const predictionNote = context.lastPredictionError != null
-      ? ` | PredErr: ${context.lastPredictionError.toFixed(3)}`
-      : ''
     console.log(
-      `[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${effectiveEpsilon.toFixed(3)} | Entropy: ${context.behaviorEntropy.toFixed(2)}${predictionNote}`
+      `[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${effectiveEpsilon.toFixed(3)} | Entropy: ${context.behaviorEntropy.toFixed(2)}`
     )
     maybeTriggerAutosave()
     await maybeCompleteGeneration(context)
@@ -4011,8 +3986,6 @@ function createContext(index, options = {}) {
     lastObs: null,
     lastAction: null,
     prevAction: null,
-    lastPrediction: null,
-    lastPredictionError: null,
     lastPos: null,
     lastHealth: 20,
     lastFood: 20,
