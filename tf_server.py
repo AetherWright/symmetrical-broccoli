@@ -6,10 +6,12 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
-from flask import Flask, jsonify, request
+from fastapi import Body, FastAPI, HTTPException
+import uvicorn
 
 try:
     import h5py  # type: ignore
@@ -89,7 +91,7 @@ def _resolve_storage_path(*segments, create=False):
         os.makedirs(directory, exist_ok=True)
     return directory
 
-app = Flask(__name__)
+app = FastAPI()
 
 BRAINS = {}
 STATE_LOCK = threading.Lock()
@@ -211,7 +213,7 @@ def _sanitize_vector(vector, expected_size=None, label="vector"):
     try:
         arr = np.asarray(vector, dtype=np.float32).reshape(-1)
     except (TypeError, ValueError):
-        app.logger.warning("Failed to coerce %s payload into float array", label)
+        LOGGER.warning("Failed to coerce %s payload into float array", label)
         return None, 0, 0, False
     invalid_mask = ~np.isfinite(arr)
     replaced = int(np.count_nonzero(invalid_mask))
@@ -231,7 +233,7 @@ def _sanitize_vector(vector, expected_size=None, label="vector"):
         else:
             arr = np.pad(arr, (0, expected_size - arr.size), constant_values=0.0)
     if replaced or clipped or adjusted:
-        app.logger.warning(
+        LOGGER.warning(
             "Sanitized %s payload (replaced=%d, clipped=%d, adjusted=%s)",
             label,
             replaced,
@@ -576,7 +578,7 @@ class RemoteBrain:
             finite = bool(tf.reduce_all(tf.math.is_finite(tensor)).numpy())
             if not finite:
                 dropped += 1
-                app.logger.warning(
+                LOGGER.warning(
                     "Dropped non-finite gradients for variable %s",
                     getattr(var, "name", "?"),
                 )
@@ -647,7 +649,7 @@ class RemoteBrain:
         self.model.set_weights(final_weights)
         self.optimizer.sync_slow_variables(self.model.trainable_variables)
         if meta["sanitized"]:
-            app.logger.warning(
+            LOGGER.warning(
                 "Sanitized %s weights (replaced=%d, clipped=%d)",
                 reason,
                 meta["replaced"],
@@ -668,7 +670,7 @@ class RemoteBrain:
                 final_weights.append(array)
             self.model.set_weights(final_weights)
             self.optimizer.sync_slow_variables(self.model.trainable_variables)
-            app.logger.warning(
+            LOGGER.warning(
                 "Sanitized %s weights (replaced=%d, clipped=%d)",
                 reason,
                 meta["replaced"],
@@ -761,7 +763,7 @@ class RemoteBrain:
                             nan=1.0 / max(1, self.action_count),
                         )
                     if sanitized_policy:
-                        app.logger.warning(
+                        LOGGER.warning(
                             "Sanitized action probabilities due to non-finite values"
                         )
                     weights_ok = replaced == 0
@@ -809,7 +811,7 @@ class RemoteBrain:
                 try:
                     obs, obs_meta = self._prepare_observation(observation, "observation")
                 except ValueError:
-                    app.logger.warning("Skipping train call due to missing observation payload")
+                    LOGGER.warning("Skipping train call due to missing observation payload")
                     results[index] = {
                         "trained": False,
                         "weights_ok": True,
@@ -865,7 +867,7 @@ class RemoteBrain:
                 try:
                     bounded_action = int(action_value)
                 except (TypeError, ValueError):
-                    app.logger.warning("Received invalid action index: %s", action_value)
+                    LOGGER.warning("Received invalid action index: %s", action_value)
                     results[index] = {
                         "trained": False,
                         "weights_ok": True,
@@ -891,10 +893,10 @@ class RemoteBrain:
                 try:
                     reward_float = float(reward_value)
                 except (TypeError, ValueError):
-                    app.logger.warning("Received invalid reward value: %s", reward_value)
+                    LOGGER.warning("Received invalid reward value: %s", reward_value)
                     reward_float = 0.0
                 if not np.isfinite(reward_float):
-                    app.logger.warning("Reward contained non-finite value: %s", reward_value)
+                    LOGGER.warning("Reward contained non-finite value: %s", reward_value)
                     reward_float = 0.0
                 scaled_reward = float(np.clip(reward_float, -1.0, 1.0))
 
@@ -912,7 +914,7 @@ class RemoteBrain:
                                 next_observation, "next_observation"
                             )
                         except ValueError:
-                            app.logger.warning(
+                            LOGGER.warning(
                                 "Skipping next observation sanitization due to invalid payload"
                             )
 
@@ -961,7 +963,7 @@ class RemoteBrain:
                 ]
                 cleaned_grads, dropped, clipped_grads = self._filter_gradients(grads_and_vars)
                 if dropped:
-                    app.logger.warning(
+                    LOGGER.warning(
                         "Skipped %d gradient tensors due to non-finite values", dropped
                     )
                 weights_ok = True
@@ -975,7 +977,7 @@ class RemoteBrain:
                     self.optimizer.apply_gradients(cleaned_grads)
                     weights_ok = self._weights_are_finite()
                     if not weights_ok:
-                        app.logger.error(
+                        LOGGER.error(
                             "Model weights contain non-finite values after training step"
                         )
                     weight_meta = self._sanitize_model_weights("post-train-batch")
@@ -1163,12 +1165,12 @@ class RemoteBrain:
                             weight_var.assign(value)
                             loaded_variables += 1
                         except Exception:  # pylint: disable=broad-except
-                            app.logger.exception(
+                            LOGGER.exception(
                                 "Failed assigning partial weight %s for layer %s", weight_name, layer.name
                             )
                 return loaded_variables, attempted_variables
         except Exception:  # pylint: disable=broad-except
-            app.logger.exception("Partial weight load failed for %s", weights_path)
+            LOGGER.exception("Partial weight load failed for %s", weights_path)
             return loaded_variables, attempted_variables
 
     def load_weights(self, directory):
@@ -1191,9 +1193,9 @@ class RemoteBrain:
                         "replaced": int(weight_meta.get("replaced", 0)),
                         "clipped": int(weight_meta.get("clipped", 0)),
                     }
-                app.logger.info("Restored weights exactly from %s", weights_path)
+                LOGGER.info("Restored weights exactly from %s", weights_path)
             except ValueError as exc:
-                app.logger.warning(
+                LOGGER.warning(
                     "Exact weight load failed for %s: %s. Attempting relaxed restore.",
                     weights_path,
                     exc,
@@ -1212,9 +1214,9 @@ class RemoteBrain:
                             "replaced": int(weight_meta.get("replaced", 0)),
                             "clipped": int(weight_meta.get("clipped", 0)),
                         }
-                    app.logger.info("Restored compatible weights with skip_mismatch from %s", weights_path)
+                    LOGGER.info("Restored compatible weights with skip_mismatch from %s", weights_path)
                 except (TypeError, ValueError) as relaxed_exc:
-                    app.logger.info(
+                    LOGGER.info(
                         "Relaxed weight load unavailable for %s: %s",
                         weights_path,
                         relaxed_exc,
@@ -1234,7 +1236,7 @@ class RemoteBrain:
                                 "replaced": int(weight_meta.get("replaced", 0)),
                                 "clipped": int(weight_meta.get("clipped", 0)),
                             }
-                        app.logger.info(
+                        LOGGER.info(
                             "Partially restored %s/%s variables from %s",
                             loaded_vars,
                             attempted or "?",
@@ -1247,29 +1249,29 @@ class RemoteBrain:
                             "loaded_variables": loaded_vars,
                             "attempted_variables": attempted,
                         }
-                        app.logger.warning(
+                        LOGGER.warning(
                             "No compatible tensors found when loading %s; keeping initialized weights",
                             weights_path,
                         )
             if loaded_info["status"] != "fresh":
                 self.optimizer.sync_slow_variables(self.model.trainable_variables)
             else:
-                app.logger.info("No compatible weights found at %s; using fresh initialization", weights_path)
+                LOGGER.info("No compatible weights found at %s; using fresh initialization", weights_path)
             return loaded_info
 
 
 def require_brain(brain_id):
     brain = BRAINS.get(brain_id)
     if brain is None:
-        return None, (jsonify({"error": "Unknown brain"}), 404)
-    return brain, None
+        raise HTTPException(status_code=404, detail="Unknown brain")
+    return brain
 
 
 def _execute(endpoint, func, *args, **kwargs):
     try:
         return WORKERS.run(endpoint, func, *args, **kwargs)
     except Exception as exc:  # pylint: disable=broad-except
-        app.logger.exception("Endpoint '%s' task failed", endpoint)
+        LOGGER.exception("Endpoint '%s' task failed", endpoint)
         raise RuntimeError(f"Failed to process {endpoint} request") from exc
 
 
@@ -1300,31 +1302,31 @@ def log_request(bot_id, endpoint, payload):
 
 
 @app.post("/api/brains")
-def create_brain_endpoint():
-    payload = request.get_json(force=True) or {}
+def create_brain_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
     input_size = int(payload.get("input_size", 0))
     action_count = int(payload.get("action_count", 0))
     if input_size <= 0 or action_count <= 0:
-        return jsonify({"error": "Invalid brain dimensions"}), 400
+        raise HTTPException(status_code=400, detail="Invalid brain dimensions")
     brain_id = str(uuid.uuid4())
     BRAINS[brain_id] = RemoteBrain(input_size, action_count)
-    return jsonify({"brain_id": brain_id})
+    return {"brain_id": brain_id}
 
 
-@app.post("/api/brains/<brain_id>/act")
-def choose_action_endpoint(brain_id):
-    brain, error = require_brain(brain_id)
-    if error:
-        return error
-    payload = request.get_json(force=True) or {}
+@app.post("/api/brains/{brain_id}/act")
+def choose_action_endpoint(
+    brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)
+):
+    brain = require_brain(brain_id)
+    payload = payload or {}
     observation = payload.get("observation")
     if not isinstance(observation, (list, tuple)):
-        return jsonify({"error": "Observation must be a list"}), 400
+        raise HTTPException(status_code=400, detail="Observation must be a list")
     epsilon = float(payload.get("epsilon", 0.1))
     try:
         result = _execute("act", brain.choose_action, observation, epsilon)
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if isinstance(result, dict):
         response_payload = {
             "action": int(result.get("action", 0)),
@@ -1338,18 +1340,16 @@ def choose_action_endpoint(brain_id):
             "sanitized": {},
         }
     log_request(payload.get("bot_id"), "act", {**payload, **response_payload})
-    return jsonify(response_payload)
+    return response_payload
 
 
-@app.post("/api/brains/<brain_id>/train")
-def train_endpoint(brain_id):
-    brain, error = require_brain(brain_id)
-    if error:
-        return error
-    payload = request.get_json(force=True) or {}
+@app.post("/api/brains/{brain_id}/train")
+def train_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    brain = require_brain(brain_id)
+    payload = payload or {}
     observation = payload.get("observation")
     if not isinstance(observation, (list, tuple)):
-        return jsonify({"error": "Observation must be a list"}), 400
+        raise HTTPException(status_code=400, detail="Observation must be a list")
     next_observation = payload.get("next_observation")
     try:
         result = _execute(
@@ -1361,7 +1361,7 @@ def train_endpoint(brain_id):
             next_observation if isinstance(next_observation, (list, tuple)) else None,
         )
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if isinstance(result, dict):
         response_payload = {
             "trained": bool(result.get("trained")),
@@ -1372,18 +1372,21 @@ def train_endpoint(brain_id):
     else:
         response_payload = {"trained": bool(result), "weights_ok": True}
     log_request(payload.get("bot_id"), "train", {**payload, **response_payload})
-    return jsonify(response_payload)
+    return response_payload
 
 
 @app.post("/api/brains/batch_act")
-def batch_act_endpoint():
-    payload = request.get_json(force=True) or {}
+def batch_act_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
     requests = payload.get("requests")
     if not isinstance(requests, list):
-        return jsonify({"error": "Requests must be a list"}), 400
-    results = [None] * len(requests)
-    grouped = {}
+        raise HTTPException(status_code=400, detail="Requests must be a list")
+    results: List[Optional[Dict[str, Any]]] = [None] * len(requests)
+    grouped: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
     for index, item in enumerate(requests):
+        if not isinstance(item, dict):
+            results[index] = {"error": "Invalid request"}
+            continue
         brain_id = item.get("brain_id")
         if not brain_id:
             results[index] = {"error": "Missing brain_id"}
@@ -1395,9 +1398,9 @@ def batch_act_endpoint():
             for index, _ in entries:
                 results[index] = {"error": "Unknown brain"}
             continue
-        observations = []
-        epsilons = []
-        valid_indices = []
+        observations: List[List[Any]] = []
+        epsilons: List[float] = []
+        valid_indices: List[int] = []
         for index, item in entries:
             observation = item.get("observation")
             if not isinstance(observation, (list, tuple)):
@@ -1411,8 +1414,9 @@ def batch_act_endpoint():
         try:
             brain_results = _execute("act", brain.choose_actions_batch, observations, epsilons)
         except RuntimeError as exc:
+            error_payload = {"error": str(exc)}
             for index in valid_indices:
-                results[index] = {"error": str(exc)}
+                results[index] = error_payload
             continue
         for offset, index in enumerate(valid_indices):
             entry_result = brain_results[offset] if offset < len(brain_results) else None
@@ -1429,26 +1433,25 @@ def batch_act_endpoint():
             results[index] = response_payload
         for index, item in entries:
             response_payload = results[index] or {}
-            log_request(
-                item.get("bot_id"),
-                "act",
-                {**item, **response_payload},
-            )
+            log_request(item.get("bot_id"), "act", {**item, **response_payload})
     for index, value in enumerate(results):
         if value is None:
             results[index] = {"error": "Request was not processed"}
-    return jsonify({"results": results})
+    return {"results": results}
 
 
 @app.post("/api/brains/batch_train")
-def batch_train_endpoint():
-    payload = request.get_json(force=True) or {}
+def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
     requests = payload.get("requests")
     if not isinstance(requests, list):
-        return jsonify({"error": "Requests must be a list"}), 400
-    results = [None] * len(requests)
-    grouped = {}
+        raise HTTPException(status_code=400, detail="Requests must be a list")
+    results: List[Optional[Dict[str, Any]]] = [None] * len(requests)
+    grouped: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
     for index, item in enumerate(requests):
+        if not isinstance(item, dict):
+            results[index] = {"error": "Invalid request"}
+            continue
         brain_id = item.get("brain_id")
         if not brain_id:
             results[index] = {"error": "Missing brain_id"}
@@ -1460,11 +1463,11 @@ def batch_train_endpoint():
             for index, _ in entries:
                 results[index] = {"error": "Unknown brain"}
             continue
-        observations = []
-        actions = []
-        rewards = []
-        next_observations = []
-        valid_indices = []
+        observations: List[List[Any]] = []
+        actions: List[Any] = []
+        rewards: List[Any] = []
+        next_observations: List[Any] = []
+        valid_indices: List[int] = []
         for index, item in entries:
             observation = item.get("observation")
             if not isinstance(observation, (list, tuple)):
@@ -1497,8 +1500,9 @@ def batch_train_endpoint():
                 next_observations,
             )
         except RuntimeError as exc:
+            error_payload = {"error": str(exc)}
             for index in valid_indices:
-                results[index] = {"error": str(exc)}
+                results[index] = error_payload
             continue
         for offset, index in enumerate(valid_indices):
             entry_result = brain_results[offset] if offset < len(brain_results) else None
@@ -1516,140 +1520,123 @@ def batch_train_endpoint():
             }
         for index, item in entries:
             response_payload = results[index] or {}
-            log_request(
-                item.get("bot_id"),
-                "train",
-                {**item, **response_payload},
-            )
+            log_request(item.get("bot_id"), "train", {**item, **response_payload})
     for index, value in enumerate(results):
         if value is None:
             results[index] = {"error": "Request was not processed"}
-    return jsonify({"results": results})
+    return {"results": results}
 
 
-@app.post("/api/brains/<brain_id>/copy")
-def copy_endpoint(brain_id):
-    brain, error = require_brain(brain_id)
-    if error:
-        return error
-    payload = request.get_json(force=True) or {}
+@app.post("/api/brains/{brain_id}/copy")
+def copy_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    brain = require_brain(brain_id)
+    payload = payload or {}
     source_id = payload.get("source_id")
-    source, source_error = require_brain(source_id)
-    if source_error:
-        return source_error
+    if not source_id:
+        raise HTTPException(status_code=400, detail="source_id is required")
+    source = require_brain(source_id)
     try:
         _execute("copy", brain.copy_from, source)
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
-    return jsonify({"status": "ok"})
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "ok"}
 
 
-@app.post("/api/brains/<brain_id>/average")
-def average_endpoint(brain_id):
-    brain, error = require_brain(brain_id)
-    if error:
-        return error
-    payload = request.get_json(force=True) or {}
+@app.post("/api/brains/{brain_id}/average")
+def average_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    brain = require_brain(brain_id)
+    payload = payload or {}
     source_ids = payload.get("source_ids") or []
     sources = []
     for source_id in source_ids:
-        src, src_error = require_brain(source_id)
-        if src_error:
-            return src_error
-        sources.append(src)
+        sources.append(require_brain(source_id))
     try:
         _execute("average", brain.average_from, sources)
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
-    return jsonify({"status": "ok"})
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "ok"}
 
 
-@app.post("/api/brains/<brain_id>/mutate")
-def mutate_endpoint(brain_id):
-    brain, error = require_brain(brain_id)
-    if error:
-        return error
-    payload = request.get_json(force=True) or {}
+@app.post("/api/brains/{brain_id}/mutate")
+def mutate_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    brain = require_brain(brain_id)
+    payload = payload or {}
     stddev = float(payload.get("stddev", 0.02))
     if stddev <= 0:
-        return jsonify({"error": "Stddev must be positive"}), 400
+        raise HTTPException(status_code=400, detail="Stddev must be positive")
     try:
         _execute("mutate", brain.mutate, stddev)
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
-    return jsonify({"status": "ok"})
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "ok"}
 
 
-@app.post("/api/brains/<brain_id>/save")
-def save_endpoint(brain_id):
-    brain, error = require_brain(brain_id)
-    if error:
-        return error
-    payload = request.get_json(force=True) or {}
+@app.post("/api/brains/{brain_id}/save")
+def save_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    brain = require_brain(brain_id)
+    payload = payload or {}
     label = payload.get("path") or brain_id
     target_dir = _resolve_storage_path("brains", label, create=True)
     try:
         _execute("save", brain.save, target_dir)
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
-    return jsonify({"status": "ok", "path": label})
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "ok", "path": label}
 
 
 @app.post("/api/brains/load")
-def load_endpoint():
-    payload = request.get_json(force=True) or {}
+def load_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
     path_label = payload.get("path")
     input_size = int(payload.get("input_size", 0))
     action_count = int(payload.get("action_count", 0))
     if not path_label or input_size <= 0 or action_count <= 0:
-        return jsonify({"error": "Invalid load request"}), 400
+        raise HTTPException(status_code=400, detail="Invalid load request")
     path = _resolve_storage_path("brains", path_label, create=False)
     if not os.path.isdir(path):
-        return jsonify({"error": "Checkpoint not found"}), 404
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
     brain_id = str(uuid.uuid4())
     brain = RemoteBrain(input_size, action_count)
     try:
         load_result = _execute("load", brain.load_weights, path)
     except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     BRAINS[brain_id] = brain
     response = {"brain_id": brain_id}
     if isinstance(load_result, dict):
-        response.update(
-            {key: value for key, value in load_result.items() if key not in {"path"}}
-        )
+        response.update({key: value for key, value in load_result.items() if key not in {"path"}})
         if load_result.get("status") in {"exact", "relaxed", "partial"}:
             response["source_path"] = load_result.get("path")
-    return jsonify(response)
+    return response
 
 
 @app.post("/api/state/save")
-def save_state_endpoint():
-    payload = request.get_json(force=True) or {}
+def save_state_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
     label = payload.get("path")
     if not label:
-        return jsonify({"error": "Path is required"}), 400
+        raise HTTPException(status_code=400, detail="Path is required")
     state = payload.get("state") or {}
     path = _resolve_storage_path("state", label, create=True)
     state_path = os.path.join(path, "brain_state.json")
     with open(state_path, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=2)
-    return jsonify({"status": "ok", "path": label})
+    return {"status": "ok", "path": label}
 
 
 @app.post("/api/state/load")
-def load_state_endpoint():
-    payload = request.get_json(force=True) or {}
+def load_state_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
+    payload = payload or {}
     label = payload.get("path")
     if not label:
-        return jsonify({"error": "Path is required"}), 400
+        raise HTTPException(status_code=400, detail="Path is required")
     path = _resolve_storage_path("state", label, create=False)
     state_path = os.path.join(path, "brain_state.json")
     if not os.path.exists(state_path):
-        return jsonify({"state": None})
+        return {"state": None}
     with open(state_path, "r", encoding="utf-8") as handle:
         state = json.load(handle)
-    return jsonify({"state": state})
+    return {"state": state}
 
 
 @app.get("/status")
@@ -1663,10 +1650,11 @@ def status_endpoint():
             "brain_count": len(BRAINS),
             "bots": STATUS["bots"],
             "recent_requests": STATUS["requests"][-10:],
-            "workers": STATUS["workers"]
+            "workers": STATUS["workers"],
         }
-    return jsonify(payload)
+    return payload
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("TF_SERVER_PORT", 5000))
+    uvicorn.run("tf_server:app", host="0.0.0.0", port=port, log_level="info")
