@@ -606,7 +606,7 @@ const ACTIONS = [
   ...Object.keys(CRAFTING_ACTIONS)
 ]
 
-const TICK_RATE = 1000
+const TICK_RATE = 50
 const EPSILON_START = 0.25
 const EPSILON_MIN = 0.05
 const EPSILON_DECAY = 0.999
