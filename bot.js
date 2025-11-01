@@ -148,6 +148,10 @@ const NEW_BRAIN_MUTATION_MAX = Math.max(
   NEW_BRAIN_MUTATION_STDDEV,
   readNumberEnv('NEW_BRAIN_MUTATION_MAX', 0.08, { min: 0 })
 )
+const MIN_CLEAN_BRAIN_SOURCES = Math.max(
+  0,
+  Math.floor(readNumberEnv('MIN_CLEAN_BRAIN_SOURCES', 5, { min: 0 }))
+)
 const MUTATION_REWARD_FACTOR = readNumberEnv('REWARD_MUTATION_FACTOR', 0.002, { min: 0 })
 const OBS_VALUE_CLAMP = readNumberEnv('OBS_VALUE_CLAMP', 1000, { min: 1 })
 const MAX_REWARD_MAGNITUDE = readNumberEnv('MAX_REWARD_MAGNITUDE', 50, { min: 1 })
@@ -622,6 +626,87 @@ function gatherCleanBrainSources({ exclude = [] } = {}) {
   return sources
 }
 
+async function reinitializeContextBrain(context, reason = 'reinitialize', details = {}) {
+  if (!context) {
+    return { success: false, sourceCount: 0, mode: 'none' }
+  }
+
+  try {
+    await ensureBaselineReady()
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      throw err
+    }
+    console.error(`[${label(context)}] Failed to prepare baseline during ${reason}:`, err)
+    return { success: false, sourceCount: 0, mode: 'reinitialize-failed' }
+  }
+
+  let brain
+  try {
+    brain = await createBrain(OBS_SIZE, ACTIONS.length)
+  } catch (err) {
+    if (isRemoteBrainUnavailableError(err)) {
+      throw err
+    }
+    console.error(`[${label(context)}] Failed to allocate replacement brain during ${reason}:`, err)
+    return { success: false, sourceCount: 0, mode: 'reinitialize-failed' }
+  }
+
+  brain.owner = label(context)
+
+  if (baselineBrain && baselineBrain.id && brain.id && brain.id !== baselineBrain.id) {
+    try {
+      await copyWeights(brain, baselineBrain)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        throw err
+      }
+      console.error(
+        `[${label(context)}] Failed to seed replacement brain from baseline during ${reason}:`,
+        err
+      )
+    }
+  }
+
+  if (!Array.isArray(context.pendingMutations)) {
+    context.pendingMutations = []
+  }
+
+  const mutationQueue = [...context.pendingMutations]
+  context.pendingMutations = []
+
+  for (let i = 0; i < mutationQueue.length; i++) {
+    const stddev = Math.min(
+      NEW_BRAIN_MUTATION_MAX,
+      Math.max(0, mutationQueue[i] ?? 0)
+    )
+    if (!Number.isFinite(stddev) || stddev <= 0) {
+      continue
+    }
+    try {
+      await mutateWeights(brain, stddev)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        const remaining = mutationQueue.slice(i)
+        context.pendingMutations = remaining.concat(context.pendingMutations)
+        throw err
+      }
+      console.error(
+        `[${label(context)}] Failed to apply pending mutation (${stddev}) during ${reason}:`,
+        err
+      )
+    }
+  }
+
+  context.brain = brain
+  markContextWeightsHealthy(context, reason)
+  console.warn(
+    `[${label(context)}] Reinitialized brain from baseline after ${reason}.`,
+    details
+  )
+  return { success: true, sourceCount: 0, mode: 'reinitialize' }
+}
+
 async function rebuildContextWeights(context, reason = 'unknown', details = {}) {
   if (!context?.brain?.id) {
     return { success: false, sourceCount: 0, mode: 'none' }
@@ -629,6 +714,26 @@ async function rebuildContextWeights(context, reason = 'unknown', details = {}) 
 
   const exclude = new Set([context])
   let sources = gatherCleanBrainSources({ exclude })
+
+  if (sources.length < MIN_CLEAN_BRAIN_SOURCES) {
+    console.warn(
+      `[${label(context)}] Only ${sources.length} clean brain source${
+        sources.length === 1 ? '' : 's'
+      } available; reinitializing for ${reason}.`
+    )
+    try {
+      return await reinitializeContextBrain(context, reason, details)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        throw err
+      }
+      console.error(
+        `[${label(context)}] Brain reinitialization failed during ${reason}:`,
+        err
+      )
+      return { success: false, sourceCount: sources.length, mode: 'reinitialize-failed' }
+    }
+  }
 
   if (!sources.length) {
     try {
