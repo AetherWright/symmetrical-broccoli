@@ -135,6 +135,14 @@ BRAIN_CONFIG = {
     "hebbian_learning_rate": 0.01,
     "hebbian_decay_multiplier": 1.5,
     "hebbian_clip": 0.75,
+    "learning_rate": 2e-3,
+    "cosine_first_decay_steps": 1024,
+    "cosine_t_mul": 2.0,
+    "cosine_m_mul": 1.0,
+    "cosine_alpha": 0.0,
+    "lion_beta_1": 0.9,
+    "lion_beta_2": 0.99,
+    "lion_ema_momentum": 0.99,
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
@@ -451,8 +459,24 @@ class RemoteBrain:
         self.action_count = int(action_count)
         self.model = build_model(self.input_size, self.action_count)
         self.hebbian_layers = list(getattr(self.model, "_hebbian_layers", []))
-        nadam = tf.keras.optimizers.Nadam(learning_rate=2e-3)
-        self.optimizer = LookaheadOptimizer(nadam, sync_period=6, slow_step_size=0.5)
+        first_decay_steps = max(1, int(BRAIN_CONFIG["cosine_first_decay_steps"]))
+        learning_rate = float(BRAIN_CONFIG["learning_rate"])
+        cosine_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=learning_rate,
+            first_decay_steps=first_decay_steps,
+            t_mul=float(BRAIN_CONFIG["cosine_t_mul"]),
+            m_mul=float(BRAIN_CONFIG["cosine_m_mul"]),
+            alpha=float(BRAIN_CONFIG["cosine_alpha"]),
+        )
+        lion = tf.keras.optimizers.Lion(
+            learning_rate=cosine_schedule,
+            beta_1=float(BRAIN_CONFIG["lion_beta_1"]),
+            beta_2=float(BRAIN_CONFIG["lion_beta_2"]),
+            use_ema=True,
+            ema_momentum=float(BRAIN_CONFIG["lion_ema_momentum"]),
+        )
+        self.optimizer = LookaheadOptimizer(lion, sync_period=6, slow_step_size=0.5)
+        self.learning_rate_schedule = cosine_schedule
         self.prediction_weight = tf.constant(1.0, dtype=tf.float32)
         self._lock = threading.RLock()
 
@@ -469,6 +493,28 @@ class RemoteBrain:
         }
         metadata["sanitized"] = bool(replaced or clipped or adjusted)
         return prepared.reshape(1, -1), metadata
+
+    def _current_learning_rate(self):
+        base_optimizer = getattr(self.optimizer, "optimizer", None)
+        if base_optimizer is None:
+            return None
+        learning_rate = getattr(base_optimizer, "learning_rate", None)
+        if learning_rate is None:
+            return None
+        try:
+            if isinstance(learning_rate, tf.keras.optimizers.schedules.LearningRateSchedule):
+                iterations = getattr(base_optimizer, "iterations", None)
+                step = iterations if iterations is not None else tf.constant(0, dtype=tf.int64)
+                value = learning_rate(step)
+            else:
+                value = learning_rate
+            if isinstance(value, tf.Tensor):
+                value = value.numpy()
+            elif hasattr(value, "numpy"):
+                value = value.numpy()
+            return float(value)
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _sanitize_prediction_output(self, tensor):
         array = np.asarray(tensor, dtype=np.float32).reshape(-1)
@@ -688,6 +734,7 @@ class RemoteBrain:
                 "trained": bool(cleaned_grads),
                 "weights_ok": bool(weights_ok),
                 "dropped_gradients": int(dropped),
+                "learning_rate": self._current_learning_rate(),
                 "sanitized": {
                     "observation": obs_meta,
                     "next_observation": next_meta
