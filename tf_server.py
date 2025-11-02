@@ -118,34 +118,6 @@ app = FastAPI()
 
 BRAINS = {}
 STATE_LOCK = threading.Lock()
-STATUS = {
-    "started_at": time.time(),
-    "total_requests": 0,
-    "requests": [],
-    "bots": {},
-    "workers": {}
-}
-
-GPU_INFO = _configure_tensorflow_devices()
-STATUS["accelerators"] = {"gpu": GPU_INFO}
-
-FLOAT_POLICY = _configure_float_policy(GPU_INFO)
-TF_FLOAT = FLOAT_POLICY["tf"]
-NP_FLOAT = FLOAT_POLICY["np"]
-STATUS["float_policy"] = {
-    "floatx": FLOAT_POLICY["floatx"],
-    "using_gpu": FLOAT_POLICY["using_gpu"],
-}
-STATUS["policy_guard"] = {
-    "act_strike_window": ACT_SANITIZATION_STRIKE_WINDOW,
-    "act_strike_threshold": ACT_SANITIZATION_STRIKE_THRESHOLD,
-    "act_force_threshold": ACT_SANITIZATION_FORCE_THRESHOLD,
-}
-LOGGER.info(
-    "TensorFlow float policy set to %s (using_gpu=%s).",
-    FLOAT_POLICY["floatx"],
-    FLOAT_POLICY["using_gpu"],
-)
 
 
 def natural_log_relu(inputs):
@@ -187,6 +159,35 @@ ACT_SANITIZATION_STRIKE_THRESHOLD = max(1, _read_int("TF_SERVER_ACT_STRIKE_THRES
 ACT_SANITIZATION_FORCE_THRESHOLD = max(
     ACT_SANITIZATION_STRIKE_THRESHOLD,
     _read_int("TF_SERVER_ACT_FORCE_THRESHOLD", 4),
+)
+
+STATUS = {
+    "started_at": time.time(),
+    "total_requests": 0,
+    "requests": [],
+    "bots": {},
+    "workers": {}
+}
+
+GPU_INFO = _configure_tensorflow_devices()
+STATUS["accelerators"] = {"gpu": GPU_INFO}
+
+FLOAT_POLICY = _configure_float_policy(GPU_INFO)
+TF_FLOAT = FLOAT_POLICY["tf"]
+NP_FLOAT = FLOAT_POLICY["np"]
+STATUS["float_policy"] = {
+    "floatx": FLOAT_POLICY["floatx"],
+    "using_gpu": FLOAT_POLICY["using_gpu"],
+}
+STATUS["policy_guard"] = {
+    "act_strike_window": ACT_SANITIZATION_STRIKE_WINDOW,
+    "act_strike_threshold": ACT_SANITIZATION_STRIKE_THRESHOLD,
+    "act_force_threshold": ACT_SANITIZATION_FORCE_THRESHOLD,
+}
+LOGGER.info(
+    "TensorFlow float policy set to %s (using_gpu=%s).",
+    FLOAT_POLICY["floatx"],
+    FLOAT_POLICY["using_gpu"],
 )
 
 
