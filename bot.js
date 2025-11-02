@@ -38,6 +38,7 @@ const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
 const PREFIXES = ['', 'Mc', 'Von', 'De', "O'", 'El']
+const LINEAGE_VARIANT_SUFFIXES = ['Nova', 'Flux', 'Echo', 'Shard', 'Pulse', 'Varia', 'Drift', 'Spark']
 
 const LINEAGE_ROOT_NAME = 'VonBasaltdeep'
 const FERAL_DEFAULT_RATIO = Math.min(0.5, Math.max(0, Number.parseFloat(process.env.FERAL_RATIO ?? '0.2')))
@@ -47,6 +48,61 @@ const MORALE_BASELINE = 0.55
 const REWARD_MUTATION_INTERVAL = Math.max(500, parseInt(process.env.REWARD_MUTATION_INTERVAL ?? '2500', 10))
 const REWARD_MUTATION_JITTER = Math.max(100, parseInt(process.env.REWARD_MUTATION_JITTER ?? '600', 10))
 const CROSSOVER_GENERATION_INTERVAL = Math.max(1, parseInt(process.env.CROSSOVER_INTERVAL ?? '5', 10))
+
+const LINEAGE_DOMINANCE_SHARE_THRESHOLD = readNumberEnv('BOT_LINEAGE_DOMINANCE_SHARE', 0.62, {
+  min: 0.3,
+  max: 0.95
+})
+const LINEAGE_DOMINANCE_GAP_THRESHOLD = readNumberEnv('BOT_LINEAGE_DOMINANCE_GAP', 0.18, {
+  min: 0,
+  max: 0.6
+})
+const LINEAGE_DOMINANCE_STREAK_THRESHOLD = Math.max(
+  1,
+  Math.floor(readNumberEnv('BOT_LINEAGE_DOMINANCE_STREAK', 2, { min: 1, max: 10 }))
+)
+const LINEAGE_DOMINANCE_MUTATION_MULTIPLIER = readNumberEnv(
+  'BOT_LINEAGE_DOMINANCE_MUTATION',
+  1.35,
+  { min: 0.1, max: 5 }
+)
+const LINEAGE_DOMINANCE_EXTRA_MUTATIONS = Math.max(
+  1,
+  Math.floor(readNumberEnv('BOT_LINEAGE_DOMINANCE_EXTRA_MUTATIONS', 2, { min: 1, max: 6 }))
+)
+const LINEAGE_DOMINANCE_COOLDOWN_GENERATIONS = Math.max(
+  1,
+  Math.floor(readNumberEnv('BOT_LINEAGE_DOMINANCE_COOLDOWN', 3, { min: 1, max: 12 }))
+)
+
+const NON_FINITE_STRIKE_WINDOW_MS = Math.max(
+  1000,
+  Math.floor(readNumberEnv('BOT_NON_FINITE_STRIKE_WINDOW_MS', 120000, { min: 1000, max: 3600000 }))
+)
+const NON_FINITE_REASON_THRESHOLD = Math.max(
+  2,
+  Math.floor(readNumberEnv('BOT_NON_FINITE_REASON_THRESHOLD', 3, { min: 1, max: 10 }))
+)
+const NON_FINITE_TOTAL_THRESHOLD = Math.max(
+  NON_FINITE_REASON_THRESHOLD,
+  Math.floor(readNumberEnv('BOT_NON_FINITE_TOTAL_THRESHOLD', 4, { min: 2, max: 16 }))
+)
+const NON_FINITE_MAX_ESCALATIONS = Math.max(
+  1,
+  Math.floor(readNumberEnv('BOT_NON_FINITE_MAX_ESCALATIONS', 2, { min: 1, max: 6 }))
+)
+const NON_FINITE_MUTATION_MULTIPLIER = readNumberEnv('BOT_NON_FINITE_MUTATION_MULTIPLIER', 0.75, {
+  min: 0.05,
+  max: 4
+})
+const NON_FINITE_MUTATION_MIN = readNumberEnv('BOT_NON_FINITE_MUTATION_MIN', 0.05, {
+  min: 0,
+  max: 2
+})
+const NON_FINITE_EPSILON_BOOST = readNumberEnv('BOT_NON_FINITE_EPSILON_BOOST', 0.35, {
+  min: 0,
+  max: 0.95
+})
 
 const DEFAULT_MINING_TOOL_PREFERENCES = ['pickaxe', 'axe', 'shovel']
 const TOOL_TIER_WEIGHTS = [
@@ -717,6 +773,93 @@ function noteRemoteBrainOnline(context) {
   context.waitingForBrain = false
 }
 
+function ensureNonFiniteTracker(context) {
+  if (!context) return null
+  if (!context.nonFiniteTracker) {
+    context.nonFiniteTracker = {
+      act: 0,
+      train: 0,
+      total: 0,
+      escalations: 0,
+      lastReset: Date.now(),
+      lastReason: null,
+      lastEscalationAt: 0
+    }
+  }
+  return context.nonFiniteTracker
+}
+
+function resetNonFiniteTracker(context) {
+  const tracker = ensureNonFiniteTracker(context)
+  if (!tracker) return
+  tracker.act = 0
+  tracker.train = 0
+  tracker.total = 0
+  tracker.escalations = 0
+  tracker.lastReason = null
+  tracker.lastEscalationAt = 0
+  tracker.lastReset = Date.now()
+}
+
+function registerNonFiniteStrike(context, reason) {
+  const tracker = ensureNonFiniteTracker(context)
+  if (!tracker) return
+  const now = Date.now()
+  if (now - tracker.lastReset > NON_FINITE_STRIKE_WINDOW_MS) {
+    tracker.act = 0
+    tracker.train = 0
+    tracker.total = 0
+    tracker.escalations = 0
+    tracker.lastReset = now
+  }
+  if (reason === 'train-non-finite') {
+    tracker.train = (tracker.train ?? 0) + 1
+  } else {
+    tracker.act = (tracker.act ?? 0) + 1
+  }
+  tracker.total = (tracker.total ?? 0) + 1
+  tracker.lastReason = reason
+
+  const strikesForReason = reason === 'train-non-finite' ? tracker.train : tracker.act
+  const needsEscalation =
+    strikesForReason >= NON_FINITE_REASON_THRESHOLD || tracker.total >= NON_FINITE_TOTAL_THRESHOLD
+  if (!needsEscalation) {
+    return
+  }
+
+  const pending = context.pendingWeightRecovery
+  if (!pending) {
+    return
+  }
+
+  tracker.escalations = (tracker.escalations ?? 0) + 1
+  tracker.lastEscalationAt = now
+
+  const baseStddev = deriveMutationStddev(null, { jitter: false }) ?? NEW_BRAIN_MUTATION_STDDEV
+  const escalationFactor = Math.max(1, 1 + NON_FINITE_MUTATION_MULTIPLIER * tracker.escalations)
+  const escalatedStddev = Math.min(
+    NEW_BRAIN_MUTATION_MAX,
+    Math.max(NON_FINITE_MUTATION_MIN, baseStddev * escalationFactor)
+  )
+  if (Number.isFinite(escalatedStddev) && escalatedStddev > 0) {
+    if (!Array.isArray(pending.extraMutations)) {
+      pending.extraMutations = []
+    }
+    pending.extraMutations.push(escalatedStddev)
+    console.warn(
+      `[${label(context)}] Escalating ${reason} recovery after ${tracker.total} strike(s); adding mutation ${escalatedStddev.toFixed(
+        3
+      )}.`
+    )
+  }
+
+  context.epsilonBoost = Math.max(context.epsilonBoost ?? 0, NON_FINITE_EPSILON_BOOST)
+
+  if (tracker.escalations >= NON_FINITE_MAX_ESCALATIONS) {
+    pending.forceReinitialize = true
+  }
+}
+
 function markBaselineWeightsHealthy(reason = 'unknown') {
   baselineWeightsSuspect = false
 }
@@ -730,6 +873,11 @@ function markContextWeightsHealthy(context, reason = 'unknown') {
   context.lastWeightRecovery = Date.now()
   context.lastWeightRecoveryReason = reason
   context.weightSkipNotified = false
+  resetNonFiniteTracker(context)
+  if (context.lineage) {
+    const stats = ensureLineageRecord(context.lineage)
+    stats.instability = Math.max(0, (stats.instability ?? 0) * 0.5)
+  }
 }
 
 function scheduleWeightRecovery(context, reason = 'unknown', details = {}) {
@@ -750,7 +898,18 @@ function scheduleWeightRecovery(context, reason = 'unknown', details = {}) {
       reason,
       details,
       attempts: 0,
-      scheduledAt: Date.now()
+      scheduledAt: Date.now(),
+      extraMutations: Array.isArray(context.pendingWeightRecovery?.extraMutations)
+        ? [...context.pendingWeightRecovery.extraMutations]
+        : [],
+      forceReinitialize: Boolean(context.pendingWeightRecovery?.forceReinitialize)
+    }
+  }
+  if (reason === 'act-non-finite' || reason === 'train-non-finite') {
+    registerNonFiniteStrike(context, reason)
+    if (context.lineage) {
+      const stats = ensureLineageRecord(context.lineage)
+      stats.instability = (stats.instability ?? 0) + 1
     }
   }
   if (firstDetection) {
@@ -967,7 +1126,11 @@ async function attemptWeightRecovery(context, trigger = 'tick') {
   context.weightRecoveryInFlight = (async () => {
     let outcome
     try {
-      outcome = await rebuildContextWeights(context, pending.reason, pending.details)
+      if (pending.forceReinitialize) {
+        outcome = await reinitializeContextBrain(context, `${pending.reason}-force`, pending.details)
+      } else {
+        outcome = await rebuildContextWeights(context, pending.reason, pending.details)
+      }
     } catch (err) {
       if (isRemoteBrainUnavailableError(err)) {
         const status = getRemoteBrainStatus()
@@ -986,6 +1149,24 @@ async function attemptWeightRecovery(context, trigger = 'tick') {
 
     if (outcome?.success) {
       markContextWeightsHealthy(context, pending.reason)
+      if (Array.isArray(pending.extraMutations) && pending.extraMutations.length) {
+        const extras = pending.extraMutations.splice(0)
+        for (const stddev of extras) {
+          if (!Number.isFinite(stddev) || stddev <= 0) continue
+          try {
+            await mutateWeights(context.brain, Math.min(NEW_BRAIN_MUTATION_MAX, Math.max(0, stddev)))
+          } catch (err) {
+            if (isRemoteBrainUnavailableError(err)) {
+              pending.extraMutations.unshift(stddev)
+              throw err
+            }
+            console.error(
+              `[${label(context)}] Failed to apply escalated mutation (${stddev}) after ${pending.reason}:`,
+              err
+            )
+          }
+        }
+      }
       const sourceNote =
         outcome.mode === 'copy' || outcome.mode === 'average'
           ? ` from ${outcome.sourceCount} clean source${
@@ -1626,9 +1807,20 @@ function ensureLineageRecord(name) {
       survivalStreak: 0,
       prestige: 0,
       births: 0,
-      lastSeenGeneration: baselineState.generation
+      lastSeenGeneration: baselineState.generation,
+      dominanceStreak: 0,
+      lastDominanceGeneration: -Infinity,
+      lastDominanceMitigation: -Infinity,
+      diversificationCount: 0,
+      instability: 0
     }
     lineageStats.set(lineageName, stats)
+  } else {
+    if (typeof stats.dominanceStreak !== 'number') stats.dominanceStreak = 0
+    if (!Number.isFinite(stats.lastDominanceGeneration)) stats.lastDominanceGeneration = -Infinity
+    if (!Number.isFinite(stats.lastDominanceMitigation)) stats.lastDominanceMitigation = -Infinity
+    if (!Number.isFinite(stats.diversificationCount)) stats.diversificationCount = 0
+    if (!Number.isFinite(stats.instability)) stats.instability = 0
   }
   return stats
 }
@@ -1697,6 +1889,29 @@ function combineLineageBases(primary, partner) {
     combined = generateRandomLineageBase()
   }
   return combined
+}
+
+function deriveLineageVariantBase(base, stats = null) {
+  const root = extractLineageBase(base) || generateRandomLineageBase()
+  let counter = stats ? stats.diversificationCount ?? 0 : 0
+  const suffix = LINEAGE_VARIANT_SUFFIXES[counter % LINEAGE_VARIANT_SUFFIXES.length] ?? 'Variant'
+  let variant = `${root}${suffix}`
+  if (counter >= LINEAGE_VARIANT_SUFFIXES.length) {
+    variant += `${counter + 1}`
+  }
+  variant = sanitizeNetworkString(variant, {
+    fallback: `${root}${suffix}`.slice(0, MAX_USERNAME_LENGTH - 1),
+    maxLength: Math.max(4, MAX_USERNAME_LENGTH - 1),
+    allowed: /[0-9A-Za-z_\-]/,
+    label: 'lineage'
+  })
+  if (!variant) {
+    variant = generateRandomLineageBase()
+  }
+  if (stats) {
+    stats.diversificationCount = (stats.diversificationCount ?? 0) + 1
+  }
+  return variant
 }
 
 function formatLineageName(base, ordinal) {
@@ -4000,6 +4215,54 @@ async function maybeCompleteGeneration(context) {
   await synchronizeGeneration()
 }
 
+function deriveLineageDominancePlan(lineageCounts, total) {
+  if (!lineageCounts || !lineageCounts.size || total <= 0) {
+    return null
+  }
+  const entries = [...lineageCounts.entries()].sort((a, b) => (b[1] ?? 0) - (a[1] ?? 0))
+  if (!entries.length) return null
+  const [topName, topCountRaw] = entries[0]
+  const topCount = Number(topCountRaw) || 0
+  if (topCount <= 0) {
+    return null
+  }
+  const share = topCount / total
+  const nextShare = entries[1] ? (Number(entries[1][1]) || 0) / total : 0
+  const gap = share - nextShare
+  const stats = ensureLineageRecord(topName)
+  if (
+    share >= LINEAGE_DOMINANCE_SHARE_THRESHOLD &&
+    gap >= LINEAGE_DOMINANCE_GAP_THRESHOLD
+  ) {
+    stats.dominanceStreak = (stats.dominanceStreak ?? 0) + 1
+  } else {
+    stats.dominanceStreak = 0
+  }
+  for (let i = 1; i < entries.length; i++) {
+    const name = entries[i]?.[0]
+    if (!name) continue
+    const entryStats = ensureLineageRecord(name)
+    if (entryStats !== stats) {
+      entryStats.dominanceStreak = Math.max(0, entryStats.dominanceStreak ?? 0)
+    }
+  }
+  const generation = baselineState.generation ?? 0
+  if (
+    stats.dominanceStreak >= LINEAGE_DOMINANCE_STREAK_THRESHOLD &&
+    generation - (stats.lastDominanceMitigation ?? -Infinity) >= LINEAGE_DOMINANCE_COOLDOWN_GENERATIONS
+  ) {
+    return {
+      lineage: topName,
+      share,
+      gap,
+      count: topCount,
+      stats,
+      generation
+    }
+  }
+  return null
+}
+
 async function synchronizeGeneration() {
   if (generationSyncInFlight) return
   if (!contexts.length) return
@@ -4018,6 +4281,20 @@ async function synchronizeGeneration() {
     const rewardSnapshot = new Map()
     for (const ctx of sorted) {
       rewardSnapshot.set(ctx, ctx.generationReward ?? 0)
+    }
+    const lineageCounts = new Map()
+    for (const ctx of contexts) {
+      const lineageName = ctx?.lineage || LINEAGE_ROOT_NAME
+      lineageCounts.set(lineageName, (lineageCounts.get(lineageName) ?? 0) + 1)
+    }
+    const dominancePlan = deriveLineageDominancePlan(lineageCounts, contexts.length)
+    if (dominancePlan) {
+      dominancePlan.stats.lastDominanceMitigation = dominancePlan.generation
+      console.warn(
+        `[Baseline] Lineage ${dominancePlan.lineage} controls ${(dominancePlan.share * 100).toFixed(
+          1
+        )}% of bots (gap ${(dominancePlan.gap * 100).toFixed(1)}%). Diversifying offspring with extra mutations.`
+      )
     }
     await ensureBaselineReady()
 
@@ -4306,12 +4583,50 @@ async function synchronizeGeneration() {
         }
         const partnerContext =
           partnerCandidate && partnerCandidate !== parentCandidate ? partnerCandidate : null
-        createContext(spawnIndex++, {
+        let effectiveMutation = mutationStddev
+        const extraMutations = []
+        let lineageOverride = null
+        if (dominancePlan && parentCandidate?.lineage === dominancePlan.lineage) {
+          const variantBase = deriveLineageVariantBase(parentCandidate.lineage, dominancePlan.stats)
+          lineageOverride = variantBase
+          const boosted = deriveMutationStddev(
+            effectiveMutation * (1 + LINEAGE_DOMINANCE_MUTATION_MULTIPLIER),
+            { jitter: true }
+          )
+          if (Number.isFinite(boosted) && boosted > 0) {
+            effectiveMutation = Math.min(NEW_BRAIN_MUTATION_MAX, boosted)
+          }
+          for (let extra = 0; extra < LINEAGE_DOMINANCE_EXTRA_MUTATIONS; extra++) {
+            const scaled = effectiveMutation * (1 + extra * 0.15)
+            const derived = deriveMutationStddev(scaled, { jitter: true })
+            if (Number.isFinite(derived) && derived > 0) {
+              extraMutations.push(derived)
+            }
+          }
+          dominancePlan.stats.instability = Math.max(0, (dominancePlan.stats.instability ?? 0) * 0.5)
+          console.log(
+            `[Baseline] Diversifying ${parentCandidate ? label(parentCandidate) : 'unknown'} → ${variantBase} with ${extraMutations.length} extra mutation${
+              extraMutations.length === 1 ? '' : 's'
+            }.`
+          )
+        }
+        const spawnOptions = {
           parent: parentCandidate,
           partner: partnerContext,
-          mutationStddev
-        })
+          mutationStddev: effectiveMutation
+        }
+        if (lineageOverride) {
+          spawnOptions.lineageBase = lineageOverride
+        }
+        if (extraMutations.length) {
+          spawnOptions.extraMutations = extraMutations
+        }
+        createContext(spawnIndex++, spawnOptions)
       }
+    }
+
+    for (const stats of lineageStats.values()) {
+      stats.instability = Math.max(0, (stats.instability ?? 0) * 0.85)
     }
 
     scheduleBaselineSave('generation')
@@ -4860,8 +5175,11 @@ function createContext(index, options = {}) {
       primaryLineage: parent?.lineage ?? null,
       partner: partner?.username ?? null,
       partnerLineage: partner?.lineage ?? null
-    }
+    },
+    nonFiniteTracker: null
   }
+
+  resetNonFiniteTracker(context)
 
   context.movementController = createMovementController(context)
 

@@ -136,6 +136,11 @@ STATUS["float_policy"] = {
     "floatx": FLOAT_POLICY["floatx"],
     "using_gpu": FLOAT_POLICY["using_gpu"],
 }
+STATUS["policy_guard"] = {
+    "act_strike_window": ACT_SANITIZATION_STRIKE_WINDOW,
+    "act_strike_threshold": ACT_SANITIZATION_STRIKE_THRESHOLD,
+    "act_force_threshold": ACT_SANITIZATION_FORCE_THRESHOLD,
+}
 LOGGER.info(
     "TensorFlow float policy set to %s (using_gpu=%s).",
     FLOAT_POLICY["floatx"],
@@ -168,6 +173,13 @@ ENDPOINT_WORKER_LIMITS = {
     "load": _read_int("TF_SERVER_LOAD_WORKERS", DEFAULT_WORKERS),
     "default": DEFAULT_WORKERS
 }
+
+ACT_SANITIZATION_STRIKE_WINDOW = max(1.0, _read_float("TF_SERVER_ACT_STRIKE_WINDOW", 30.0))
+ACT_SANITIZATION_STRIKE_THRESHOLD = max(1, _read_int("TF_SERVER_ACT_STRIKE_THRESHOLD", 2))
+ACT_SANITIZATION_FORCE_THRESHOLD = max(
+    ACT_SANITIZATION_STRIKE_THRESHOLD,
+    _read_int("TF_SERVER_ACT_FORCE_THRESHOLD", 4),
+)
 
 
 class EndpointWorkerPool:
@@ -566,6 +578,8 @@ class RemoteBrain:
         self.optimizer = LookaheadOptimizer(lion, sync_period=6, slow_step_size=0.5)
         self.learning_rate_schedule = cosine_schedule
         self._lock = threading.RLock()
+        self.policy_strikes = 0
+        self.policy_last_reset = time.time()
 
     def _prepare_observation(self, vector, label):
         prepared, replaced, clipped, adjusted = _sanitize_vector(
@@ -836,11 +850,35 @@ class RemoteBrain:
                             safe_probs,
                             nan=1.0 / max(1, self.action_count),
                         )
+                    now = time.time()
+                    weights_ok = replaced == 0
+                    strikes = None
                     if sanitized_policy:
                         LOGGER.warning(
                             "Sanitized action probabilities due to non-finite values"
                         )
-                    weights_ok = replaced == 0
+                        if now - self.policy_last_reset > ACT_SANITIZATION_STRIKE_WINDOW:
+                            self.policy_strikes = 0
+                            self.policy_last_reset = now
+                        self.policy_strikes += 1
+                        strikes = self.policy_strikes
+                        weight_meta = self._sanitize_model_weights("act-policy")
+                        if weight_meta.get("sanitized"):
+                            weights_ok = weights_ok and weight_meta.get("replaced", 0) == 0
+                        weights_ok = weights_ok and self._weights_are_finite()
+                        if strikes >= ACT_SANITIZATION_FORCE_THRESHOLD:
+                            LOGGER.warning(
+                                "Policy sanitization strike threshold reached (%d >= %d); flagging weights suspect.",
+                                strikes,
+                                ACT_SANITIZATION_FORCE_THRESHOLD,
+                            )
+                            weights_ok = False
+                    else:
+                        if now - self.policy_last_reset > ACT_SANITIZATION_STRIKE_WINDOW:
+                            self.policy_strikes = 0
+                            self.policy_last_reset = now
+                        elif self.policy_strikes > 0:
+                            self.policy_strikes = max(0, self.policy_strikes - 1)
                     exploration = float(np.random.random()) < entry["epsilon"]
                     if exploration:
                         action_index = int(np.random.randint(0, self.action_count))
@@ -853,6 +891,14 @@ class RemoteBrain:
                     policy_meta["sanitized"] = bool(
                         policy_meta["replaced"] or policy_meta["fallback"]
                     )
+                    if strikes is not None:
+                        policy_meta["strikes"] = int(strikes)
+                        policy_meta["strike_threshold"] = int(
+                            ACT_SANITIZATION_FORCE_THRESHOLD
+                        )
+                        policy_meta["window_ms"] = int(
+                            ACT_SANITIZATION_STRIKE_WINDOW * 1000
+                        )
                     results[entry["index"]] = {
                         "action": action_index,
                         "weights_ok": bool(weights_ok),
@@ -1384,6 +1430,18 @@ def log_request(bot_id, endpoint, payload):
                     "gradient_norm": payload.get("gradient_norm"),
                 }
             )
+            sanitized = payload.get("sanitized")
+            if isinstance(sanitized, dict):
+                policy_meta = sanitized.get("policy")
+                if isinstance(policy_meta, dict):
+                    if "strikes" in policy_meta:
+                        try:
+                            bot_state["policy_strikes"] = int(policy_meta["strikes"])
+                        except (TypeError, ValueError):  # pragma: no cover - defensive
+                            bot_state["policy_strikes"] = policy_meta["strikes"]
+                        bot_state["policy_strike_threshold"] = ACT_SANITIZATION_FORCE_THRESHOLD
+                    if policy_meta.get("sanitized"):
+                        bot_state["policy_last_sanitized"] = entry["timestamp"]
 
 
 @app.post("/api/brains")
