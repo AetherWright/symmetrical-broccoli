@@ -125,12 +125,100 @@ const ARMOR_SLOT_BONUS = {
   feet: 20
 }
 
+const REWARD_SIGN = Object.freeze({
+  POSITIVE: 'positive',
+  NEGATIVE: 'negative',
+  EITHER: 'either'
+})
+
 function readNumberEnv(name, fallback, { min = -Infinity, max = Infinity } = {}) {
   const raw = Number.parseFloat(process.env[name] ?? '')
   if (!Number.isFinite(raw)) {
     return fallback
   }
   return Math.min(max, Math.max(min, raw))
+}
+
+function recordRewardSignCorrection(context, expectation, original, corrected, reason, channel) {
+  if (!context || corrected === original) return
+  if (!context.rewardSignStats) {
+    context.rewardSignStats = { corrections: 0, history: [] }
+  }
+  context.rewardSignStats.corrections += 1
+  const entry = {
+    expectation,
+    original,
+    corrected,
+    reason,
+    channel,
+    tick: context.tickCount ?? 0
+  }
+  context.rewardSignStats.history.push(entry)
+  if (context.rewardSignStats.history.length > 8) {
+    context.rewardSignStats.history.shift()
+  }
+  const shouldLog =
+    context.rewardSignStats.corrections <= 5 || context.rewardSignStats.corrections % 20 === 0
+  if (shouldLog) {
+    try {
+      console.warn(
+        `[${label(context)}] Reward sign correction for ${reason} (${channel}) → ${original.toFixed(3)} adjusted to ${corrected.toFixed(3)} (expected ${expectation}).`
+      )
+    } catch (err) {
+      console.warn('Reward sign correction logged without context label:', err)
+    }
+  }
+}
+
+function ensureRewardSign(amount, expectation = REWARD_SIGN.EITHER, context = null, reason = 'unspecified', channel = 'reward') {
+  const numeric = Number(amount)
+  if (!Number.isFinite(numeric) || numeric === 0) {
+    return 0
+  }
+  let corrected = numeric
+  if (expectation === REWARD_SIGN.POSITIVE && numeric < 0) {
+    corrected = Math.abs(numeric)
+  } else if (expectation === REWARD_SIGN.NEGATIVE && numeric > 0) {
+    corrected = -Math.abs(numeric)
+  }
+  if (corrected !== numeric) {
+    recordRewardSignCorrection(context, expectation, numeric, corrected, reason, channel)
+  }
+  return corrected
+}
+
+function applyRewardComponent(total, amount, expectation = REWARD_SIGN.EITHER, context = null, reason = 'unspecified') {
+  const corrected = ensureRewardSign(amount, expectation, context, reason, 'reward')
+  return total + corrected
+}
+
+function addBlockReward(context, amount, expectation = REWARD_SIGN.EITHER, reason = 'block') {
+  if (!context) return 0
+  const base = Number.isFinite(context.blockReward) ? context.blockReward : 0
+  const corrected = ensureRewardSign(amount, expectation, context, reason, 'block')
+  if (corrected === 0) {
+    context.blockReward = base
+    return context.blockReward
+  }
+  const next = base + corrected
+  context.blockReward = Number.isFinite(next) ? next : 0
+  return context.blockReward
+}
+
+function drainPositiveBlockReward(context, amount) {
+  if (!context) return 0
+  const deduction = Math.abs(Number(amount) || 0)
+  if (!Number.isFinite(deduction) || deduction === 0) {
+    return Number.isFinite(context.blockReward) ? context.blockReward : 0
+  }
+  const base = Number.isFinite(context.blockReward) ? context.blockReward : 0
+  if (base <= 0) {
+    context.blockReward = base
+    return base
+  }
+  const next = Math.max(0, base - deduction)
+  context.blockReward = next
+  return next
 }
 
 const MOVEMENT_SMOOTH_RAMP_MS = Math.max(
@@ -2240,7 +2328,7 @@ function noteResourceDiversity(type) {
     pool.diversity.add(type)
     const bonus = 0.08
     for (const ctx of contexts) {
-      ctx.blockReward += bonus
+      addBlockReward(ctx, bonus, REWARD_SIGN.POSITIVE, 'resource-diversity')
     }
     console.log(`[Resource] Diversity bonus unlocked for ${type} (${pool.diversity.size}/${RESOURCE_TYPES.length}).`)
   }
@@ -2745,7 +2833,12 @@ async function maybeAutoEat(context) {
     await sleep(200)
     maint.lastAutoEatSuccess = Date.now()
     maint.hungerCrisis = false
-    context.blockReward += hunger <= HUNGER_CRITICAL_THRESHOLD ? 0.25 : 0.12
+    addBlockReward(
+      context,
+      hunger <= HUNGER_CRITICAL_THRESHOLD ? 0.25 : 0.12,
+      REWARD_SIGN.POSITIVE,
+      'auto-eat'
+    )
     console.log(`[${label(context)}] Auto-ate ${best.name ?? 'food'} to restore hunger.`)
     return true
   } catch (err) {
@@ -3099,7 +3192,7 @@ async function executeCraftAction(context, act) {
 
   const success = await craftItem(context, config.item, config)
   if (success) {
-    context.blockReward += config.reward ?? 0.4
+    addBlockReward(context, config.reward ?? 0.4, REWARD_SIGN.POSITIVE, 'craft-success')
     context.resources.crafted += config.amount ?? 1
     GLOBAL_RESOURCE_POOL.crafted += config.amount ?? 1
     noteResourceDiversity('crafted')
@@ -3110,7 +3203,7 @@ async function executeCraftAction(context, act) {
     }
     console.log(`[${label(context)}] Crafted ${config.item}`)
   } else {
-    context.blockReward -= 0.03
+    addBlockReward(context, 0.03, REWARD_SIGN.NEGATIVE, 'craft-failure')
   }
 }
 
@@ -3118,7 +3211,7 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
   const { bot } = context
   const target = bot.blockAtCursor(5)
   if (!target) {
-    context.blockReward -= 0.02
+    addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'mining-no-target')
     return
   }
 
@@ -3139,7 +3232,7 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
 
   try {
     await bot.dig(target)
-    context.blockReward += 0.5
+    addBlockReward(context, 0.5, REWARD_SIGN.POSITIVE, 'mining-success')
     const resourceType = categorizeResource(target.name)
     if (resourceType && typeof context.resources[resourceType] === 'number') {
       context.resources[resourceType] += 1
@@ -3153,7 +3246,7 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
     }
   } catch (err) {
     console.warn(`[${label(context)}] Mining failed:`, err?.message ?? err)
-    context.blockReward -= 0.05
+    addBlockReward(context, 0.05, REWARD_SIGN.NEGATIVE, 'mining-failure')
     if (context.mode === 'feral') {
       context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.2)
     }
@@ -3240,12 +3333,17 @@ async function executeAction(context, index) {
           const hungerBefore = Number(bot.food ?? 20)
           try {
             await bot.attack(entity)
-            context.blockReward += 0.3
+            addBlockReward(context, 0.3, REWARD_SIGN.POSITIVE, 'attack-success')
             if (
               hungerBefore <= HUNGER_HUNT_THRESHOLD &&
               isPassiveAnimal(entity)
             ) {
-              context.blockReward += HUNGER_HUNT_ACTION_REWARD
+              addBlockReward(
+                context,
+                HUNGER_HUNT_ACTION_REWARD,
+                REWARD_SIGN.POSITIVE,
+                'attack-hunt-bonus'
+              )
               console.log(`[${label(context)}] Rewarding hunt on ${entity.name ?? entity.displayName ?? 'mob'} while hungry.`)
             }
             if (context.mode === 'feral') {
@@ -3253,7 +3351,7 @@ async function executeAction(context, index) {
             }
           } catch (err) {
             console.warn(`[${label(context)}] Attack failed:`, err?.message ?? err)
-            context.blockReward -= 0.05
+            addBlockReward(context, 0.05, REWARD_SIGN.NEGATIVE, 'attack-failure')
             if (context.mode === 'feral') {
               context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.1)
             }
@@ -3262,9 +3360,9 @@ async function executeAction(context, index) {
           console.debug(
             `[${label(context)}] Skipping attack on invalid target ${entity.name ?? entity.displayName ?? entity.type ?? 'entity'}.`
           )
-          context.blockReward -= 0.02
+          addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'attack-invalid-target')
         } else {
-          context.blockReward -= 0.01
+          addBlockReward(context, 0.01, REWARD_SIGN.NEGATIVE, 'attack-no-target')
           if (context.mode === 'feral') {
             context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.05)
           }
@@ -3279,21 +3377,21 @@ async function executeAction(context, index) {
           if (success) {
             try {
               await bot.placeBlock(target, new Vec3(0, 1, 0))
-              context.blockReward += 0.25
+              addBlockReward(context, 0.25, REWARD_SIGN.POSITIVE, 'build-success')
               registerWithdrawal(context, 1)
               updateCooperationScore(context)
             } catch (err) {
               console.warn(`[${label(context)}] Build failed:`, err?.message ?? err)
-              context.blockReward -= 0.02
+              addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'build-place-failure')
             }
           } else {
-            context.blockReward -= 0.02
+            addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'build-no-block-equipped')
           }
           if (placePos) {
             // noop - placeholder for potential future heuristics
           }
         } else {
-          context.blockReward -= 0.02
+          addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'build-no-target')
         }
         break
       }
@@ -3307,17 +3405,17 @@ async function executeAction(context, index) {
             if (blockBelow) {
               try {
                 await bot.placeBlock(blockBelow, new Vec3(0, 1, 0))
-                context.blockReward += 0.2
+                addBlockReward(context, 0.2, REWARD_SIGN.POSITIVE, 'build-above-success')
                 registerWithdrawal(context, 1)
                 updateCooperationScore(context)
               } catch (err) {
                 console.warn(`[${label(context)}] Build above failed:`, err?.message ?? err)
-                context.blockReward -= 0.02
+                addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'build-above-failure')
               }
             }
           }
         } else {
-          context.blockReward -= 0.02
+          addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'build-above-no-block')
         }
         break
       }
@@ -3329,16 +3427,16 @@ async function executeAction(context, index) {
             try {
               await bot.placeBlock(target, new Vec3(1, 0, 0))
               await movePulse({ forward: 1 }, 200)
-              context.blockReward += 0.22
+              addBlockReward(context, 0.22, REWARD_SIGN.POSITIVE, 'build-forward-success')
               registerWithdrawal(context, 1)
               updateCooperationScore(context)
             } catch (err) {
               console.warn(`[${label(context)}] Build forward failed:`, err?.message ?? err)
-              context.blockReward -= 0.02
+              addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'build-forward-failure')
             }
           }
         } else {
-          context.blockReward -= 0.02
+          addBlockReward(context, 0.02, REWARD_SIGN.NEGATIVE, 'build-forward-no-target')
         }
         break
       }
@@ -3347,7 +3445,7 @@ async function executeAction(context, index) {
           bot.activateItem()
           await sleep(300)
           bot.deactivateItem()
-          context.blockReward += 0.05
+          addBlockReward(context, 0.05, REWARD_SIGN.POSITIVE, 'use-item')
         } catch (err) {
           console.warn(`[${label(context)}] Use-item action failed:`, err?.message ?? err)
         }
@@ -3460,20 +3558,50 @@ function computeReward(context, obs) {
     const dz = pos.z - context.lastPos.z
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
     const horizontal = Math.sqrt(dx * dx + dz * dz)
-    reward += Math.min(dist * 0.1, 0.5)
-    reward += Math.min(horizontal * 0.05, 0.25)
-    reward += Math.min(Math.abs(dy) * 0.05, 0.15)
+    reward = applyRewardComponent(
+      reward,
+      Math.min(dist * 0.1, 0.5),
+      REWARD_SIGN.POSITIVE,
+      context,
+      'movement-distance'
+    )
+    reward = applyRewardComponent(
+      reward,
+      Math.min(horizontal * 0.05, 0.25),
+      REWARD_SIGN.POSITIVE,
+      context,
+      'movement-horizontal'
+    )
+    reward = applyRewardComponent(
+      reward,
+      Math.min(Math.abs(dy) * 0.05, 0.15),
+      REWARD_SIGN.POSITIVE,
+      context,
+      'movement-vertical'
+    )
   }
 
   const health = obs[8]
   if (Number.isFinite(health)) {
     if (health < context.lastHealth) {
       const damage = Math.max(0, context.lastHealth - health)
-      reward -= Math.min(1.5, damage * 0.5)
+      reward = applyRewardComponent(
+        reward,
+        Math.min(1.5, damage * 0.5),
+        REWARD_SIGN.NEGATIVE,
+        context,
+        'damage-taken'
+      )
       context.damageDebt = limitPositive(context.damageDebt + damage * DAMAGE_DEBT_WEIGHT, DAMAGE_MEMORY_CLAMP)
       context.recentDamage = limitPositive(context.recentDamage + damage, DAMAGE_MEMORY_CLAMP)
     } else if (health > context.lastHealth) {
-      reward += Math.min(1, (health - context.lastHealth) * 0.5)
+      reward = applyRewardComponent(
+        reward,
+        Math.min(1, (health - context.lastHealth) * 0.5),
+        REWARD_SIGN.POSITIVE,
+        context,
+        'health-regain'
+      )
     }
     context.lastHealth = health
   }
@@ -3481,9 +3609,21 @@ function computeReward(context, obs) {
   const food = obs[9]
   if (Number.isFinite(food)) {
     if (food > context.lastFood) {
-      reward += Math.min(0.5, (food - context.lastFood) * 0.1)
+      reward = applyRewardComponent(
+        reward,
+        Math.min(0.5, (food - context.lastFood) * 0.1),
+        REWARD_SIGN.POSITIVE,
+        context,
+        'food-gain'
+      )
     } else if (food < context.lastFood) {
-      reward -= Math.min(0.5, (context.lastFood - food) * 0.05)
+      reward = applyRewardComponent(
+        reward,
+        Math.min(0.5, (context.lastFood - food) * 0.05),
+        REWARD_SIGN.NEGATIVE,
+        context,
+        'food-loss'
+      )
     }
     context.lastFood = food
   }
@@ -3492,14 +3632,26 @@ function computeReward(context, obs) {
   if (Number.isFinite(invTotal)) {
     const delta = invTotal - context.lastInvTotal
     if (delta !== 0) {
-      reward += Math.sign(delta) * Math.min(Math.abs(delta) * 0.2, 1.5)
+      reward = applyRewardComponent(
+        reward,
+        Math.sign(delta) * Math.min(Math.abs(delta) * 0.2, 1.5),
+        REWARD_SIGN.EITHER,
+        context,
+        'inventory-delta'
+      )
     }
     context.lastInvTotal = invTotal
   }
 
   const nearestDist = obs[16]
   if (Number.isFinite(nearestDist) && nearestDist > 0 && nearestDist < 3) {
-    reward -= (3 - nearestDist) * 0.05
+    reward = applyRewardComponent(
+      reward,
+      (3 - nearestDist) * 0.05,
+      REWARD_SIGN.NEGATIVE,
+      context,
+      'threat-proximity'
+    )
   }
 
   if (context.lastAction != null) {
@@ -3509,58 +3661,112 @@ function computeReward(context, obs) {
       context.repetitionStreak = 0
     }
     const fatiguePenalty = Math.min(0.6, context.repetitionStreak * 0.05)
-    reward -= fatiguePenalty
+    reward = applyRewardComponent(reward, fatiguePenalty, REWARD_SIGN.NEGATIVE, context, 'action-fatigue')
   }
 
   if (context.noveltyFlag) {
-    reward += 0.12 * rewardProfile.novelty
+    reward = applyRewardComponent(
+      reward,
+      0.12 * rewardProfile.novelty,
+      REWARD_SIGN.POSITIVE,
+      context,
+      'novelty'
+    )
   }
 
   updateCooperationScore(context)
   const cooperation = Number.isFinite(context.cooperationScore) ? context.cooperationScore : 0
   const entropy = Number.isFinite(context.behaviorEntropy) ? context.behaviorEntropy : 0
   const chainScore = Number.isFinite(context.currentChainScore) ? context.currentChainScore : 0
-  reward += Math.max(-0.3, Math.min(0.3, cooperation * 0.5)) * rewardProfile.cooperation
-  reward += (entropy - 0.5) * 0.1 * rewardProfile.entropy
-  reward += Math.min(0.25, chainScore * 0.2) * rewardProfile.skill
+  reward = applyRewardComponent(
+    reward,
+    Math.max(-0.3, Math.min(0.3, cooperation * 0.5)) * rewardProfile.cooperation,
+    REWARD_SIGN.EITHER,
+    context,
+    'cooperation'
+  )
+  reward = applyRewardComponent(
+    reward,
+    (entropy - 0.5) * 0.1 * rewardProfile.entropy,
+    REWARD_SIGN.EITHER,
+    context,
+    'entropy'
+  )
+  reward = applyRewardComponent(
+    reward,
+    Math.min(0.25, chainScore * 0.2) * rewardProfile.skill,
+    REWARD_SIGN.POSITIVE,
+    context,
+    'skill-chain'
+  )
 
   if (!Number.isFinite(context.blockReward)) {
     context.blockReward = 0
   }
   const consumedBlockReward = context.blockReward
-  reward += consumedBlockReward * rewardProfile.resource
+  reward = applyRewardComponent(
+    reward,
+    consumedBlockReward * rewardProfile.resource,
+    REWARD_SIGN.EITHER,
+    context,
+    'block-reward'
+  )
   context.blockReward = 0
 
   const achievementBonus = context.achievementReward ?? 0
   if (achievementBonus !== 0) {
-    reward += achievementBonus
+    reward = applyRewardComponent(reward, achievementBonus, REWARD_SIGN.POSITIVE, context, 'achievement')
     context.achievementReward = 0
   }
 
   if (context.damageDebt > 0) {
-    reward -= Math.min(2, context.damageDebt * DAMAGE_DEBT_PENALTY)
+    reward = applyRewardComponent(
+      reward,
+      Math.min(2, context.damageDebt * DAMAGE_DEBT_PENALTY),
+      REWARD_SIGN.NEGATIVE,
+      context,
+      'damage-debt'
+    )
   }
 
   const pendingDeathPenalty = context.deathPenalty ?? 0
   if (pendingDeathPenalty > 0) {
-    reward -= pendingDeathPenalty
+    reward = applyRewardComponent(
+      reward,
+      pendingDeathPenalty,
+      REWARD_SIGN.NEGATIVE,
+      context,
+      'death-penalty'
+    )
     context.deathPenalty = 0
   }
 
   const lineageBonus = getLineagePrestige(context.lineage) * 0.1 * rewardProfile.lineage
-  reward += lineageBonus
+  reward = applyRewardComponent(reward, lineageBonus, REWARD_SIGN.POSITIVE, context, 'lineage-prestige')
 
   if (context.mode === 'feral') {
     const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
-    reward += Math.min(0.5, fury * 0.08) * rewardProfile.feral
-    reward -= Math.max(0, context.cooperationScore) * 0.2
+    reward = applyRewardComponent(
+      reward,
+      Math.min(0.5, fury * 0.08) * rewardProfile.feral,
+      REWARD_SIGN.POSITIVE,
+      context,
+      'feral-fury'
+    )
+    reward = applyRewardComponent(
+      reward,
+      Math.max(0, context.cooperationScore) * 0.2,
+      REWARD_SIGN.NEGATIVE,
+      context,
+      'feral-cooperation-penalty'
+    )
     context.feralFury = Math.max(0, fury * 0.92)
   } else {
     const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
     context.feralFury = Math.max(0, fury * 0.85)
   }
 
-  reward -= 0.02
+  reward = applyRewardComponent(reward, 0.02, REWARD_SIGN.NEGATIVE, context, 'tick-cost')
 
   reward = adjustMorale(context, reward)
 
@@ -4119,7 +4325,7 @@ function applyDeathPenalty(context, source = 'unknown') {
   context.lastDeathAt = now
   const penalty = Math.max(5, DEATH_REWARD_PENALTY)
   context.deathPenalty = (context.deathPenalty ?? 0) + penalty
-  context.blockReward = Math.max(0, context.blockReward - penalty * 0.1)
+  drainPositiveBlockReward(context, penalty * 0.1)
   context.repetitionStreak = 0
   context.noveltyFlag = false
   console.warn(`[${label(context)}] Death detected via ${source} → -${penalty.toFixed(2)} reward penalty`)
@@ -4135,7 +4341,7 @@ function setupRewardTracking(context) {
       block.name.includes('stone') ? 1.0 :
       block.name.includes('dirt') ? 0.5 :
       0.3
-    context.blockReward += value
+    addBlockReward(context, value, REWARD_SIGN.POSITIVE, 'block-break')
     if (context.mode === 'feral') {
       context.feralFury = Math.min(5, (context.feralFury ?? 0) + value * 0.2)
     }
@@ -4143,7 +4349,7 @@ function setupRewardTracking(context) {
   })
 
   bot.on('diggingAborted', () => {
-    context.blockReward -= 0.1
+    addBlockReward(context, 0.1, REWARD_SIGN.NEGATIVE, 'dig-aborted')
     console.log(`[${label(context)}] Dig aborted → -0.1 penalty`)
     if (context.mode === 'feral') {
       context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.15)
@@ -4154,7 +4360,7 @@ function setupRewardTracking(context) {
     if (collector === bot.entity) {
       const count = collected?.metadata?.itemCount ?? collected?.count ?? 1
       const bonus = Math.max(0.3, (count || 1) * 0.15)
-      context.blockReward += bonus
+      addBlockReward(context, bonus, REWARD_SIGN.POSITIVE, 'item-collect')
       if (context.mode === 'feral') {
         context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.1)
       }
@@ -4170,7 +4376,7 @@ function setupRewardTracking(context) {
       if (typeof itemName === 'string' && isAnimalFoodItem(itemName)) {
         const hungerBonusBase = isCriticalHunger(context) ? HUNGER_COLLECTION_REWARD * 1.5 : HUNGER_COLLECTION_REWARD
         if (isHungry(context)) {
-          context.blockReward += hungerBonusBase
+          addBlockReward(context, hungerBonusBase, REWARD_SIGN.POSITIVE, 'item-collect-hungry')
           console.log(
             `[${label(context)}] Collected ${itemName} while hungry → +${hungerBonusBase.toFixed(2)} reward`
           )
@@ -4578,6 +4784,7 @@ function createContext(index, options = {}) {
     longRewardAvg: 0,
     rewardDrift: 0,
     rewardVolatility: 0,
+    rewardSignStats: { corrections: 0, history: [] },
     actionMemoryBest: 0,
     actionMemoryWorst: 0,
     actionCounts: new Map(),
