@@ -148,6 +148,14 @@ LOGGER.info(
 )
 
 
+def natural_log_relu(inputs):
+    tensor = tf.convert_to_tensor(inputs)
+    return tf.math.log1p(tf.nn.relu(tensor))
+
+
+tf.keras.utils.get_custom_objects()["natural_log_relu"] = natural_log_relu
+
+
 def _read_int(name, default):
     try:
         return max(1, int(os.environ.get(name, default)))
@@ -366,7 +374,7 @@ class HebbianDense(tf.keras.layers.Layer):
     def __init__(
         self,
         units,
-        activation="relu",
+        activation=natural_log_relu,
         hebbian_learning_rate=0.01,
         decay_multiplier=1.5,
         clip=0.75,
@@ -491,7 +499,7 @@ def build_model(input_size, action_count):
     x = tf.keras.layers.BatchNormalization(name="input_batchnorm")(inputs)
     x = tf.keras.layers.Dense(
         BRAIN_CONFIG["hidden_units"],
-        activation="relu",
+        activation=natural_log_relu,
         name="hidden_dense_1",
     )(x)
     x = tf.keras.layers.Dropout(
@@ -500,7 +508,7 @@ def build_model(input_size, action_count):
     hebbian_layers = []
     hebbian_1 = HebbianDense(
         BRAIN_CONFIG["hebbian_units"][0],
-        activation="relu",
+        activation=natural_log_relu,
         hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
         decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
         clip=BRAIN_CONFIG["hebbian_clip"],
@@ -513,7 +521,7 @@ def build_model(input_size, action_count):
     )(x)
     x = tf.keras.layers.Dense(
         BRAIN_CONFIG["mid_units"],
-        activation="relu",
+        activation=natural_log_relu,
         name="hidden_dense_2",
     )(x)
     x = tf.keras.layers.Dropout(
@@ -521,7 +529,7 @@ def build_model(input_size, action_count):
     )(x)
     hebbian_2 = HebbianDense(
         BRAIN_CONFIG["hebbian_units"][1],
-        activation="relu",
+        activation=natural_log_relu,
         hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
         decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
         clip=BRAIN_CONFIG["hebbian_clip"],
@@ -531,7 +539,7 @@ def build_model(input_size, action_count):
     hebbian_layers.append(hebbian_2)
     shared = tf.keras.layers.Dense(
         max(1, BRAIN_CONFIG["shared_units"]),
-        activation="relu",
+        activation=natural_log_relu,
         name="shared_dense",
     )(x)
     shared = tf.keras.layers.Dropout(
@@ -539,7 +547,7 @@ def build_model(input_size, action_count):
     )(shared)
     policy_features = tf.keras.layers.Dense(
         max(1, BRAIN_CONFIG["shared_units"]),
-        activation="relu",
+        activation=natural_log_relu,
         name="policy_dense",
     )(shared)
     policy_features = tf.keras.layers.Dropout(
