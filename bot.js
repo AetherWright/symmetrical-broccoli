@@ -355,7 +355,8 @@ const healthMetrics = {
     trainRemote: createRollingStats()
   },
   droppedGradients: createRollingStats(),
-  clippedGradients: createRollingStats()
+  clippedGradients: createRollingStats(),
+  gradientNorm: createRollingStats()
 }
 
 let nextHealthSummaryAt = Date.now() + HEALTH_SUMMARY_INTERVAL_MS
@@ -426,6 +427,11 @@ function recordClippedGradients(count) {
   healthMetrics.clippedGradients.add(count)
 }
 
+function recordGradientNorm(norm) {
+  if (!Number.isFinite(norm) || norm <= 0) return
+  healthMetrics.gradientNorm.add(norm)
+}
+
 function recordTickDuration(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs < 0) return
   healthMetrics.tickDuration.add(durationMs)
@@ -461,17 +467,21 @@ function maybeLogHealthSummary() {
   const trainRemoteSummary = healthMetrics.sanitization.trainRemote.summary()
   const droppedSummary = healthMetrics.droppedGradients.summary()
   const clippedSummary = healthMetrics.clippedGradients.summary()
+  const gradientNormSummary = healthMetrics.gradientNorm.summary()
 
   const windowSeconds = Math.round(HEALTH_METRIC_WINDOW_MS / 1000)
   const tickAvg = tickSummary.count ? tickSummary.avg.toFixed(1) : 'n/a'
   const tickMax = tickSummary.count ? tickSummary.max.toFixed(1) : 'n/a'
+  const gradNormAvg = gradientNormSummary.count ? gradientNormSummary.avg.toFixed(2) : 'n/a'
+  const gradNormMax = gradientNormSummary.count ? gradientNormSummary.max.toFixed(2) : 'n/a'
 
   console.log(
     `[Health] Last ${windowSeconds}s | Tick avg ${tickAvg}ms (max ${tickMax}ms, n=${tickSummary.count}) | ` +
       `Remote offline ${formatAggregate(offlineSummary)} | Remote recoveries ${formatAggregate(recoverySummary)} | ` +
       `Act sanitize obs=${formatAggregate(actionObsSummary)}, remote=${formatAggregate(actionRemoteSummary)} | ` +
       `Train sanitize obs=${formatAggregate(trainObsSummary)}, next=${formatAggregate(trainNextSummary)}, remote=${formatAggregate(trainRemoteSummary)} | ` +
-      `Dropped grads ${formatAggregate(droppedSummary)} | Clipped grads ${formatAggregate(clippedSummary)}`
+      `Dropped grads ${formatAggregate(droppedSummary)} | Clipped grads ${formatAggregate(clippedSummary)} | ` +
+      `Grad norm avg ${gradNormAvg} (max ${gradNormMax})`
   )
 }
 
@@ -3866,6 +3876,7 @@ async function tickLoop(context) {
           recordTrainingSanitization(trainOutcome.sanitization)
           recordDroppedGradients(trainOutcome.droppedGradients)
           recordClippedGradients(trainOutcome.clippedGradients)
+          recordGradientNorm(trainOutcome.gradientNorm)
         }
         if (trainOutcome && trainOutcome.weightsOk === false) {
           const trainDetails = {

@@ -204,6 +204,7 @@ BRAIN_CONFIG = {
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
 GRAD_CLIP_VALUE = abs(_read_float("TF_SERVER_GRADIENT_CLIP_VALUE", 100.0))
+GRAD_CLIP_GLOBAL_NORM = abs(_read_float("TF_SERVER_GRADIENT_GLOBAL_NORM", 250.0))
 WEIGHT_CLAMP = abs(_read_float("TF_SERVER_WEIGHT_CLAMP", 1e6))
 
 
@@ -568,7 +569,8 @@ class RemoteBrain:
 
     @staticmethod
     def _filter_gradients(grads_and_vars):
-        cleaned = []
+        gradients = []
+        variables = []
         dropped = 0
         clipped = 0
         for grad, var in grads_and_vars:
@@ -598,8 +600,44 @@ class RemoteBrain:
                     else:
                         clipped_grad = clipped_tensor
                     clipped += 1
-            cleaned.append((clipped_grad, var))
-        return cleaned, dropped, clipped
+            gradients.append(clipped_grad)
+            variables.append(var)
+        global_norm = None
+        if gradients:
+            if GRAD_CLIP_GLOBAL_NORM > 0:
+                try:
+                    clipped_list, original_norm = tf.clip_by_global_norm(
+                        gradients, GRAD_CLIP_GLOBAL_NORM
+                    )
+                    gradients = clipped_list
+                    try:
+                        norm_value = original_norm.numpy()
+                    except AttributeError:
+                        norm_value = float(original_norm)
+                    global_norm = float(norm_value)
+                    if global_norm > GRAD_CLIP_GLOBAL_NORM:
+                        clipped += 1
+                        LOGGER.debug(
+                            "Clipped gradients by global norm (norm=%.3f limit=%.3f)",
+                            global_norm,
+                            GRAD_CLIP_GLOBAL_NORM,
+                        )
+                except Exception as exc:  # pragma: no cover - defensive
+                    LOGGER.warning("Failed to apply global norm clipping: %s", exc)
+                    gradients = list(gradients)
+            else:
+                try:
+                    norm_tensor = tf.linalg.global_norm(
+                        [
+                            grad.values if isinstance(grad, tf.IndexedSlices) else grad
+                            for grad in gradients
+                        ]
+                    )
+                    global_norm = float(norm_tensor.numpy())
+                except Exception:  # pragma: no cover - monitoring best effort
+                    global_norm = None
+        cleaned = list(zip(gradients, variables))
+        return cleaned, dropped, clipped, global_norm
 
     @staticmethod
     def _sanitize_weight_list(weights):
@@ -961,7 +999,9 @@ class RemoteBrain:
                     for grad, var in zip(gradients, self.model.trainable_variables)
                     if grad is not None
                 ]
-                cleaned_grads, dropped, clipped_grads = self._filter_gradients(grads_and_vars)
+                cleaned_grads, dropped, clipped_grads, gradient_norm = self._filter_gradients(
+                    grads_and_vars
+                )
                 if dropped:
                     LOGGER.warning(
                         "Skipped %d gradient tensors due to non-finite values", dropped
@@ -999,6 +1039,7 @@ class RemoteBrain:
                         "weights_ok": bool(weights_ok),
                         "dropped_gradients": int(dropped),
                         "clipped_gradients": int(clipped_grads),
+                        "gradient_norm": float(gradient_norm) if gradient_norm is not None else None,
                         "learning_rate": current_lr,
                         "sanitized": {
                             "observation": entry["obs_meta"],
@@ -1019,6 +1060,7 @@ class RemoteBrain:
                         "weights_ok": True,
                         "dropped_gradients": 0,
                         "clipped_gradients": 0,
+                        "gradient_norm": None,
                         "sanitized": {
                             "observation": {
                                 "replaced": 0,
@@ -1285,6 +1327,7 @@ def log_request(bot_id, endpoint, payload):
             "reward": payload.get("reward"),
             "action": payload.get("action"),
             "epsilon": payload.get("epsilon"),
+            "gradient_norm": payload.get("gradient_norm"),
         }
         STATUS["requests"].append(entry)
         STATUS["requests"] = STATUS["requests"][-50:]
@@ -1297,6 +1340,7 @@ def log_request(bot_id, endpoint, payload):
                     "last_action": payload.get("action"),
                     "last_reward": payload.get("reward"),
                     "epsilon": payload.get("epsilon"),
+                    "gradient_norm": payload.get("gradient_norm"),
                 }
             )
 
@@ -1476,6 +1520,7 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
                     "weights_ok": True,
                     "dropped_gradients": 0,
                     "clipped_gradients": 0,
+                    "gradient_norm": None,
                     "sanitized": {
                         "observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
                         "next_observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
@@ -1514,6 +1559,7 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
                 "weights_ok": bool(entry_result.get("weights_ok", True)),
                 "dropped_gradients": int(entry_result.get("dropped_gradients", 0)),
                 "clipped_gradients": int(entry_result.get("clipped_gradients", 0)),
+                "gradient_norm": entry_result.get("gradient_norm"),
                 "learning_rate": entry_result.get("learning_rate"),
                 "hebbian": entry_result.get("hebbian"),
                 "sanitized": entry_result.get("sanitized") or {},

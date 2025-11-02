@@ -488,6 +488,9 @@ export async function trainBrainsBatch(argsList) {
           clippedGradients: Number.isFinite(remote.clipped_gradients)
             ? remote.clipped_gradients
             : 0,
+          gradientNorm: Number.isFinite(remote.gradient_norm)
+            ? remote.gradient_norm
+            : null,
           learningRate: remote.learning_rate ?? null,
           hebbian: remote.hebbian ?? null,
           sanitization: {
