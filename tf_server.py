@@ -1016,9 +1016,14 @@ class RemoteBrain:
 
                 with tf.GradientTape() as tape:
                     action_pred = self.model(obs_matrix, training=True)
+                    action_pred = tf.cast(action_pred, TF_FLOAT)
                     total_loss = tf.constant(0.0, dtype=TF_FLOAT)
-                    one_hot = tf.one_hot(actions_tensor, self.action_count)
-                    log_probs = tf.math.log(action_pred + 1e-8)
+                    one_hot = tf.one_hot(
+                        actions_tensor, self.action_count, dtype=TF_FLOAT
+                    )
+                    log_probs = tf.math.log(
+                        action_pred + tf.constant(1e-8, dtype=TF_FLOAT)
+                    )
                     policy_loss = -tf.reduce_mean(
                         tf.reduce_sum(log_probs * one_hot, axis=-1) * rewards_tensor
                     )
