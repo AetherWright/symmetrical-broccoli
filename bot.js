@@ -133,6 +133,31 @@ function readNumberEnv(name, fallback, { min = -Infinity, max = Infinity } = {})
   return Math.min(max, Math.max(min, raw))
 }
 
+const MOVEMENT_SMOOTH_RAMP_MS = Math.max(
+  10,
+  Math.floor(readNumberEnv('MOVEMENT_SMOOTH_RAMP_MS', 120, { min: 10 }))
+)
+const MOVEMENT_SMOOTH_THRESHOLD = readNumberEnv('MOVEMENT_SMOOTH_THRESHOLD', 0.35, {
+  min: 0.05,
+  max: 0.9
+})
+const MOVEMENT_UPDATE_INTERVAL_MS = Math.max(
+  10,
+  Math.floor(readNumberEnv('MOVEMENT_UPDATE_INTERVAL_MS', 50, { min: 10 }))
+)
+const MOVEMENT_JUMP_MAX_MS = Math.max(
+  50,
+  Math.floor(readNumberEnv('MOVEMENT_JUMP_MAX_MS', 300, { min: 50 }))
+)
+const LOOK_SMOOTH_STEPS = Math.max(
+  1,
+  Math.floor(readNumberEnv('LOOK_SMOOTH_STEPS', 6, { min: 1, max: 24 }))
+)
+const LOOK_SMOOTH_DURATION_MS = Math.max(
+  20,
+  Math.floor(readNumberEnv('LOOK_SMOOTH_DURATION_MS', 180, { min: 20 }))
+)
+
 const HEALTH_METRIC_WINDOW_MS = Math.max(
   1000,
   Math.floor(readNumberEnv('HEALTH_METRIC_WINDOW_MS', 300000, { min: 1000 }))
@@ -1067,6 +1092,327 @@ let lastFatalRecoveryAt = 0
 // HELPERS
 // ----------------------------
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) {
+    if (Number.isNaN(value)) return 0
+    return value > 0 ? max : value < 0 ? min : 0
+  }
+  return Math.min(max, Math.max(min, value))
+}
+
+function normalizeAngle(angle) {
+  if (!Number.isFinite(angle)) return 0
+  let wrapped = angle % (Math.PI * 2)
+  if (wrapped > Math.PI) wrapped -= Math.PI * 2
+  if (wrapped < -Math.PI) wrapped += Math.PI * 2
+  return wrapped
+}
+
+function createDefaultMovementModifiers() {
+  return {
+    sprint: false,
+    sneak: false,
+    jump: false,
+    keepJump: false
+  }
+}
+
+function createMovementController(context) {
+  const state = {
+    context,
+    current: { forward: 0, strafe: 0 },
+    target: { forward: 0, strafe: 0 },
+    modifiers: createDefaultMovementModifiers(),
+    lastUpdate: monotonicNow(),
+    jumpReleaseAt: 0,
+    token: null,
+    activeControls: {
+      forward: false,
+      back: false,
+      left: false,
+      right: false,
+      sprint: false,
+      sneak: false,
+      jump: false
+    }
+  }
+
+  function applyControl(name, value) {
+    const bot = state.context?.bot
+    if (!bot || typeof bot.setControlState !== 'function') return
+    if (state.activeControls[name] === value) return
+    state.activeControls[name] = value
+    try {
+      bot.setControlState(name, value)
+    } catch (err) {
+      console.warn(`[${label(state.context)}] Failed to apply control ${name}:`, err?.message ?? err)
+    }
+  }
+
+  function setTarget(vector = {}, options = {}, token = null) {
+    state.target.forward = clampNumber(Number(vector.forward ?? 0), -1, 1)
+    state.target.strafe = clampNumber(Number(vector.strafe ?? 0), -1, 1)
+    if (token != null) {
+      state.token = token
+    }
+    const nextModifiers = createDefaultMovementModifiers()
+    if (options && typeof options === 'object') {
+      if (options.sprint) nextModifiers.sprint = true
+      if (options.sneak) nextModifiers.sneak = true
+      if (options.jump) nextModifiers.jump = true
+      if (options.keepJump) nextModifiers.keepJump = true
+    }
+    state.modifiers = nextModifiers
+    if (state.modifiers.jump) {
+      const holdMs = clampNumber(Number(options?.jumpHoldMs ?? MOVEMENT_JUMP_MAX_MS), 0, MOVEMENT_JUMP_MAX_MS)
+      state.jumpReleaseAt = monotonicNow() + holdMs
+    } else if (!state.modifiers.keepJump) {
+      state.jumpReleaseAt = 0
+    }
+  }
+
+  function clearTarget(token = null, { immediate = false } = {}) {
+    if (token != null && state.token != null && token !== state.token) {
+      return false
+    }
+    state.target.forward = 0
+    state.target.strafe = 0
+    state.modifiers = createDefaultMovementModifiers()
+    state.jumpReleaseAt = 0
+    if (token == null || state.token === token) {
+      state.token = null
+    }
+    if (immediate) {
+      state.current.forward = 0
+      state.current.strafe = 0
+    }
+    return true
+  }
+
+  function update(now = monotonicNow()) {
+    const dt = Math.max(0, now - state.lastUpdate)
+    state.lastUpdate = now
+    const ramp = MOVEMENT_SMOOTH_RAMP_MS <= 0 ? 1 : Math.min(1, dt / MOVEMENT_SMOOTH_RAMP_MS)
+    state.current.forward += (state.target.forward - state.current.forward) * ramp
+    state.current.strafe += (state.target.strafe - state.current.strafe) * ramp
+
+    const threshold = MOVEMENT_SMOOTH_THRESHOLD
+    const forwardValue = state.current.forward
+    const strafeValue = state.current.strafe
+
+    const forwardActive = forwardValue > threshold
+    const backActive = forwardValue < -threshold
+    const rightActive = strafeValue > threshold
+    const leftActive = strafeValue < -threshold
+
+    applyControl('forward', forwardActive)
+    applyControl('back', backActive)
+    applyControl('right', rightActive)
+    applyControl('left', leftActive)
+
+    const shouldSprint = Boolean(state.modifiers.sprint) && !Boolean(state.modifiers.sneak)
+    const shouldSneak = Boolean(state.modifiers.sneak) && !Boolean(state.modifiers.sprint)
+    const nowMs = now
+    const jumpActive = Boolean(state.modifiers.jump) &&
+      (Boolean(state.modifiers.keepJump) || nowMs <= state.jumpReleaseAt)
+
+    applyControl('sprint', shouldSprint)
+    applyControl('sneak', shouldSneak)
+    applyControl('jump', jumpActive)
+
+    if (!jumpActive && state.activeControls.jump) {
+      applyControl('jump', false)
+    }
+  }
+
+  async function pulse(vector = {}, duration = 350, options = {}) {
+    const token = Symbol('movement-pulse')
+    setTarget(vector, { ...options, jumpHoldMs: options?.jumpHoldMs ?? duration }, token)
+    update()
+    try {
+      await sleep(duration)
+    } finally {
+      if (clearTarget(token)) {
+        update()
+      }
+    }
+  }
+
+  function hold(vector = {}, options = {}) {
+    const token = Symbol('movement-hold')
+    setTarget(vector, options, token)
+    update()
+    return ({ immediate = false } = {}) => {
+      if (clearTarget(token, { immediate })) {
+        update()
+      }
+    }
+  }
+
+  function release({ immediate = false } = {}) {
+    clearTarget(null, { immediate })
+    update()
+  }
+
+  function reset() {
+    state.current.forward = 0
+    state.current.strafe = 0
+    clearTarget(null, { immediate: true })
+    for (const key of Object.keys(state.activeControls)) {
+      if (state.activeControls[key]) {
+        state.activeControls[key] = false
+        try {
+          state.context?.bot?.setControlState?.(key, false)
+        } catch (err) {
+          console.warn(`[${label(state.context)}] Failed to reset control ${key}:`, err?.message ?? err)
+        }
+      }
+    }
+  }
+
+  return {
+    update,
+    pulse,
+    hold,
+    release,
+    reset
+  }
+}
+
+function ensureMovementController(context) {
+  if (!context) return null
+  if (!context.movementController) {
+    context.movementController = createMovementController(context)
+  }
+  return context.movementController
+}
+
+async function smoothMovementPulse(context, vector = {}, duration = 350, options = {}) {
+  const controller = ensureMovementController(context)
+  if (controller) {
+    await controller.pulse(vector, duration, options)
+    return
+  }
+  const bot = context?.bot
+  if (!bot) {
+    await sleep(duration)
+    return
+  }
+  const states = []
+  const forward = Number(vector.forward ?? 0)
+  const strafe = Number(vector.strafe ?? 0)
+  if (forward > 0) states.push('forward')
+  if (forward < 0) states.push('back')
+  if (strafe > 0) states.push('right')
+  if (strafe < 0) states.push('left')
+  if (options.sprint) states.push('sprint')
+  if (options.sneak) states.push('sneak')
+  if (options.jump) states.push('jump')
+  for (const state of states) {
+    bot.setControlState(state, true)
+  }
+  await sleep(duration)
+  for (const state of states) {
+    bot.setControlState(state, false)
+  }
+}
+
+function holdMovement(context, vector = {}, options = {}) {
+  const controller = ensureMovementController(context)
+  if (controller) {
+    return controller.hold(vector, options)
+  }
+  const bot = context?.bot
+  if (!bot) return () => {}
+  const states = []
+  const forward = Number(vector.forward ?? 0)
+  const strafe = Number(vector.strafe ?? 0)
+  if (forward > 0) states.push('forward')
+  if (forward < 0) states.push('back')
+  if (strafe > 0) states.push('right')
+  if (strafe < 0) states.push('left')
+  if (options.sprint) states.push('sprint')
+  if (options.sneak) states.push('sneak')
+  if (options.jump) states.push('jump')
+  for (const state of states) {
+    bot.setControlState(state, true)
+  }
+  return ({ immediate = false } = {}) => {
+    for (const state of states) {
+      bot.setControlState(state, false)
+    }
+  }
+}
+
+function releaseMovement(context, options = {}) {
+  const controller = ensureMovementController(context)
+  if (controller) {
+    controller.release(options)
+  }
+}
+
+async function smoothLookTo(context, targetYaw, targetPitch, options = {}) {
+  const bot = context?.bot
+  if (!bot?.entity) return
+  const currentYaw = bot.entity.yaw ?? 0
+  const currentPitch = bot.entity.pitch ?? 0
+  const yawDelta = normalizeAngle(targetYaw - currentYaw)
+  const clampedPitch = clampNumber(targetPitch, -Math.PI / 2, Math.PI / 2)
+  const steps = Math.max(1, Math.floor(Number.isFinite(options.steps) ? options.steps : LOOK_SMOOTH_STEPS))
+  const duration = Math.max(0, Number.isFinite(options.duration) ? options.duration : LOOK_SMOOTH_DURATION_MS)
+  const stepDelay = steps > 0 ? duration / steps : 0
+
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps
+    const nextYaw = currentYaw + yawDelta * t
+    const nextPitch = currentPitch + (clampedPitch - currentPitch) * t
+    try {
+      await bot.look(nextYaw, nextPitch, true)
+    } catch (err) {
+      console.warn(`[${label(context)}] Smooth look failed:`, err?.message ?? err)
+      break
+    }
+    if (stepDelay > 0 && i < steps) {
+      await sleep(stepDelay)
+    }
+  }
+}
+
+async function smoothLookBy(context, deltaYaw = 0, deltaPitch = 0, options = {}) {
+  const bot = context?.bot
+  if (!bot?.entity) return
+  const currentYaw = bot.entity.yaw ?? 0
+  const currentPitch = bot.entity.pitch ?? 0
+  const targetYaw = currentYaw + deltaYaw
+  const targetPitch = currentPitch + deltaPitch
+  await smoothLookTo(context, targetYaw, targetPitch, options)
+}
+
+let movementUpdateTimer = null
+
+function startMovementUpdateLoop() {
+  if (movementUpdateTimer) return
+  movementUpdateTimer = setInterval(() => {
+    const now = monotonicNow()
+    for (const ctx of contexts) {
+      try {
+        ctx?.movementController?.update(now)
+      } catch (err) {
+        console.warn(`[${label(ctx)}] Movement smoothing update failed:`, err?.message ?? err)
+      }
+    }
+  }, MOVEMENT_UPDATE_INTERVAL_MS)
+}
+
+function stopMovementUpdateLoop() {
+  if (movementUpdateTimer) {
+    clearInterval(movementUpdateTimer)
+    movementUpdateTimer = null
+  }
+}
+
+startMovementUpdateLoop()
 
 function sanitizeNetworkString(value, {
   fallback = '',
@@ -2776,14 +3122,11 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
     return
   }
 
-  if (forward) {
-    bot.setControlState('forward', true)
+  const movementVector = {
+    forward: forward ? 1 : 0,
+    strafe: clampNumber(Number(strafe) || 0, -1, 1)
   }
-  if (strafe < 0) {
-    bot.setControlState('left', true)
-  } else if (strafe > 0) {
-    bot.setControlState('right', true)
-  }
+  const releaseMovement = holdMovement(context, movementVector)
 
   let equipped = await equipOptimalMiningTool(context, target)
   if (!equipped) {
@@ -2814,6 +3157,8 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
     if (context.mode === 'feral') {
       context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.2)
     }
+  } finally {
+    releaseMovement?.({ immediate: false })
   }
 }
 
@@ -2830,22 +3175,11 @@ async function executeAction(context, index) {
     return
   }
 
-  const holdControls = async (states = [], duration = 350) => {
-    for (const state of states) {
-      bot.setControlState(state, true)
-    }
-    await sleep(duration)
-    for (const state of states) {
-      bot.setControlState(state, false)
-    }
-  }
+  const movePulse = (vector, duration = 350, options = {}) =>
+    smoothMovementPulse(context, vector, duration, options)
 
   const lookBy = async (deltaYaw = 0, deltaPitch = 0) => {
-    const yaw = bot.entity?.yaw ?? 0
-    const pitch = bot.entity?.pitch ?? 0
-    const nextYaw = yaw + deltaYaw
-    const nextPitch = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, pitch + deltaPitch))
-    await bot.look(nextYaw, nextPitch, true)
+    await smoothLookBy(context, deltaYaw, deltaPitch)
   }
 
   const getTargetBlock = () => bot.blockAtCursor(5)
@@ -2853,28 +3187,28 @@ async function executeAction(context, index) {
   try {
     switch (act) {
       case 'move_forward':
-        await holdControls(['forward'])
+        await movePulse({ forward: 1 })
         break
       case 'move_backward':
-        await holdControls(['back'])
+        await movePulse({ forward: -1 })
         break
       case 'strafe_left':
-        await holdControls(['left'])
+        await movePulse({ strafe: -1 })
         break
       case 'strafe_right':
-        await holdControls(['right'])
+        await movePulse({ strafe: 1 })
         break
       case 'jump':
-        await holdControls(['jump'])
+        await movePulse({}, 350, { jump: true })
         break
       case 'jump_forward':
-        await holdControls(['forward', 'jump'])
+        await movePulse({ forward: 1 }, 500, { jump: true })
         break
       case 'sprint_forward':
-        await holdControls(['forward', 'sprint'], 500)
+        await movePulse({ forward: 1 }, 500, { sprint: true })
         break
       case 'sneak_forward':
-        await holdControls(['forward', 'sneak'], 500)
+        await movePulse({ forward: 1 }, 500, { sneak: true })
         break
       case 'turn_left':
         await lookBy(-Math.PI / 4, 0)
@@ -2994,8 +3328,7 @@ async function executeAction(context, index) {
           if (success) {
             try {
               await bot.placeBlock(target, new Vec3(1, 0, 0))
-              bot.setControlState('forward', true)
-              await sleep(200)
+              await movePulse({ forward: 1 }, 200)
               context.blockReward += 0.22
               registerWithdrawal(context, 1)
               updateCooperationScore(context)
@@ -3024,6 +3357,7 @@ async function executeAction(context, index) {
         break
     }
   } finally {
+    releaseMovement(context)
     bot.clearControlStates()
   }
 }
@@ -3940,6 +4274,7 @@ function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
         username: context.username
       })
       context.bot = newBot
+      context.movementController?.reset()
       context.running = true
       context.reconnecting = false
       context.reconnectAttempts = 0
@@ -3961,6 +4296,7 @@ function setupBot(context) {
     console.log(`[${label(context)}] Spawned! Waiting for entity to initialize...`)
 
     context.reconnecting = false
+    context.movementController?.reset()
     context.registry = context.bot.registry ?? context.registry
     if (!context.registry) {
       console.warn(`[${label(context)}] Failed to load registry — crafting actions will be limited.`)
@@ -4015,6 +4351,7 @@ async function retireContext(context, reason = 'retire') {
   } catch (err) {
     console.warn(`[${label(context)}] Failed to retire bot:`, err?.message ?? err)
   }
+  context.movementController?.reset()
   context.bot = null
   const idx = contexts.indexOf(context)
   if (idx >= 0) {
@@ -4214,6 +4551,7 @@ function createContext(index, options = {}) {
     running: true,
     tickTimer: null,
     tickInFlight: false,
+    movementController: null,
     registry: null,
     lastObs: null,
     lastAction: null,
@@ -4306,6 +4644,8 @@ function createContext(index, options = {}) {
       partnerLineage: partner?.lineage ?? null
     }
   }
+
+  context.movementController = createMovementController(context)
 
   if (Number.isFinite(primaryMutation) && primaryMutation > 0) {
     enqueuePendingMutation(context, primaryMutation)
@@ -4421,6 +4761,7 @@ process.stdin.on('data', async data => {
         console.warn(`[${label(ctx)}] Failed to quit bot during shutdown:`, err)
       }
     }
+    stopMovementUpdateLoop()
     await shutdownBrainWorkerPool()
     process.exit(0)
   }
@@ -4478,6 +4819,7 @@ async function gracefulShutdown(reason = 'signal') {
   } catch (err) {
     console.error('[Brain] Failed during graceful shutdown:', err)
   } finally {
+    stopMovementUpdateLoop()
     try {
       await shutdownBrainWorkerPool()
     } catch (poolErr) {
