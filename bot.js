@@ -144,6 +144,46 @@ const HUNGER_HUNT_THRESHOLD = Math.max(8, Math.min(HUNGER_EAT_THRESHOLD, parseIn
 const HUNGER_HUNT_ACTION_REWARD = 0.35
 const HUNGER_COLLECTION_REWARD = 0.25
 
+const ORE_NAME_KEYWORDS = [
+  'ore',
+  'ingot',
+  'debris',
+  'raw_',
+  'gem',
+  'emerald',
+  'lapis',
+  'quartz',
+  'diamond',
+  'netherite',
+  'coal',
+  'redstone'
+]
+const ORE_BLOCK_REWARD_BONUS = readNumberEnv('ORE_BLOCK_REWARD_BONUS', 6, {
+  min: 0,
+  max: 100
+})
+const ORE_PICKUP_REWARD_BASE = readNumberEnv('ORE_PICKUP_REWARD_BASE', 3, {
+  min: 0,
+  max: 100
+})
+const ORE_PICKUP_REWARD_PER_ITEM = readNumberEnv('ORE_PICKUP_REWARD_PER_ITEM', 0.75, {
+  min: 0,
+  max: 20
+})
+
+const STRAIGHT_DOWN_DIG_THRESHOLD = Math.max(
+  2,
+  Math.floor(readNumberEnv('STRAIGHT_DOWN_DIG_THRESHOLD', 3, { min: 1, max: 20 }))
+)
+const STRAIGHT_DOWN_DIG_PENALTY = readNumberEnv('STRAIGHT_DOWN_DIG_PENALTY', 1.25, {
+  min: 0,
+  max: 20
+})
+const STRAIGHT_DOWN_DIG_PENALTY_GROWTH = readNumberEnv('STRAIGHT_DOWN_DIG_PENALTY_GROWTH', 0.4, {
+  min: 0,
+  max: 10
+})
+
 const COOKED_FOOD_KEYWORDS = ['cooked', 'baked', 'roasted', 'stew', 'pie', 'bread']
 const AVOID_FOOD_KEYWORDS = ['rotten_flesh', 'spider_eye', 'poisonous', 'raw_fish', 'raw_salmon']
 const PASSIVE_ANIMAL_KEYWORDS = ['cow', 'pig', 'sheep', 'chicken', 'rabbit', 'mooshroom', 'goat', 'hoglin', 'salmon', 'cod']
@@ -2589,11 +2629,29 @@ function trackNovelty(context, obs) {
   }
 }
 
+function isOreName(name) {
+  if (!name) return false
+  const normalized = String(name).toLowerCase()
+  return ORE_NAME_KEYWORDS.some(keyword => normalized.includes(keyword))
+}
+
+function isOreBlock(block) {
+  if (!block) return false
+  if (typeof block === 'string') {
+    return isOreName(block)
+  }
+  if (typeof block?.name === 'string') {
+    return isOreName(block.name)
+  }
+  return false
+}
+
 function categorizeResource(name) {
   if (!name) return null
-  if (name.includes('log') || name.includes('wood')) return 'wood'
-  if (name.includes('stone') || name.includes('cobblestone') || name.includes('gravel')) return 'stone'
-  if (name.includes('ore') || name.includes('ingot') || name.includes('coal') || name.includes('iron')) return 'ore'
+  const normalized = String(name).toLowerCase()
+  if (normalized.includes('log') || normalized.includes('wood')) return 'wood'
+  if (normalized.includes('stone') || normalized.includes('cobblestone') || normalized.includes('gravel')) return 'stone'
+  if (isOreName(normalized) || normalized.includes('coal') || normalized.includes('iron')) return 'ore'
   return null
 }
 
@@ -4733,14 +4791,44 @@ function setupRewardTracking(context) {
 
   bot.on('blockBreak', block => {
     if (!block || block.name === 'air') return
-    const value =
-      block.name.includes('ore') ? 2.0 :
-      block.name.includes('stone') ? 1.0 :
-      block.name.includes('dirt') ? 0.5 :
+    const blockNameRaw = typeof block.name === 'string' ? block.name : ''
+    const blockName = blockNameRaw.toLowerCase()
+    const ore = isOreBlock(block)
+    let value =
+      blockName.includes('stone') ? 1.0 :
+      blockName.includes('dirt') ? 0.5 :
       0.3
-    addBlockReward(context, value, REWARD_SIGN.POSITIVE, 'block-break')
+    if (ore) {
+      value = Math.max(value, ORE_BLOCK_REWARD_BONUS)
+    }
+    addBlockReward(context, value, REWARD_SIGN.POSITIVE, ore ? 'ore-break' : 'block-break')
     if (context.mode === 'feral') {
       context.feralFury = Math.min(5, (context.feralFury ?? 0) + value * 0.2)
+    }
+    const blockPos = block.position
+    if (blockPos) {
+      const last = context.lastDigPosition
+      const sameColumn =
+        last &&
+        Number.isInteger(last.x) &&
+        Number.isInteger(last.y) &&
+        Number.isInteger(last.z) &&
+        last.x === blockPos.x &&
+        last.z === blockPos.z
+      if (sameColumn && last.y - blockPos.y === 1) {
+        context.straightDownDigStreak = (context.straightDownDigStreak ?? 0) + 1
+        if (context.straightDownDigStreak >= STRAIGHT_DOWN_DIG_THRESHOLD) {
+          const excess = context.straightDownDigStreak - STRAIGHT_DOWN_DIG_THRESHOLD
+          const penalty = STRAIGHT_DOWN_DIG_PENALTY + excess * STRAIGHT_DOWN_DIG_PENALTY_GROWTH
+          addBlockReward(context, -penalty, REWARD_SIGN.NEGATIVE, 'dig-straight-down')
+          console.log(
+            `[${label(context)}] Straight-down digging penalty (${context.straightDownDigStreak}) → -${penalty.toFixed(2)} reward`
+          )
+        }
+      } else {
+        context.straightDownDigStreak = 0
+      }
+      context.lastDigPosition = { x: blockPos.x, y: blockPos.y, z: blockPos.z }
     }
     console.log(`[${label(context)}] Broke ${block.name} → +${value.toFixed(2)} reward`)
   })
@@ -4751,6 +4839,7 @@ function setupRewardTracking(context) {
     if (context.mode === 'feral') {
       context.feralFury = Math.max(0, (context.feralFury ?? 0) - 0.15)
     }
+    context.straightDownDigStreak = 0
   })
 
   bot.on('playerCollect', (collector, collected) => {
@@ -4769,6 +4858,13 @@ function setupRewardTracking(context) {
         noteResourceDiversity(category)
         registerContribution(context, count)
         updateCooperationScore(context)
+      }
+      if (typeof itemName === 'string' && isOreName(itemName)) {
+        const oreBonus = Math.max(ORE_PICKUP_REWARD_BASE, count * ORE_PICKUP_REWARD_PER_ITEM)
+        addBlockReward(context, oreBonus, REWARD_SIGN.POSITIVE, 'ore-collect')
+        console.log(
+          `[${label(context)}] Collected ore ${itemName} → +${oreBonus.toFixed(2)} reward`
+        )
       }
       if (typeof itemName === 'string' && isAnimalFoodItem(itemName)) {
         const hungerBonusBase = isCriticalHunger(context) ? HUNGER_COLLECTION_REWARD * 1.5 : HUNGER_COLLECTION_REWARD
@@ -5165,6 +5261,8 @@ function createContext(index, options = {}) {
     lastInvTotal: 0,
     blockReward: 0,
     achievementReward: 0,
+    lastDigPosition: null,
+    straightDownDigStreak: 0,
     tickCount: 0,
     trainingSteps: 0,
     cumulativeReward: 0,
