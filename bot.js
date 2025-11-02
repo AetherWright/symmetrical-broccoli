@@ -26,6 +26,11 @@ import {
   shutdownBrainWorkerPool,
   warmBrainWorkerPool
 } from './brainWorkerPool.js'
+import {
+  isEchoFallbackEnabled,
+  chooseEchoAction,
+  reportEchoLearning
+} from './echoTool.js'
 
 // ----------------------------
 // CONFIG
@@ -4163,11 +4168,40 @@ async function tickLoop(context) {
 
     await runMaintenanceRoutines(context)
 
+    let fallbackActive = Boolean(context.echoFallbackActive)
+    const updateFallbackState = active => {
+      const previous = Boolean(context.echoFallbackActive)
+      if (active === previous) {
+        return
+      }
+      context.echoFallbackActive = active
+      if (active) {
+        console.warn(
+          `[${label(context)}] TensorFlow brain unavailable; switching to Echo fallback.`
+        )
+      } else {
+        console.log(
+          `[${label(context)}] TensorFlow brain reachable; exiting Echo fallback.`
+        )
+      }
+    }
+
     const status = getRemoteBrainStatus()
     if (!status.connected) {
       remoteUnavailable = true
       remoteIssue = status
-      return
+      if (isEchoFallbackEnabled()) {
+        fallbackActive = true
+        updateFallbackState(true)
+      } else {
+        updateFallbackState(false)
+        return
+      }
+    } else if (fallbackActive) {
+      fallbackActive = false
+      updateFallbackState(false)
+    } else {
+      updateFallbackState(false)
     }
 
     if (context.weightsSuspect || context.pendingWeightRecovery) {
@@ -4183,8 +4217,22 @@ async function tickLoop(context) {
       }
     }
 
-    const brain = await ensureContextBrain(context)
-    if (!brain) {
+    let brain = null
+    if (!fallbackActive) {
+      try {
+        brain = await ensureContextBrain(context)
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
+          remoteUnavailable = true
+          remoteIssue = err
+          fallbackActive = true
+          updateFallbackState(true)
+        } else {
+          throw err
+        }
+      }
+    }
+    if (!fallbackActive && !brain) {
       console.warn(`[${label(context)}] Brain not ready, skipping tick.`)
       return
     }
@@ -4219,45 +4267,101 @@ async function tickLoop(context) {
     if (context.lastObs && context.lastAction != null) {
       const lastObsValid = vectorHasFiniteValues(context.lastObs)
       if (lastObsValid) {
-        const trainOutcome = await trainBrainConcurrent(
-          brain,
-          context.lastObs,
-          context.lastAction,
-          reward,
-          observation
-        )
-        trained = Boolean(trainOutcome?.trained)
+        let trainOutcome = null
+        let trainUsedFallback = fallbackActive
+        if (!fallbackActive) {
+          try {
+            trainOutcome = await trainBrainConcurrent(
+              brain,
+              context.lastObs,
+              context.lastAction,
+              reward,
+              observation
+            )
+          } catch (err) {
+            if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
+              remoteUnavailable = true
+              remoteIssue = err
+              fallbackActive = true
+              trainUsedFallback = true
+              updateFallbackState(true)
+            } else {
+              throw err
+            }
+          }
+        }
+        if (fallbackActive) {
+          trainUsedFallback = true
+          trainOutcome = await reportEchoLearning({
+            observation: context.lastObs,
+            nextObservation: observation,
+            actionIndex: context.lastAction,
+            actions: ACTIONS,
+            reward,
+            botId: label(context)
+          })
+        }
         if (trainOutcome) {
           recordTrainingSanitization(trainOutcome.sanitization)
           recordDroppedGradients(trainOutcome.droppedGradients)
           recordClippedGradients(trainOutcome.clippedGradients)
           recordGradientNorm(trainOutcome.gradientNorm)
-        }
-        if (trainOutcome && trainOutcome.weightsOk === false) {
-          const trainDetails = {
-            ...(trainOutcome.sanitization ?? {}),
-            trigger: 'train'
+          trained = Boolean(trainOutcome.trained)
+          if (!trainUsedFallback && trainOutcome.weightsOk === false) {
+            const trainDetails = {
+              ...(trainOutcome.sanitization ?? {}),
+              trigger: 'train'
+            }
+            scheduleWeightRecovery(context, 'train-non-finite', trainDetails)
+            console.warn(
+              `[${label(context)}] Non-finite weights detected after training; deferring tick until recovery.`
+            )
+            return
           }
-          scheduleWeightRecovery(context, 'train-non-finite', trainDetails)
-          console.warn(
-            `[${label(context)}] Non-finite weights detected after training; deferring tick until recovery.`
-          )
-          return
         }
       } else {
         console.warn(`[${label(context)}] Skipping training due to invalid previous observation values.`)
       }
     }
 
-    const actionResult = await chooseActionConcurrent(brain, observation, effectiveEpsilon)
+    let actionResult = null
+    let actionUsedFallback = fallbackActive
+    if (!fallbackActive) {
+      try {
+        actionResult = await chooseActionConcurrent(brain, observation, effectiveEpsilon)
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
+          remoteUnavailable = true
+          remoteIssue = err
+          fallbackActive = true
+          actionUsedFallback = true
+          updateFallbackState(true)
+        } else {
+          throw err
+        }
+      }
+    }
+    if (fallbackActive) {
+      actionResult = await chooseEchoAction({
+        observation,
+        epsilon: effectiveEpsilon,
+        actions: ACTIONS,
+        botId: label(context)
+      })
+      actionUsedFallback = true
+    }
+    if (!actionResult) {
+      throw new Error('Failed to select action for current tick')
+    }
     recordActionSanitization(actionResult?.sanitization)
     const remotePolicyReplaced = Number.parseInt(
       actionResult?.sanitization?.remote?.policy?.replaced ?? 0,
       10
     )
     if (
-      actionResult?.weightsOk === false ||
-      (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0)
+      !actionUsedFallback &&
+      (actionResult?.weightsOk === false ||
+        (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0))
     ) {
       const actionDetails = {
         observation: actionResult?.sanitization?.observation ?? {},
@@ -4407,6 +4511,16 @@ async function synchronizeGeneration() {
   if (generationSyncInFlight) return
   if (!contexts.length) return
   if (!contexts.every(ctx => ctx.readyForSync)) return
+
+  if (!isRemoteBrainConnected()) {
+    if (isEchoFallbackEnabled()) {
+      const status = getRemoteBrainStatus()
+      console.warn(
+        `[Baseline] Skipping generation sync while TensorFlow brain unavailable (${describeRemoteRetry(status)}).`
+      )
+    }
+    return
+  }
 
   generationSyncInFlight = true
   try {
@@ -5255,6 +5369,7 @@ function createContext(index, options = {}) {
     lastWeightRecovery: Date.now(),
     lastWeightRecoveryReason: 'init',
     weightSkipNotified: false,
+    echoFallbackActive: false,
     pendingMutations: [],
     epsilon: EPSILON_START,
     epsilonBoost: 0,
