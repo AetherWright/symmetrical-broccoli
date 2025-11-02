@@ -148,7 +148,6 @@ const ORE_NAME_KEYWORDS = [
   'ore',
   'ingot',
   'debris',
-  'raw_',
   'gem',
   'emerald',
   'lapis',
@@ -158,6 +157,11 @@ const ORE_NAME_KEYWORDS = [
   'coal',
   'redstone'
 ]
+const RAW_ORE_SUFFIXES = new Set([
+  'iron',
+  'gold',
+  'copper'
+])
 const ORE_BLOCK_REWARD_BONUS = readNumberEnv('ORE_BLOCK_REWARD_BONUS', 6, {
   min: 0,
   max: 100
@@ -2632,6 +2636,13 @@ function trackNovelty(context, obs) {
 function isOreName(name) {
   if (!name) return false
   const normalized = String(name).toLowerCase()
+  if (normalized.startsWith('raw_')) {
+    const suffix = normalized.slice(4)
+    const rawType = suffix.split('_')[0]
+    if (rawType && RAW_ORE_SUFFIXES.has(rawType)) {
+      return true
+    }
+  }
   return ORE_NAME_KEYWORDS.some(keyword => normalized.includes(keyword))
 }
 
