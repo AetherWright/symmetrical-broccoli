@@ -2,3 +2,4 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.24.0
 tensorflow>=2.15.0
 h5py>=3.8.0
+requests>=2.31.0
