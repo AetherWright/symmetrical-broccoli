@@ -34,10 +34,6 @@ def _configure_tensorflow_devices():
         "names": [],
     }
     try:
-        tf.config.experimental.enable_tensor_float_32_execution(True)
-    except Exception:  # pragma: no cover - best effort
-        pass
-    try:
         gpus = tf.config.list_physical_devices("GPU")
     except Exception as exc:  # pragma: no cover - defensive
         LOGGER.warning("Unable to inspect GPU devices: %s", exc)
@@ -60,18 +56,45 @@ def _configure_tensorflow_devices():
         logical = tf.config.list_logical_devices("GPU")
         info["logical"] = len(logical)
         LOGGER.info(
-            "TensorFlow GPU acceleration enabled (%d physical, %d logical). Memory growth configured on %d device(s).",
+            "TensorFlow GPU acceleration detected (%d physical, %d logical). Memory growth configured on %d device(s).",
             info["physical"],
             info["logical"],
             configured,
         )
     except Exception:  # pragma: no cover - defensive
         LOGGER.info(
-            "TensorFlow GPU acceleration enabled (%d physical GPU devices). Memory growth configured on %d device(s).",
+            "TensorFlow GPU acceleration detected (%d physical GPU devices). Memory growth configured on %d device(s).",
             info["physical"],
             configured,
         )
     return info
+
+
+def _configure_float_policy(gpu_info):
+    requested_gpu = str(os.environ.get("TF_SERVER_ENABLE_GPU", "0")).lower() in {"1", "true", "yes", "on"}
+    using_gpu = bool(gpu_info.get("available") and requested_gpu)
+    if not using_gpu and gpu_info.get("available"):
+        try:
+            tf.config.set_visible_devices([], "GPU")
+            LOGGER.info("GPU devices disabled; running on CPU with float64 policy.")
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Failed to disable GPU devices: %s", exc)
+    floatx = "float32" if using_gpu else "float64"
+    try:
+        tf.keras.backend.set_floatx(floatx)
+    except Exception as exc:  # pragma: no cover - defensive
+        LOGGER.warning("Failed to set TensorFlow floatx to %s: %s", floatx, exc)
+    if using_gpu:
+        try:
+            tf.config.experimental.enable_tensor_float_32_execution(True)
+        except Exception:  # pragma: no cover - best effort
+            pass
+    return {
+        "floatx": floatx,
+        "tf": tf.float32 if floatx == "float32" else tf.float64,
+        "np": np.float32 if floatx == "float32" else np.float64,
+        "using_gpu": using_gpu,
+    }
 
 
 def _sanitize_segment(value, fallback="default"):
@@ -105,6 +128,19 @@ STATUS = {
 
 GPU_INFO = _configure_tensorflow_devices()
 STATUS["accelerators"] = {"gpu": GPU_INFO}
+
+FLOAT_POLICY = _configure_float_policy(GPU_INFO)
+TF_FLOAT = FLOAT_POLICY["tf"]
+NP_FLOAT = FLOAT_POLICY["np"]
+STATUS["float_policy"] = {
+    "floatx": FLOAT_POLICY["floatx"],
+    "using_gpu": FLOAT_POLICY["using_gpu"],
+}
+LOGGER.info(
+    "TensorFlow float policy set to %s (using_gpu=%s).",
+    FLOAT_POLICY["floatx"],
+    FLOAT_POLICY["using_gpu"],
+)
 
 
 def _read_int(name, default):
@@ -212,7 +248,7 @@ def _sanitize_vector(vector, expected_size=None, label="vector"):
     if vector is None:
         return None, 0, 0, False
     try:
-        arr = np.asarray(vector, dtype=np.float32).reshape(-1)
+        arr = np.asarray(vector, dtype=NP_FLOAT).reshape(-1)
     except (TypeError, ValueError):
         LOGGER.warning("Failed to coerce %s payload into float array", label)
         return None, 0, 0, False
@@ -241,7 +277,7 @@ def _sanitize_vector(vector, expected_size=None, label="vector"):
             clipped,
             adjusted,
         )
-    return arr.astype(np.float32, copy=False), replaced, clipped, adjusted
+    return arr.astype(NP_FLOAT, copy=False), replaced, clipped, adjusted
 
 
 class LookaheadOptimizer:
@@ -335,7 +371,7 @@ class HebbianDense(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         last_dim = int(input_shape[-1])
-        dtype = self.dtype or tf.float32
+        dtype = self.dtype or TF_FLOAT
         self.base_kernel = self.add_weight(
             name="base_kernel",
             shape=(last_dim, self.units),
@@ -769,12 +805,12 @@ class RemoteBrain:
                 )
             if valid_entries:
                 batch = np.stack([entry["tensor"] for entry in valid_entries], axis=0).astype(
-                    np.float32, copy=False
+                    NP_FLOAT, copy=False
                 )
                 action_probs = self.model(batch, training=False)
-                probs_np = action_probs.numpy().astype(np.float32, copy=False)
+                probs_np = action_probs.numpy().astype(NP_FLOAT, copy=False)
                 for entry, row in zip(valid_entries, probs_np):
-                    raw_probs = row.astype(np.float32, copy=False).reshape(-1)
+                    raw_probs = row.astype(NP_FLOAT, copy=False).reshape(-1)
                     replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
                     sanitized_policy = replaced > 0
                     safe_probs = np.nan_to_num(
@@ -790,7 +826,7 @@ class RemoteBrain:
                         safe_probs = np.full(
                             self.action_count,
                             1.0 / max(1, self.action_count),
-                            dtype=np.float32,
+                            dtype=NP_FLOAT,
                         )
                     else:
                         safe_probs = safe_probs / total
@@ -969,18 +1005,18 @@ class RemoteBrain:
 
             if valid_entries:
                 obs_matrix = np.stack([entry["obs"] for entry in valid_entries], axis=0).astype(
-                    np.float32, copy=False
+                    NP_FLOAT, copy=False
                 )
                 actions_tensor = tf.convert_to_tensor(
                     [entry["action"] for entry in valid_entries], dtype=tf.int32
                 )
                 rewards_tensor = tf.convert_to_tensor(
-                    [entry["reward"] for entry in valid_entries], dtype=tf.float32
+                    [entry["reward"] for entry in valid_entries], dtype=TF_FLOAT
                 )
 
                 with tf.GradientTape() as tape:
                     action_pred = self.model(obs_matrix, training=True)
-                    total_loss = tf.constant(0.0, dtype=tf.float32)
+                    total_loss = tf.constant(0.0, dtype=TF_FLOAT)
                     one_hot = tf.one_hot(actions_tensor, self.action_count)
                     log_probs = tf.math.log(action_pred + 1e-8)
                     policy_loss = -tf.reduce_mean(
@@ -990,7 +1026,7 @@ class RemoteBrain:
                     total_loss = tf.where(
                         tf.math.is_finite(total_loss),
                         total_loss,
-                        tf.constant(0.0, dtype=tf.float32),
+                        tf.constant(0.0, dtype=TF_FLOAT),
                     )
 
                 gradients = tape.gradient(total_loss, self.model.trainable_variables)
