@@ -156,6 +156,24 @@ const DEATH_REWARD_PENALTY = (() => {
   return Math.max(5, raw)
 })()
 
+const COSINE_PENALTY_REFERENCE = readNumberEnv('COSINE_PENALTY_REFERENCE', 3.5, {
+  min: 0.1,
+  max: 100
+})
+const COSINE_PENALTY_DECAY = readNumberEnv('COSINE_PENALTY_DECAY', 0.9, {
+  min: 0,
+  max: 0.999
+})
+const COSINE_PENALTY_MIN_SCALE = readNumberEnv('COSINE_PENALTY_MIN_SCALE', 0.35, {
+  min: 0,
+  max: 1
+})
+const COSINE_PENALTY_MAX_SCALE_RAW = readNumberEnv('COSINE_PENALTY_MAX_SCALE', 1.0, {
+  min: 0.1,
+  max: 2.5
+})
+const COSINE_PENALTY_MAX_SCALE = Math.max(COSINE_PENALTY_MIN_SCALE, COSINE_PENALTY_MAX_SCALE_RAW)
+
 const ARMOR_SLOT_PATTERNS = [
   { slot: 'head', keywords: ['helmet', 'cap', 'turtle_helmet', 'turtle_shell'] },
   { slot: 'torso', keywords: ['chestplate', 'tunic', 'elytra'] },
@@ -245,18 +263,20 @@ function ensureRewardSign(amount, expectation = REWARD_SIGN.EITHER, context = nu
 
 function applyRewardComponent(total, amount, expectation = REWARD_SIGN.EITHER, context = null, reason = 'unspecified') {
   const corrected = ensureRewardSign(amount, expectation, context, reason, 'reward')
-  return total + corrected
+  const adjusted = applyCosinePenaltyScaling(context, reason, corrected)
+  return total + adjusted
 }
 
 function addBlockReward(context, amount, expectation = REWARD_SIGN.EITHER, reason = 'block') {
   if (!context) return 0
   const base = Number.isFinite(context.blockReward) ? context.blockReward : 0
   const corrected = ensureRewardSign(amount, expectation, context, reason, 'block')
-  if (corrected === 0) {
+  const adjusted = applyCosinePenaltyScaling(context, reason, corrected)
+  if (adjusted === 0) {
     context.blockReward = base
     return context.blockReward
   }
-  const next = base + corrected
+  const next = base + adjusted
   context.blockReward = Number.isFinite(next) ? next : 0
   return context.blockReward
 }
@@ -275,6 +295,57 @@ function drainPositiveBlockReward(context, amount) {
   const next = Math.max(0, base - deduction)
   context.blockReward = next
   return next
+}
+
+function ensureCosinePenaltyState(context) {
+  if (!context) return null
+  if (!context.cosinePenaltyScaling) {
+    context.cosinePenaltyScaling = {
+      reasons: Object.create(null)
+    }
+  }
+  if (!context.cosinePenaltyScaling.reasons) {
+    context.cosinePenaltyScaling.reasons = Object.create(null)
+  }
+  return context.cosinePenaltyScaling.reasons
+}
+
+function computeCosinePenaltyScale(context, reason, penaltyValue) {
+  if (!context || !Number.isFinite(penaltyValue)) {
+    return 1
+  }
+  const reasons = ensureCosinePenaltyState(context)
+  if (!reasons) return 1
+  const key = reason || 'unspecified'
+  const now = Number.isFinite(context.tickCount) ? context.tickCount : 0
+  let state = reasons[key]
+  if (!state) {
+    state = { phase: 0, lastTick: now }
+    reasons[key] = state
+  }
+  const elapsed = Math.max(0, now - (Number.isFinite(state.lastTick) ? state.lastTick : now))
+  const decay = elapsed > 0 ? Math.pow(COSINE_PENALTY_DECAY, elapsed) : 1
+  const previousPhase = Number.isFinite(state.phase) ? state.phase : 0
+  let phase = Math.max(0, Math.min(1, previousPhase * decay))
+  const severity = Math.min(1, Math.abs(penaltyValue) / COSINE_PENALTY_REFERENCE)
+  phase = Math.max(0, Math.min(1, phase + severity * (1 - phase)))
+  state.phase = phase
+  state.lastTick = now
+  const cosine = 0.5 * (1 - Math.cos(Math.PI * phase))
+  const scale = COSINE_PENALTY_MIN_SCALE + cosine * (COSINE_PENALTY_MAX_SCALE - COSINE_PENALTY_MIN_SCALE)
+  return Number.isFinite(scale) && scale > 0 ? scale : 1
+}
+
+function applyCosinePenaltyScaling(context, reason, value) {
+  if (!context || !Number.isFinite(value) || value >= 0) {
+    return Number.isFinite(value) ? value : 0
+  }
+  const scale = computeCosinePenaltyScale(context, reason, value)
+  const adjusted = value * scale
+  if (!Number.isFinite(adjusted)) {
+    return value
+  }
+  return adjusted
 }
 
 const MOVEMENT_SMOOTH_RAMP_MS = Math.max(
@@ -5111,6 +5182,7 @@ function createContext(index, options = {}) {
     rewardDrift: 0,
     rewardVolatility: 0,
     rewardSignStats: { corrections: 0, history: [] },
+    cosinePenaltyScaling: { reasons: Object.create(null) },
     actionMemoryBest: 0,
     actionMemoryWorst: 0,
     actionCounts: new Map(),
