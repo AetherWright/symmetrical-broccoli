@@ -196,6 +196,9 @@ BRAIN_CONFIG = {
     "lookahead_sync": 6,
     "lookahead_alpha": 0.5,
     "ema_decay": 0.995,
+    "meta_hidden": 96,
+    "meta_state_momentum": 0.9,
+    "reward_prediction_weight": 0.35,
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
@@ -543,14 +546,41 @@ class BrainModel(torch.nn.Module):
         self.context_gate = torch.nn.Linear(BRAIN_CONFIG["shared_units"] * 2, BRAIN_CONFIG["shared_units"])
         self.policy_dense = torch.nn.Linear(BRAIN_CONFIG["shared_units"], BRAIN_CONFIG["shared_units"])
         self.policy_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.reward_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
         self.action_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
         self.action_count = action_count
+        meta_hidden = max(8, int(BRAIN_CONFIG.get("meta_hidden", 32)))
+        meta_input_dim = BRAIN_CONFIG["shared_units"] + action_count
+        self.meta_controller = torch.nn.GRU(meta_input_dim, meta_hidden, batch_first=True)
+        self.meta_to_scale = torch.nn.Linear(meta_hidden, BRAIN_CONFIG["shared_units"])
+        self.meta_to_shift = torch.nn.Linear(meta_hidden, BRAIN_CONFIG["shared_units"])
+        self.meta_state_momentum = float(min(max(BRAIN_CONFIG.get("meta_state_momentum", 0.9), 0.0), 0.999))
+        self.register_buffer(
+            "meta_state",
+            torch.zeros(1, meta_hidden, dtype=FLOAT_POLICY["dtype"]),
+            persistent=False,
+        )
 
     @staticmethod
     def _activate(tensor: torch.Tensor) -> torch.Tensor:
         return natural_log_relu(tensor)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def _update_meta_state(self, new_state: torch.Tensor) -> None:
+        if not isinstance(new_state, torch.Tensor):
+            return
+        with torch.no_grad():
+            mean_state = new_state.mean(dim=1)
+            if mean_state.dtype != self.meta_state.dtype or mean_state.device != self.meta_state.device:
+                mean_state = mean_state.to(device=self.meta_state.device, dtype=self.meta_state.dtype)
+            finite_mask = torch.isfinite(mean_state)
+            if not torch.all(finite_mask):
+                cleaned = torch.where(finite_mask, mean_state, torch.zeros_like(mean_state))
+            else:
+                cleaned = mean_state
+            momentum = self.meta_state_momentum
+            self.meta_state.mul_(momentum).add_(cleaned, alpha=1.0 - momentum)
+
+    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if inputs.dim() != 2:
             raise ValueError(f"Expected 2D inputs (batch, features); got shape {tuple(inputs.shape)}")
         use_batch_stats = self.training and inputs.size(0) > 1
@@ -590,8 +620,20 @@ class BrainModel(torch.nn.Module):
         shared = shared + context_weights * transformer_features
         policy_features = self._activate(self.policy_dense(shared))
         policy_features = self.policy_dropout(policy_features)
-        logits = self.action_head(policy_features)
-        return torch.nn.functional.softmax(logits, dim=-1)
+        reward_prediction = self.reward_head(policy_features)
+        meta_input = torch.cat([policy_features, reward_prediction], dim=-1).unsqueeze(1)
+        initial_state = self.meta_state.to(device=inputs.device, dtype=inputs.dtype)
+        initial_state = initial_state.expand(meta_input.size(0), -1).contiguous()
+        initial_state = initial_state.unsqueeze(0).detach()
+        meta_output, new_state = self.meta_controller(meta_input, initial_state)
+        meta_features = meta_output.squeeze(1)
+        scale = torch.sigmoid(self.meta_to_scale(meta_features))
+        shift = self.meta_to_shift(meta_features)
+        adapted_features = policy_features * scale + shift
+        logits = self.action_head(adapted_features)
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        self._update_meta_state(new_state.detach())
+        return probs, reward_prediction
 
     def hebbian_layers(self) -> List[HebbianLinear]:
         return [self.hebbian_dense_1, self.hebbian_dense_2]
@@ -788,6 +830,8 @@ class RemoteBrain:
                 )
             if valid_entries:
                 batch = np.stack([entry["tensor"] for entry in valid_entries], axis=0).astype(NP_FLOAT, copy=False)
+                meta_state_norm = 0.0
+                reward_predictions_np = None
                 with torch.no_grad():
                     ema_applied = False
                     try:
@@ -795,11 +839,16 @@ class RemoteBrain:
                             self.ema.apply_shadow(self.model)
                             ema_applied = True
                         tensor = torch.from_numpy(batch).to(self.device)
-                        probs = self.model(tensor).cpu().numpy().astype(NP_FLOAT, copy=False)
+                        policy_probs, reward_predictions = self.model(tensor)
+                        probs = policy_probs.cpu().numpy().astype(NP_FLOAT, copy=False)
+                        reward_predictions_np = reward_predictions.cpu().numpy().astype(NP_FLOAT, copy=False)
+                        meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
                     finally:
                         if ema_applied:
                             self.ema.restore(self.model)
-                for entry, row in zip(valid_entries, probs):
+                if reward_predictions_np is None:
+                    reward_predictions_np = np.zeros((len(valid_entries), self.action_count), dtype=NP_FLOAT)
+                for entry, row, reward_row in zip(valid_entries, probs, reward_predictions_np):
                     raw_probs = row.reshape(-1)
                     replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
                     sanitized_policy = replaced > 0
@@ -822,6 +871,20 @@ class RemoteBrain:
                     now = time.time()
                     weights_ok = replaced == 0
                     strikes: Optional[int] = None
+                    reward_row = reward_row.reshape(-1)
+                    reward_replaced = int(reward_row.size - np.count_nonzero(np.isfinite(reward_row)))
+                    reward_sanitized = reward_replaced > 0
+                    safe_rewards = np.nan_to_num(reward_row, nan=0.0, posinf=0.0, neginf=0.0)
+                    if safe_rewards.size != self.action_count:
+                        reward_sanitized = True
+                        if safe_rewards.size > self.action_count:
+                            safe_rewards = safe_rewards[: self.action_count]
+                        else:
+                            safe_rewards = np.pad(
+                                safe_rewards,
+                                (0, self.action_count - safe_rewards.size),
+                                constant_values=0.0,
+                            )
                     if sanitized_policy:
                         LOGGER.warning("Sanitized action probabilities due to non-finite values")
                         if now - self.policy_last_reset > ACT_SANITIZATION_STRIKE_WINDOW:
@@ -860,6 +923,9 @@ class RemoteBrain:
                         policy_meta["strikes"] = int(strikes)
                         policy_meta["strike_threshold"] = int(ACT_SANITIZATION_FORCE_THRESHOLD)
                         policy_meta["window_ms"] = int(ACT_SANITIZATION_STRIKE_WINDOW * 1000)
+                    action_prediction = 0.0
+                    if 0 <= action_index < safe_rewards.size:
+                        action_prediction = float(safe_rewards[action_index])
                     results[entry["index"]] = {
                         "action": action_index,
                         "weights_ok": bool(weights_ok),
@@ -867,6 +933,13 @@ class RemoteBrain:
                             "observation": entry["meta"],
                             "policy": policy_meta,
                             "exploration": bool(exploration),
+                        },
+                        "reward_prediction": {
+                            "value": action_prediction,
+                            "sanitized": bool(reward_sanitized),
+                        },
+                        "meta": {
+                            "state_norm": float(meta_state_norm),
                         },
                     }
             final_results = [result or {"error": "Observation could not be processed"} for result in results]
@@ -938,6 +1011,15 @@ class RemoteBrain:
                             "next_observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
                             "weights": {"replaced": 0, "clipped": 0, "sanitized": False},
                         },
+                        "reward_prediction": {
+                            "predicted": 0.0,
+                            "loss": None,
+                            "advantage": 0.0,
+                        },
+                        "meta": {
+                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "policy_loss": 0.0,
+                        },
                     }
                     continue
                 next_meta = {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False}
@@ -965,6 +1047,15 @@ class RemoteBrain:
                                 "log_penalty": 0.0,
                             },
                         },
+                        "reward_prediction": {
+                            "predicted": 0.0,
+                            "loss": None,
+                            "advantage": 0.0,
+                        },
+                        "meta": {
+                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "policy_loss": 0.0,
+                        },
                     }
                     continue
                 try:
@@ -989,6 +1080,15 @@ class RemoteBrain:
                                 "log_penalty": 0.0,
                             },
                         },
+                        "reward_prediction": {
+                            "predicted": 0.0,
+                            "loss": None,
+                            "advantage": 0.0,
+                        },
+                        "meta": {
+                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "policy_loss": 0.0,
+                        },
                     }
                     continue
                 scaled_reward, reward_meta = self._transform_reward(reward_value, penalty_value)
@@ -1009,17 +1109,30 @@ class RemoteBrain:
                 reward_tensor = torch.tensor([entry["reward"] for entry in valid_entries], dtype=FLOAT_POLICY["dtype"], device=self.device)
                 obs_tensor = torch.from_numpy(obs_matrix).to(self.device)
                 self.optimizer.zero_grad()
-                probs = self.model(obs_tensor)
-                log_probs = torch.log(probs + 1e-8)
+                policy_probs, reward_predictions = self.model(obs_tensor)
+                log_probs = torch.log(policy_probs + 1e-8)
                 selected_log_probs = log_probs.gather(1, action_tensor.view(-1, 1)).squeeze(1)
-                loss = -(selected_log_probs * reward_tensor).mean()
-                if not torch.isfinite(loss):
+                predicted_rewards = reward_predictions.gather(1, action_tensor.view(-1, 1)).squeeze(1)
+                advantages = reward_tensor - predicted_rewards.detach()
+                advantages = advantages - advantages.mean()
+                policy_loss = -(selected_log_probs * advantages).mean()
+                prediction_loss = torch.nn.functional.smooth_l1_loss(predicted_rewards, reward_tensor)
+                prediction_weight = float(BRAIN_CONFIG.get("reward_prediction_weight", 0.0))
+                total_loss = policy_loss + prediction_weight * prediction_loss
+                params: List[torch.nn.Parameter] = []
+                dropped = 0
+                clipped_grads = 0
+                gradient_norm: Optional[float] = None
+                weights_ok = True
+                weight_meta = {"sanitized": False, "replaced": 0, "clipped": 0}
+                policy_loss_value = float(policy_loss.detach().cpu().item())
+                prediction_loss_value = float(prediction_loss.detach().cpu().item())
+                meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
+                if not torch.isfinite(total_loss):
                     LOGGER.warning("Loss became non-finite; skipping update")
                 else:
-                    loss.backward()
+                    total_loss.backward()
                     params, dropped, clipped_grads, gradient_norm = self._filter_gradients()
-                    weights_ok = True
-                    weight_meta = {"sanitized": False, "replaced": 0, "clipped": 0}
                     if params:
                         self.optimizer.step()
                         weights_ok = self._weights_are_finite()
@@ -1035,31 +1148,44 @@ class RemoteBrain:
                                 self.ema.update(self.model)
                     else:
                         dropped = max(dropped, 1)
-                        clipped_grads = clipped_grads
                         gradient_norm = None
                         self.optimizer.zero_grad()
                         weights_ok = self._weights_are_finite()
-                    mean_reward = float(np.mean([entry["reward"] for entry in valid_entries])) if valid_entries else 0.0
-                    hebbian_info = self._apply_hebbian_updates(mean_reward)
-                    for entry in valid_entries:
-                        results[entry["index"]] = {
-                            "trained": bool(params),
-                            "weights_ok": bool(weights_ok),
-                            "dropped_gradients": int(dropped),
-                            "clipped_gradients": int(clipped_grads),
-                            "gradient_norm": float(gradient_norm) if gradient_norm is not None else None,
-                            "sanitized": {
-                                "observation": entry["obs_meta"],
-                                "next_observation": entry["next_meta"],
-                                "weights": {
-                                    "replaced": int(weight_meta.get("replaced", 0)),
-                                    "clipped": int(weight_meta.get("clipped", 0)),
-                                    "sanitized": bool(weight_meta.get("sanitized", False)),
-                                },
-                                "reward": entry["reward_meta"],
+                mean_reward = float(np.mean([entry["reward"] for entry in valid_entries])) if valid_entries else 0.0
+                hebbian_info = self._apply_hebbian_updates(mean_reward)
+                predicted_values_np = predicted_rewards.detach().cpu().numpy().astype(NP_FLOAT, copy=False)
+                advantages_np = advantages.detach().cpu().numpy().astype(NP_FLOAT, copy=False)
+                for offset, entry in enumerate(valid_entries):
+                    predicted_value = float(predicted_values_np[offset]) if offset < len(predicted_values_np) else 0.0
+                    advantage_value = float(advantages_np[offset]) if offset < len(advantages_np) else 0.0
+                    results[entry["index"]] = {
+                        "trained": bool(params),
+                        "weights_ok": bool(weights_ok),
+                        "dropped_gradients": int(dropped),
+                        "clipped_gradients": int(clipped_grads),
+                        "gradient_norm": float(gradient_norm) if gradient_norm is not None else None,
+                        "sanitized": {
+                            "observation": entry["obs_meta"],
+                            "next_observation": entry["next_meta"],
+                            "weights": {
+                                "replaced": int(weight_meta.get("replaced", 0)),
+                                "clipped": int(weight_meta.get("clipped", 0)),
+                                "sanitized": bool(weight_meta.get("sanitized", False)),
                             },
-                            "hebbian": hebbian_info,
-                        }
+                            "reward": entry["reward_meta"],
+                        },
+                        "hebbian": hebbian_info,
+                        "reward_prediction": {
+                            "predicted": predicted_value,
+                            "loss": prediction_loss_value,
+                            "advantage": advantage_value,
+                        },
+                        "meta": {
+                            "state_norm": float(meta_state_norm),
+                            "policy_loss": policy_loss_value,
+                        },
+                    }
+            idle_meta_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
             final_results = [
                 value
                 if value is not None
@@ -1080,6 +1206,15 @@ class RemoteBrain:
                             "log_positive": 0.0,
                             "log_penalty": 0.0,
                         },
+                    },
+                    "reward_prediction": {
+                        "predicted": 0.0,
+                        "loss": None,
+                        "advantage": 0.0,
+                    },
+                    "meta": {
+                        "state_norm": float(idle_meta_norm),
+                        "policy_loss": 0.0,
                     },
                 }
                 for value in results
@@ -1192,6 +1327,7 @@ def log_request(bot_id: Any, endpoint: str, payload: Dict[str, Any]) -> None:
             "action": payload.get("action"),
             "epsilon": payload.get("epsilon"),
             "gradient_norm": payload.get("gradient_norm"),
+            "reward_prediction": payload.get("reward_prediction"),
         }
         STATUS["requests"].append(entry)
         STATUS["requests"] = STATUS["requests"][-50:]
@@ -1246,6 +1382,10 @@ def choose_action_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Bo
         "weights_ok": bool(result.get("weights_ok", True)),
         "sanitized": result.get("sanitized") or {},
     }
+    if "reward_prediction" in result:
+        response_payload["reward_prediction"] = result["reward_prediction"]
+    if "meta" in result:
+        response_payload["meta"] = result["meta"]
     log_request(payload.get("bot_id"), "act", {**payload, **response_payload})
     return response_payload
 
@@ -1276,6 +1416,10 @@ def train_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(defau
         "dropped_gradients": int(result.get("dropped_gradients", 0)),
         "sanitized": result.get("sanitized") or {},
     }
+    if "reward_prediction" in result:
+        response_payload["reward_prediction"] = result["reward_prediction"]
+    if "meta" in result:
+        response_payload["meta"] = result["meta"]
     log_request(payload.get("bot_id"), "train", {**payload, **response_payload})
     return response_payload
 
@@ -1335,6 +1479,10 @@ def batch_act_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
                 "weights_ok": bool(entry_result.get("weights_ok", True)),
                 "sanitized": entry_result.get("sanitized") or {},
             }
+            if "reward_prediction" in entry_result:
+                response_payload["reward_prediction"] = entry_result["reward_prediction"]
+            if "meta" in entry_result:
+                response_payload["meta"] = entry_result["meta"]
             results[index] = response_payload
         for index, item in entries:
             response_payload = results[index] or {}
@@ -1413,6 +1561,10 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
                 "dropped_gradients": int(entry_result.get("dropped_gradients", 0)),
                 "sanitized": entry_result.get("sanitized") or {},
             }
+            if "reward_prediction" in entry_result:
+                response_payload["reward_prediction"] = entry_result["reward_prediction"]
+            if "meta" in entry_result:
+                response_payload["meta"] = entry_result["meta"]
             results[index] = response_payload
         for index, item in entries:
             response_payload = results[index] or {}
