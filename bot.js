@@ -1513,7 +1513,36 @@ const CROWDING_PENALTY_CLAMP = readNumberEnv('BOT_CROWDING_PENALTY_CLAMP', 1, {
   max: 5
 })
 
-const BASE_OBS_FEATURES = 73
+const GROUP_AFFINITY_DECAY = readNumberEnv('BOT_GROUP_AFFINITY_DECAY', 0.92, {
+  min: 0.1,
+  max: 0.999
+})
+const GROUP_AFFINITY_GAIN = readNumberEnv('BOT_GROUP_AFFINITY_GAIN', 0.2, {
+  min: 0.01,
+  max: 1
+})
+const GROUP_AFFINITY_INTENSITY_CLAMP = readNumberEnv('BOT_GROUP_AFFINITY_INTENSITY_CLAMP', 4, {
+  min: 0.5,
+  max: 20
+})
+const GROUP_AFFINITY_CLAMP = readNumberEnv('BOT_GROUP_AFFINITY_CLAMP', 3, {
+  min: 0.5,
+  max: 20
+})
+const GROUP_AFFINITY_RIVALRY_WEIGHT = readNumberEnv('BOT_GROUP_AFFINITY_RIVALRY_WEIGHT', 0.75, {
+  min: 0,
+  max: 3
+})
+const GROUP_AFFINITY_REWARD_SCALE = readNumberEnv('BOT_GROUP_AFFINITY_REWARD_SCALE', 0.18, {
+  min: 0,
+  max: 2
+})
+const GROUP_AFFINITY_REWARD_CLAMP = readNumberEnv('BOT_GROUP_AFFINITY_REWARD_CLAMP', 0.25, {
+  min: 0.01,
+  max: 2
+})
+
+const BASE_OBS_FEATURES = 75
 const MEMORY_REWARD_WINDOW = Math.max(
   4,
   Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 16, { min: 4, max: 64 }))
@@ -1537,6 +1566,10 @@ const EPSILON_BOOST_NORMALIZER = readNumberEnv('BOT_EPSILON_BOOST_NORMALIZER', 1
 const EPSILON_NORMALIZER = readNumberEnv('BOT_EPSILON_NORMALIZER', 1, { min: 0.1, max: 2 })
 const FERAL_FURY_NORMALIZER = readNumberEnv('BOT_FERAL_FURY_NORMALIZER', 5, { min: 0.5, max: 20 })
 const COOPERATION_CLAMP = readNumberEnv('BOT_COOPERATION_CLAMP', 1.5, { min: 0.1, max: 10 })
+const GROUP_RESOURCE_ALIGNMENT_WEIGHT = readNumberEnv('BOT_GROUP_RESOURCE_ALIGNMENT_WEIGHT', 0.6, {
+  min: 0,
+  max: 1
+})
 const STREAK_NORMALIZER = readNumberEnv('BOT_STREAK_NORMALIZER', 24, { min: 1, max: 200 })
 const REPETITION_NORMALIZER = readNumberEnv('BOT_REPETITION_NORMALIZER', 24, { min: 1, max: 200 })
 const MORALE_FRUSTRATION_CLAMP = readNumberEnv('BOT_MORALE_FRUSTRATION_CLAMP', 2, { min: 0.1, max: 10 })
@@ -1618,6 +1651,7 @@ const GLOBAL_RESOURCE_POOL = {
   totalWithdrawal: 0,
   diversity: new Set()
 }
+const GROUP_RESOURCE_POOLS = new Map()
 const COMMUNICATION_BUS = {
   messages: [],
   lastPrune: 0
@@ -2636,6 +2670,96 @@ function normalizePositive(value, limit) {
   return scaled
 }
 
+function createGroupAffinityState() {
+  return {
+    same: 0,
+    other: 0,
+    lastTick: 0,
+    lastUpdatedChannel: null,
+    lastProximity: { same: 0, other: 0, updatedAt: 0 }
+  }
+}
+
+function ensureGroupAffinityState(context) {
+  if (!context) return null
+  if (!context.groupAffinity) {
+    context.groupAffinity = createGroupAffinityState()
+  }
+  const affinity = context.groupAffinity
+  if (!Number.isFinite(affinity.lastTick)) {
+    affinity.lastTick = Number.isFinite(context?.tickCount) ? context.tickCount : 0
+  }
+  if (!affinity.lastProximity) {
+    affinity.lastProximity = { same: 0, other: 0, updatedAt: 0 }
+  }
+  affinity.same = Number.isFinite(affinity.same) && affinity.same >= 0 ? affinity.same : 0
+  affinity.other = Number.isFinite(affinity.other) && affinity.other >= 0 ? affinity.other : 0
+  return affinity
+}
+
+function decayGroupAffinity(context) {
+  const affinity = ensureGroupAffinityState(context)
+  if (!affinity) return null
+  const tick = Number.isFinite(context?.tickCount) ? context.tickCount : 0
+  const lastTick = Number.isFinite(affinity.lastTick) ? affinity.lastTick : tick
+  const steps = Math.max(0, tick - lastTick)
+  if (steps > 0) {
+    const decay = Math.pow(GROUP_AFFINITY_DECAY, steps)
+    affinity.same *= decay
+    affinity.other *= decay
+    affinity.lastTick = tick
+  } else if (!Number.isFinite(affinity.lastTick)) {
+    affinity.lastTick = tick
+  }
+  affinity.same = Math.max(0, Math.min(GROUP_AFFINITY_CLAMP, affinity.same))
+  affinity.other = Math.max(0, Math.min(GROUP_AFFINITY_CLAMP, affinity.other))
+  return affinity
+}
+
+function noteGroupInteraction(context, sameGroup, intensity, channel = 'generic') {
+  if (!context || !Number.isFinite(intensity) || !context.mode) return
+  const magnitude = limitPositive(Math.abs(intensity), GROUP_AFFINITY_INTENSITY_CLAMP)
+  if (magnitude <= 0) return
+  const affinity = decayGroupAffinity(context) || ensureGroupAffinityState(context)
+  if (!affinity) return
+  const gain = magnitude * GROUP_AFFINITY_GAIN
+  if (sameGroup) {
+    affinity.same = Math.min(GROUP_AFFINITY_CLAMP, affinity.same + gain)
+  } else {
+    affinity.other = Math.min(GROUP_AFFINITY_CLAMP, affinity.other + gain)
+  }
+  affinity.lastUpdatedChannel = channel
+}
+
+function registerGroupProximity(context, sameGroupCount, otherGroupCount, timestamp = Date.now()) {
+  const affinity = ensureGroupAffinityState(context)
+  if (!affinity) return
+  if (sameGroupCount > 0) {
+    noteGroupInteraction(context, true, sameGroupCount, 'proximity')
+  }
+  if (otherGroupCount > 0) {
+    noteGroupInteraction(context, false, otherGroupCount, 'proximity')
+  }
+  affinity.lastProximity = {
+    same: Math.max(0, sameGroupCount || 0),
+    other: Math.max(0, otherGroupCount || 0),
+    updatedAt: timestamp
+  }
+}
+
+function computeGroupAffinityBonus(context) {
+  const affinity = decayGroupAffinity(context)
+  if (!affinity) return 0
+  const same = Number.isFinite(affinity.same) ? affinity.same : 0
+  const other = Number.isFinite(affinity.other) ? affinity.other : 0
+  const net = same - other * GROUP_AFFINITY_RIVALRY_WEIGHT
+  if (!Number.isFinite(net) || Math.abs(net) < 1e-3) {
+    return 0
+  }
+  const scaled = net * GROUP_AFFINITY_REWARD_SCALE
+  return limitMagnitude(scaled, GROUP_AFFINITY_REWARD_CLAMP)
+}
+
 function sanitizeCommunicationPayload(payload) {
   if (!payload || typeof payload !== 'object') return null
   const result = {}
@@ -2820,6 +2944,7 @@ function broadcastRewardHighlight(context, now = Date.now()) {
   const record = {
     senderId: context.id,
     lineage: context.lineage ?? null,
+    mode: context.mode ?? null,
     reason: highlight.reason ?? 'unspecified',
     amount,
     createdAt: Number(highlight.createdAt) || now,
@@ -2922,6 +3047,10 @@ function updateRewardEventAwareness(context) {
       intensity *= spatialDecay
     } else if (event.senderId !== context.id) {
       continue
+    }
+    if (event.senderId !== context.id && context.mode && event.mode) {
+      const sameMode = event.mode === context.mode
+      noteGroupInteraction(context, sameMode, intensity, 'reward-highlight')
     }
     if (intensity <= topIntensity) continue
     topIntensity = intensity
@@ -3046,7 +3175,10 @@ function updateCommunicationAwareness(context) {
     if (!withinRange || intensity <= 0) continue
     const index = COMMUNICATION_TYPE_INDEX.get(message.type)
     if (index == null) continue
-    if (message.lineage && context.lineage && message.lineage === context.lineage) {
+    const sameMode = context.mode && message.mode && message.mode === context.mode
+    const sameLineage = message.lineage && context.lineage && message.lineage === context.lineage
+    const isAlly = sameMode || (!message.mode && sameLineage)
+    if (isAlly) {
       summary.allies[index] += intensity
       summary.alliesCount[index] += 1
       if (position && message.position) {
@@ -3059,6 +3191,9 @@ function updateCommunicationAwareness(context) {
       summary.othersCount[index] += 1
     }
     if (message.senderId !== context.id) {
+      if (context.mode && message.mode) {
+        noteGroupInteraction(context, sameMode, intensity, 'communication-heard')
+      }
       lastHeard = Math.max(lastHeard, Number(message.createdAt))
     }
   }
@@ -3315,14 +3450,26 @@ function categorizeResource(name) {
   return null
 }
 
+function ensureGroupResourcePool(mode) {
+  const key = typeof mode === 'string' && mode ? mode : 'unknown'
+  if (!GROUP_RESOURCE_POOLS.has(key)) {
+    GROUP_RESOURCE_POOLS.set(key, { totalContribution: 0, totalWithdrawal: 0 })
+  }
+  return GROUP_RESOURCE_POOLS.get(key)
+}
+
 function registerContribution(context, amount) {
   context.resourceLedger.contributed += amount
   GLOBAL_RESOURCE_POOL.totalContribution += amount
+  const pool = ensureGroupResourcePool(context?.mode)
+  pool.totalContribution += amount
 }
 
 function registerWithdrawal(context, amount) {
   context.resourceLedger.withdrawn += amount
   GLOBAL_RESOURCE_POOL.totalWithdrawal += amount
+  const pool = ensureGroupResourcePool(context?.mode)
+  pool.totalWithdrawal += amount
 }
 
 function updateCooperationScore(context) {
@@ -3330,8 +3477,13 @@ function updateCooperationScore(context) {
   const withdrawal = context.resourceLedger.withdrawn
   const totalContribution = GLOBAL_RESOURCE_POOL.totalContribution || 1
   const totalWithdrawal = GLOBAL_RESOURCE_POOL.totalWithdrawal || 1
-  const fairness = contribution / totalContribution - withdrawal / totalWithdrawal
-  context.cooperationScore = fairness
+  const fairnessGlobal = contribution / totalContribution - withdrawal / totalWithdrawal
+  const groupPool = ensureGroupResourcePool(context?.mode)
+  const groupContribution = groupPool.totalContribution || 1
+  const groupWithdrawal = groupPool.totalWithdrawal || 1
+  const fairnessGroup = contribution / groupContribution - withdrawal / groupWithdrawal
+  context.cooperationScore =
+    fairnessGlobal * (1 - GROUP_RESOURCE_ALIGNMENT_WEIGHT) + fairnessGroup * GROUP_RESOURCE_ALIGNMENT_WEIGHT
 }
 
 function noteResourceDiversity(type) {
@@ -3658,6 +3810,11 @@ function gatherObservations(context) {
   obs[rewardSignalIndex] = rewardSignalAmount
   obs[rewardSignalIndex + 1] = Math.max(0, Math.min(1, rewardSignal?.reason ?? 0))
   obs[rewardSignalIndex + 2] = Math.max(0, Math.min(1, rewardSignal?.freshness ?? 0))
+  const affinityState = ensureGroupAffinityState(context)
+  const affinitySame = normalizePositive(affinityState?.same ?? 0, GROUP_AFFINITY_CLAMP)
+  const affinityOther = normalizePositive(affinityState?.other ?? 0, GROUP_AFFINITY_CLAMP)
+  obs[rewardSignalIndex + 3] = affinitySame
+  obs[rewardSignalIndex + 4] = affinityOther
 
   populateMemoryObservation(context, obs, MEMORY_OBS_START)
 
@@ -4649,6 +4806,8 @@ function computeCrowdingPenalty(context, now = Date.now()) {
   }
   const pos = context.bot.entity.position
   let nearby = 1
+  let sameGroupNearby = 0
+  let otherGroupNearby = 0
   for (const other of contexts) {
     if (!other || other === context) continue
     const otherPos = other.bot?.entity?.position
@@ -4663,7 +4822,15 @@ function computeCrowdingPenalty(context, now = Date.now()) {
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
     if (!Number.isFinite(dist) || dist > CROWDING_RADIUS) continue
     nearby += 1
+    if (context.mode && other.mode) {
+      if (other.mode === context.mode) {
+        sameGroupNearby += 1
+      } else {
+        otherGroupNearby += 1
+      }
+    }
   }
+  registerGroupProximity(context, sameGroupNearby, otherGroupNearby, now)
   if (nearby <= CROWDING_THRESHOLD) {
     return 0
   }
@@ -4676,6 +4843,7 @@ function computeReward(context, obs) {
   let reward = createRewardAccumulator()
 
   ensureTemporalMemoryState(context)
+  decayGroupAffinity(context)
   context.damageDebt = limitPositive((context.damageDebt ?? 0) * DAMAGE_DEBT_DECAY, DAMAGE_MEMORY_CLAMP)
   context.recentDamage = limitPositive((context.recentDamage ?? 0) * DAMAGE_RECENT_DECAY, DAMAGE_MEMORY_CLAMP)
 
@@ -4897,6 +5065,17 @@ function computeReward(context, obs) {
   } else {
     const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
     context.feralFury = Math.max(0, fury * 0.85)
+  }
+
+  const affinityBonus = computeGroupAffinityBonus(context)
+  if (affinityBonus !== 0) {
+    reward = applyRewardComponent(
+      reward,
+      affinityBonus,
+      REWARD_SIGN.EITHER,
+      context,
+      'group-affinity'
+    )
   }
 
   reward = applyRewardComponent(reward, 0.02, REWARD_SIGN.NEGATIVE, context, 'tick-cost')
@@ -6243,7 +6422,8 @@ function createContext(index, options = {}) {
       partnerLineage: partner?.lineage ?? null
     },
     nonFiniteTracker: null,
-    communication: createCommunicationState()
+    communication: createCommunicationState(),
+    groupAffinity: createGroupAffinityState()
   }
 
   resetNonFiniteTracker(context)
