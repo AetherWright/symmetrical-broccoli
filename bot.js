@@ -362,6 +362,7 @@ function applyRewardComponent(total, amount, expectation = REWARD_SIGN.EITHER, c
   accumulator.total += adjusted
   if (adjusted > 0) {
     accumulator.reward += adjusted
+    noteRewardHighlight(context, reason, adjusted)
   } else if (adjusted < 0) {
     accumulator.penalty += Math.abs(adjusted)
   }
@@ -1468,7 +1469,51 @@ const COMMUNICATION_COOLDOWN_PENALTY = readNumberEnv('BOT_COMMUNICATION_COOLDOWN
   max: 1
 })
 
-const BASE_OBS_FEATURES = 70
+const REWARD_EVENT_RANGE = readNumberEnv('BOT_REWARD_EVENT_RANGE', 48, { min: 4, max: 256 })
+const REWARD_EVENT_DECAY_MS = readNumberEnv('BOT_REWARD_EVENT_DECAY_MS', 10000, {
+  min: 250,
+  max: 120000
+})
+const REWARD_EVENT_VALUE_CLAMP = readNumberEnv('BOT_REWARD_EVENT_VALUE_CLAMP', 4, {
+  min: 0.1,
+  max: 50
+})
+const REWARD_EVENT_THRESHOLD = readNumberEnv('BOT_REWARD_EVENT_THRESHOLD', 0.25, {
+  min: 0.01,
+  max: 5
+})
+const REWARD_EVENT_REFRESH_MS = readNumberEnv('BOT_REWARD_EVENT_REFRESH_MS', 3000, {
+  min: 100,
+  max: 60000
+})
+const REWARD_EVENT_BUS_LIMIT = Math.max(
+  64,
+  Math.floor(readNumberEnv('BOT_REWARD_EVENT_BUS_LIMIT', 256, { min: 32, max: 2000 }))
+)
+
+const CROWDING_RADIUS = readNumberEnv('BOT_CROWDING_RADIUS', 5, { min: 1, max: 32 })
+const CROWDING_THRESHOLD = Math.max(
+  2,
+  Math.floor(readNumberEnv('BOT_CROWDING_THRESHOLD', 4, { min: 2, max: 32 }))
+)
+const CROWDING_PENALTY_BASE = readNumberEnv('BOT_CROWDING_PENALTY_BASE', 0.05, {
+  min: 0,
+  max: 1
+})
+const CROWDING_PENALTY_STEP = readNumberEnv('BOT_CROWDING_PENALTY_STEP', 0.015, {
+  min: 0,
+  max: 1
+})
+const CROWDING_ACTION_WINDOW_MS = readNumberEnv('BOT_CROWDING_ACTION_WINDOW_MS', 500, {
+  min: 50,
+  max: 5000
+})
+const CROWDING_PENALTY_CLAMP = readNumberEnv('BOT_CROWDING_PENALTY_CLAMP', 1, {
+  min: 0.1,
+  max: 5
+})
+
+const BASE_OBS_FEATURES = 73
 const MEMORY_REWARD_WINDOW = Math.max(
   4,
   Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 16, { min: 4, max: 64 }))
@@ -1575,6 +1620,10 @@ const GLOBAL_RESOURCE_POOL = {
 }
 const COMMUNICATION_BUS = {
   messages: [],
+  lastPrune: 0
+}
+const REWARD_EVENT_BUS = {
+  events: [],
   lastPrune: 0
 }
 const rewardProfile = {
@@ -2721,6 +2770,172 @@ function broadcastCommunication(context, type, intensity = 1, payload = null) {
   return record
 }
 
+function pruneRewardEventBus(now = Date.now()) {
+  const bus = REWARD_EVENT_BUS
+  if (!bus) return
+  if (now < bus.lastPrune + 200) {
+    return
+  }
+  bus.lastPrune = now
+  const cutoff = now - REWARD_EVENT_DECAY_MS
+  if (!Number.isFinite(cutoff) || cutoff <= 0) {
+    return
+  }
+  if (!Array.isArray(bus.events) || bus.events.length === 0) {
+    bus.events = []
+    return
+  }
+  const filtered = []
+  for (const event of bus.events) {
+    const createdAt = Number(event?.createdAt)
+    if (!Number.isFinite(createdAt) || createdAt < cutoff) {
+      continue
+    }
+    filtered.push(event)
+  }
+  if (filtered.length > REWARD_EVENT_BUS_LIMIT) {
+    bus.events = filtered.slice(filtered.length - REWARD_EVENT_BUS_LIMIT)
+  } else {
+    bus.events = filtered
+  }
+}
+
+function refreshRewardHighlight(context, now = Date.now()) {
+  if (!context?.rewardHighlight) {
+    return
+  }
+  const createdAt = Number(context.rewardHighlight.createdAt)
+  if (!Number.isFinite(createdAt) || now - createdAt > REWARD_EVENT_DECAY_MS) {
+    context.rewardHighlight = null
+  }
+}
+
+function broadcastRewardHighlight(context, now = Date.now()) {
+  if (!context?.rewardHighlight) return
+  const highlight = context.rewardHighlight
+  const amount = limitPositive(Number(highlight.amount) || 0, REWARD_EVENT_VALUE_CLAMP)
+  if (amount <= 0) return
+  const position = context.bot?.entity?.position
+  if (!position) return
+  const record = {
+    senderId: context.id,
+    lineage: context.lineage ?? null,
+    reason: highlight.reason ?? 'unspecified',
+    amount,
+    createdAt: Number(highlight.createdAt) || now,
+    position: {
+      x: Number(position.x) || 0,
+      y: Number(position.y) || 0,
+      z: Number(position.z) || 0
+    }
+  }
+  pruneRewardEventBus(now)
+  REWARD_EVENT_BUS.events.push(record)
+  if (REWARD_EVENT_BUS.events.length > REWARD_EVENT_BUS_LIMIT) {
+    REWARD_EVENT_BUS.events.splice(
+      0,
+      Math.max(0, REWARD_EVENT_BUS.events.length - REWARD_EVENT_BUS_LIMIT)
+    )
+  }
+}
+
+function noteRewardHighlight(context, reason, amount, now = Date.now()) {
+  if (!context || !Number.isFinite(amount) || amount <= 0) {
+    return
+  }
+  if (amount < REWARD_EVENT_THRESHOLD) {
+    return
+  }
+  const normalizedReason = typeof reason === 'string' && reason ? reason : 'unspecified'
+  const clampedAmount = limitPositive(amount, REWARD_EVENT_VALUE_CLAMP)
+  const highlight = context.rewardHighlight
+  const shouldReplace =
+    !highlight ||
+    !Number.isFinite(highlight.amount) ||
+    clampedAmount > highlight.amount * 1.05 ||
+    now - (Number(highlight.createdAt) || 0) >= REWARD_EVENT_REFRESH_MS
+  if (!shouldReplace) {
+    return
+  }
+  context.rewardHighlight = {
+    amount: clampedAmount,
+    reason: normalizedReason,
+    createdAt: now
+  }
+  broadcastRewardHighlight(context, now)
+}
+
+function hashRewardReason(reason) {
+  if (!reason) return 0
+  const text = String(reason)
+  let hash = 0
+  for (let i = 0; i < text.length; i++) {
+    hash = (hash * 33 + text.charCodeAt(i)) >>> 0
+  }
+  const bucket = hash % 997
+  return bucket / 996
+}
+
+function ensureRewardSignalState(context) {
+  if (!context) return null
+  if (!context.rewardSignal) {
+    context.rewardSignal = { amount: 0, reason: 0, freshness: 0, updatedAt: 0 }
+  }
+  return context.rewardSignal
+}
+
+function updateRewardEventAwareness(context) {
+  const signal = ensureRewardSignalState(context)
+  if (!signal || !context?.bot?.entity?.position) {
+    if (signal) {
+      signal.amount = 0
+      signal.reason = 0
+      signal.freshness = 0
+      signal.updatedAt = Date.now()
+    }
+    return signal
+  }
+  const now = Date.now()
+  pruneRewardEventBus(now)
+  const position = context.bot.entity.position
+  let topIntensity = 0
+  let topReason = 0
+  let topFreshness = 0
+  for (const event of REWARD_EVENT_BUS.events) {
+    if (!event) continue
+    const dt = now - Number(event.createdAt)
+    if (!Number.isFinite(dt) || dt < 0 || dt > REWARD_EVENT_DECAY_MS) continue
+    let intensity = limitPositive(Number(event.amount) || 0, REWARD_EVENT_VALUE_CLAMP)
+    if (intensity <= 0) continue
+    const timeDecay = Math.max(0, 1 - dt / REWARD_EVENT_DECAY_MS)
+    intensity *= timeDecay
+    const eventPos = event.position
+    if (eventPos && position) {
+      const dx = Number(eventPos.x) - Number(position.x)
+      const dy = Number(eventPos.y) - Number(position.y)
+      const dz = Number(eventPos.z) - Number(position.z)
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+      if (!Number.isFinite(dist) || dist > REWARD_EVENT_RANGE) {
+        continue
+      }
+      const spatialDecay = Math.max(0, 1 - dist / REWARD_EVENT_RANGE)
+      intensity *= spatialDecay
+    } else if (event.senderId !== context.id) {
+      continue
+    }
+    if (intensity <= topIntensity) continue
+    topIntensity = intensity
+    topReason = hashRewardReason(event.reason)
+    topFreshness = timeDecay
+  }
+  signal.amount = topIntensity
+  signal.reason = Math.max(0, Math.min(1, topReason))
+  signal.freshness = Math.max(0, Math.min(1, topFreshness))
+  signal.updatedAt = now
+  refreshRewardHighlight(context, now)
+  return signal
+}
+
 function computeCommunicationIntensity(context, type) {
   switch (type) {
     case 'resource': {
@@ -3436,6 +3651,13 @@ function gatherObservations(context) {
       obs[56 + i] = 0
     }
   }
+
+  const rewardSignalIndex = 56 + COMMUNICATION_TYPE_COUNT * 2 + 4
+  const rewardSignal = updateRewardEventAwareness(context)
+  const rewardSignalAmount = normalizePositive(rewardSignal?.amount ?? 0, REWARD_EVENT_VALUE_CLAMP)
+  obs[rewardSignalIndex] = rewardSignalAmount
+  obs[rewardSignalIndex + 1] = Math.max(0, Math.min(1, rewardSignal?.reason ?? 0))
+  obs[rewardSignalIndex + 2] = Math.max(0, Math.min(1, rewardSignal?.freshness ?? 0))
 
   populateMemoryObservation(context, obs, MEMORY_OBS_START)
 
@@ -4417,6 +4639,39 @@ function shouldCullForDowntrend(context) {
   return true
 }
 
+function computeCrowdingPenalty(context, now = Date.now()) {
+  if (!context?.bot?.entity?.position) return 0
+  if (!Array.isArray(contexts) || contexts.length === 0) return 0
+  if (!Number.isFinite(context.tickCount) || context.tickCount <= 0) return 0
+  const lastAction = Number(context.lastActionAt) || 0
+  if (!Number.isFinite(lastAction) || now - lastAction > CROWDING_ACTION_WINDOW_MS) {
+    return 0
+  }
+  const pos = context.bot.entity.position
+  let nearby = 1
+  for (const other of contexts) {
+    if (!other || other === context) continue
+    const otherPos = other.bot?.entity?.position
+    if (!otherPos) continue
+    const otherLastAction = Number(other.lastActionAt) || 0
+    if (!Number.isFinite(otherLastAction) || now - otherLastAction > CROWDING_ACTION_WINDOW_MS) {
+      continue
+    }
+    const dx = Number(otherPos.x) - Number(pos.x)
+    const dy = Number(otherPos.y) - Number(pos.y)
+    const dz = Number(otherPos.z) - Number(pos.z)
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    if (!Number.isFinite(dist) || dist > CROWDING_RADIUS) continue
+    nearby += 1
+  }
+  if (nearby <= CROWDING_THRESHOLD) {
+    return 0
+  }
+  const excess = nearby - CROWDING_THRESHOLD
+  const penalty = CROWDING_PENALTY_BASE + excess * CROWDING_PENALTY_STEP
+  return limitPositive(penalty, CROWDING_PENALTY_CLAMP)
+}
+
 function computeReward(context, obs) {
   let reward = createRewardAccumulator()
 
@@ -4535,6 +4790,11 @@ function computeReward(context, obs) {
     }
     const fatiguePenalty = Math.min(0.6, context.repetitionStreak * 0.05)
     reward = applyRewardComponent(reward, fatiguePenalty, REWARD_SIGN.NEGATIVE, context, 'action-fatigue')
+  }
+
+  const crowdPenalty = computeCrowdingPenalty(context)
+  if (crowdPenalty > 0) {
+    reward = applyRewardComponent(reward, -crowdPenalty, REWARD_SIGN.NEGATIVE, context, 'crowding')
   }
 
   if (context.noveltyFlag) {
@@ -4883,6 +5143,7 @@ async function tickLoop(context) {
 
     const action = actionResult.action
     await executeAction(context, action)
+    context.lastActionAt = Date.now()
 
     recordActionMemory(context, action)
 
@@ -5887,6 +6148,7 @@ function createContext(index, options = {}) {
     lastObs: null,
     lastAction: null,
     prevAction: null,
+    lastActionAt: 0,
     lastPos: null,
     lastHealth: 20,
     lastFood: 20,
@@ -5953,6 +6215,8 @@ function createContext(index, options = {}) {
       lastNetDrop: 0,
       lastUpdatedGeneration: baselineState.generation ?? 0
     },
+    rewardHighlight: null,
+    rewardSignal: null,
     morale: {
       value: MORALE_BASELINE,
       frustration: 0,
