@@ -380,7 +380,21 @@ class BrainModel(torch.nn.Module):
         return natural_log_relu(tensor)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        x = self.input_bn(inputs)
+        if inputs.dim() != 2:
+            raise ValueError(f"Expected 2D inputs (batch, features); got shape {tuple(inputs.shape)}")
+        use_batch_stats = self.training and inputs.size(0) > 1
+        running_mean = self.input_bn.running_mean if self.input_bn.track_running_stats else None
+        running_var = self.input_bn.running_var if self.input_bn.track_running_stats else None
+        x = torch.nn.functional.batch_norm(
+            inputs,
+            running_mean,
+            running_var,
+            self.input_bn.weight,
+            self.input_bn.bias,
+            use_batch_stats,
+            self.input_bn.momentum,
+            self.input_bn.eps,
+        )
         x = self._activate(self.hidden_dense_1(x))
         x = self.hidden_dropout_1(x)
         x = self.hebbian_dense_1(x)
