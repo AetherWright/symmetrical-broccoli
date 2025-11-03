@@ -262,6 +262,7 @@ BRAIN_CONFIG = {
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
 GRAD_CLIP_VALUE = abs(_read_float("TF_SERVER_GRADIENT_CLIP_VALUE", 100.0))
 GRAD_CLIP_GLOBAL_NORM = abs(_read_float("TF_SERVER_GRADIENT_GLOBAL_NORM", 250.0))
+GRAD_SKIP_GLOBAL_NORM = abs(_read_float("TF_SERVER_GRADIENT_SKIP_GLOBAL_NORM", 0.0))
 WEIGHT_CLAMP = abs(_read_float("TF_SERVER_WEIGHT_CLAMP", 1e6))
 
 
@@ -353,6 +354,16 @@ class LookaheadOptimizer:
                 continue
             fast_value = self._read_variable(self._fast_vars[index])
             self._slow_vars[index].assign(fast_value)
+
+    def get_slow_variable_value(self, variable):
+        index = self._fast_var_ids.get(id(variable))
+        if index is None:
+            return None
+        slow_var = self._slow_vars[index]
+        try:
+            return slow_var.numpy()
+        except AttributeError:
+            return np.asarray(slow_var)
 
     def apply_gradients(self, grads_and_vars):
         if not grads_and_vars:
@@ -696,6 +707,20 @@ class RemoteBrain:
                 except Exception:  # pragma: no cover - monitoring best effort
                     global_norm = None
         cleaned = list(zip(gradients, variables))
+        if global_norm is not None:
+            if not np.isfinite(global_norm):
+                LOGGER.warning(
+                    "Global gradient norm became non-finite; dropping %d gradient tensors",
+                    len(cleaned),
+                )
+                return [], dropped + len(cleaned), clipped, None
+            if GRAD_SKIP_GLOBAL_NORM > 0 and global_norm > GRAD_SKIP_GLOBAL_NORM:
+                LOGGER.warning(
+                    "Global gradient norm %.3f exceeded skip threshold %.3f; skipping gradient application",
+                    global_norm,
+                    GRAD_SKIP_GLOBAL_NORM,
+                )
+                return [], dropped + len(cleaned), clipped, global_norm
         return cleaned, dropped, clipped, global_norm
 
     @staticmethod
@@ -755,17 +780,59 @@ class RemoteBrain:
         return meta
 
     def _sanitize_model_weights(self, reason):
-        weights = self.model.get_weights()
-        sanitized_weights, meta = self._sanitize_weight_list(weights)
+        replaced_total = 0
+        clipped_total = 0
+        sanitized_any = False
+        slow_value_lookup = None
+        fetch_slow_value = getattr(self.optimizer, "get_slow_variable_value", None)
+        if callable(fetch_slow_value):
+            slow_value_lookup = fetch_slow_value
+        trainable_ids = {id(var): var for var in self.model.trainable_variables}
+        for variable in self.model.weights:
+            array = variable.numpy()
+            dtype = getattr(variable.dtype, "as_numpy_dtype", array.dtype)
+            invalid_mask = ~np.isfinite(array)
+            invalid_count = int(np.count_nonzero(invalid_mask))
+            finite_array = np.nan_to_num(
+                array,
+                nan=0.0,
+                posinf=WEIGHT_CLAMP + 1.0 if WEIGHT_CLAMP > 0 else 0.0,
+                neginf=-(WEIGHT_CLAMP + 1.0) if WEIGHT_CLAMP > 0 else 0.0,
+            )
+            clip_needed = bool(WEIGHT_CLAMP > 0 and np.any(np.abs(finite_array) > WEIGHT_CLAMP))
+            if not invalid_count and not clip_needed:
+                continue
+            sanitized_any = True
+            sanitized = array.astype(dtype, copy=True)
+            if invalid_count:
+                replacement = None
+                if slow_value_lookup is not None and id(variable) in trainable_ids:
+                    slow_value = slow_value_lookup(trainable_ids[id(variable)])
+                    if slow_value is not None and np.shape(slow_value) == sanitized.shape:
+                        replacement = np.asarray(slow_value, dtype=dtype)
+                        if not np.all(np.isfinite(replacement)):
+                            replacement = np.nan_to_num(replacement, nan=0.0, posinf=0.0, neginf=0.0)
+                if replacement is not None:
+                    sanitized[invalid_mask] = replacement[invalid_mask]
+                else:
+                    sanitized[invalid_mask] = 0.0
+                replaced_total += invalid_count
+            clip_count = 0
+            if WEIGHT_CLAMP > 0:
+                clip_mask = np.abs(sanitized) > WEIGHT_CLAMP
+                clip_count = int(np.count_nonzero(clip_mask))
+                if clip_count:
+                    np.clip(sanitized, -WEIGHT_CLAMP, WEIGHT_CLAMP, out=sanitized)
+                    clipped_total += clip_count
+            if sanitized.dtype != dtype:
+                sanitized = sanitized.astype(dtype, copy=False)
+            variable.assign(sanitized)
+        meta = {
+            "sanitized": bool(sanitized_any),
+            "replaced": int(replaced_total),
+            "clipped": int(clipped_total),
+        }
         if meta["sanitized"]:
-            final_weights = []
-            for original, sanitized in zip(weights, sanitized_weights):
-                array = np.asarray(sanitized)
-                dtype = getattr(original, "dtype", array.dtype)
-                if array.dtype != dtype:
-                    array = array.astype(dtype, copy=False)
-                final_weights.append(array)
-            self.model.set_weights(final_weights)
             self.optimizer.sync_slow_variables(self.model.trainable_variables)
             LOGGER.warning(
                 "Sanitized %s weights (replaced=%d, clipped=%d)",
@@ -806,6 +873,7 @@ class RemoteBrain:
             count = len(observations)
             results = [None] * count
             valid_entries = []
+
             for index, observation in enumerate(observations):
                 epsilon = 0.1
                 if index < len(epsilons):
@@ -931,11 +999,30 @@ class RemoteBrain:
             raise RuntimeError(str(result["error"]))
         return result
 
-    def train_batch(self, observations, actions, rewards, next_observations):
+    def train_batch(
+        self, observations, actions, rewards, penalties, next_observations
+    ):
         with self._lock:
             count = len(observations)
             results = [None] * count
             valid_entries = []
+
+            def _sanitize_component(value, label):
+                if value is None:
+                    return 0.0
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    LOGGER.warning("Received invalid %s value: %s", label, value)
+                    return 0.0
+                if not np.isfinite(numeric):
+                    LOGGER.warning("%s contained non-finite value: %s", label, value)
+                    return 0.0
+                if numeric < 0.0:
+                    LOGGER.warning("%s was negative; clamping to zero: %s", label, value)
+                    numeric = 0.0
+                return float(numeric)
+
             for index, observation in enumerate(observations):
                 try:
                     obs, obs_meta = self._prepare_observation(observation, "observation")
@@ -970,8 +1057,11 @@ class RemoteBrain:
 
                 bounded_action = None
                 reward_value = rewards[index] if index < len(rewards) else None
+                penalty_value = penalties[index] if index < len(penalties) else None
                 action_value = actions[index] if index < len(actions) else None
-                if action_value is None or reward_value is None:
+                if action_value is None or (
+                    reward_value is None and penalty_value is None
+                ):
                     results[index] = {
                         "trained": False,
                         "weights_ok": True,
@@ -1019,15 +1109,25 @@ class RemoteBrain:
                     }
                     continue
                 bounded_action = int(np.clip(bounded_action, 0, self.action_count - 1))
-                try:
-                    reward_float = float(reward_value)
-                except (TypeError, ValueError):
-                    LOGGER.warning("Received invalid reward value: %s", reward_value)
-                    reward_float = 0.0
-                if not np.isfinite(reward_float):
-                    LOGGER.warning("Reward contained non-finite value: %s", reward_value)
-                    reward_float = 0.0
-                scaled_reward = float(np.clip(reward_float, -1.0, 1.0))
+                positive_component = _sanitize_component(
+                    reward_value, "reward component"
+                )
+                penalty_component = _sanitize_component(
+                    penalty_value, "penalty component"
+                )
+
+                reward_float = positive_component - penalty_component
+                log_reward_component = float(np.log1p(positive_component))
+                log_penalty_component = float(np.log1p(penalty_component))
+                scaled_reward = log_reward_component - log_penalty_component
+                if not np.isfinite(scaled_reward):
+                    LOGGER.warning(
+                        "Reward transformation produced non-finite value (raw=%s, log_reward=%s, log_penalty=%s)",
+                        reward_float,
+                        log_reward_component,
+                        log_penalty_component,
+                    )
+                    scaled_reward = 0.0
 
                 next_meta = {
                     "replaced": 0,
@@ -1055,6 +1155,13 @@ class RemoteBrain:
                         "next_meta": next_meta,
                         "action": bounded_action,
                         "reward": scaled_reward,
+                        "reward_meta": {
+                            "raw": reward_float,
+                            "positive": positive_component,
+                            "penalty": penalty_component,
+                            "log_positive": log_reward_component,
+                            "log_penalty": log_penalty_component,
+                        },
                     }
                 )
 
@@ -1130,6 +1237,7 @@ class RemoteBrain:
                 current_lr = self._current_learning_rate()
 
                 for entry in valid_entries:
+                    reward_meta = entry.get("reward_meta", {})
                     results[entry["index"]] = {
                         "trained": bool(cleaned_grads),
                         "weights_ok": bool(weights_ok),
@@ -1145,6 +1253,7 @@ class RemoteBrain:
                                 "clipped": int(weight_meta.get("clipped", 0)),
                                 "sanitized": bool(weight_meta.get("sanitized", False)),
                             },
+                            "reward": reward_meta,
                         },
                         "hebbian": hebbian_info,
                     }
@@ -1179,11 +1288,12 @@ class RemoteBrain:
                     }
             return results
 
-    def train(self, observation, action_index, reward, next_observation):
+    def train(self, observation, action_index, reward, penalty, next_observation):
         batch = self.train_batch(
             [observation],
             [action_index],
             [reward],
+            [penalty],
             [next_observation],
         )
         if not batch:
@@ -1421,6 +1531,7 @@ def log_request(bot_id, endpoint, payload):
             "bot_id": bot_id,
             "endpoint": endpoint,
             "reward": payload.get("reward"),
+            "penalty": payload.get("penalty"),
             "action": payload.get("action"),
             "epsilon": payload.get("epsilon"),
             "gradient_norm": payload.get("gradient_norm"),
@@ -1435,6 +1546,7 @@ def log_request(bot_id, endpoint, payload):
                     "last_seen": entry["timestamp"],
                     "last_action": payload.get("action"),
                     "last_reward": payload.get("reward"),
+                    "last_penalty": payload.get("penalty"),
                     "epsilon": payload.get("epsilon"),
                     "gradient_norm": payload.get("gradient_norm"),
                 }
@@ -1510,6 +1622,7 @@ def train_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(defau
             observation,
             payload.get("action"),
             payload.get("reward"),
+            payload.get("penalty"),
             next_observation if isinstance(next_observation, (list, tuple)) else None,
         )
     except RuntimeError as exc:
@@ -1618,6 +1731,7 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
         observations: List[List[Any]] = []
         actions: List[Any] = []
         rewards: List[Any] = []
+        penalties: List[Any] = []
         next_observations: List[Any] = []
         valid_indices: List[int] = []
         for index, item in entries:
@@ -1639,6 +1753,7 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
             observations.append(observation)
             actions.append(item.get("action"))
             rewards.append(item.get("reward"))
+            penalties.append(item.get("penalty"))
             next_observations.append(item.get("next_observation"))
             valid_indices.append(index)
         if not observations:
@@ -1650,6 +1765,7 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
                 observations,
                 actions,
                 rewards,
+                penalties,
                 next_observations,
             )
         except RuntimeError as exc:
