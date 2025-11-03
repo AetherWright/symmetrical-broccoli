@@ -808,6 +808,7 @@ class RemoteBrain:
             self.model.eval()
             results: List[Optional[Dict[str, Any]]] = [None] * len(observations)
             valid_entries = []
+
             for index, observation in enumerate(observations):
                 epsilon = 0.1
                 if index < len(epsilons):
@@ -996,6 +997,23 @@ class RemoteBrain:
             self.model.train()
             results: List[Optional[Dict[str, Any]]] = [None] * len(observations)
             valid_entries = []
+
+            def _sanitize_component(value, label):
+                if value is None:
+                    return 0.0
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    LOGGER.warning("Received invalid %s value: %s", label, value)
+                    return 0.0
+                if not np.isfinite(numeric):
+                    LOGGER.warning("%s contained non-finite value: %s", label, value)
+                    return 0.0
+                if numeric < 0.0:
+                    LOGGER.warning("%s was negative; clamping to zero: %s", label, value)
+                    numeric = 0.0
+                return float(numeric)
+
             for index, observation in enumerate(observations):
                 try:
                     obs, obs_meta = self._prepare_observation(observation, "observation")
