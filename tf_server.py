@@ -921,7 +921,11 @@ class RemoteBrain:
             averaged = {}
             for key in state_dicts[0]:
                 stacked = torch.stack([state[key] for state in state_dicts], dim=0)
-                averaged[key] = stacked.mean(dim=0)
+                if stacked.dtype.is_floating_point or stacked.dtype.is_complex:
+                    averaged_value = stacked.mean(dim=0)
+                else:
+                    averaged_value = torch.round(stacked.to(torch.float32).mean(dim=0)).to(stacked.dtype)
+                averaged[key] = averaged_value
             self.model.load_state_dict(averaged)
             self.optimizer.sync_slow_parameters(list(self.model.parameters()))
 
