@@ -345,17 +345,17 @@ export async function chooseActionConcurrent(brain, observation, epsilon) {
   }
 }
 
-export async function trainBrainConcurrent(brain, observation, actionIndex, reward, nextObservation) {
+export async function trainBrainConcurrent(brain, observation, actionIndex, reward, penalty, nextObservation) {
   const pool = ensurePool()
   if (!pool) {
-    return directTrainBrain(brain, observation, actionIndex, reward, nextObservation)
+    return directTrainBrain(brain, observation, actionIndex, reward, penalty, nextObservation)
   }
   try {
-    return await pool.run('trainBrain', [brain, observation, actionIndex, reward, nextObservation])
+    return await pool.run('trainBrain', [brain, observation, actionIndex, reward, penalty, nextObservation])
   } catch (error) {
     if (fallbackOnFailure(error)) {
       await shutdownBrainWorkerPool()
-      return directTrainBrain(brain, observation, actionIndex, reward, nextObservation)
+      return directTrainBrain(brain, observation, actionIndex, reward, penalty, nextObservation)
     }
     throw error
   }
