@@ -1419,21 +1419,27 @@ const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
 const EMOTION_VECTOR_SIZE = 3
-const BASE_OBS_FEATURES = 44
+const BASE_OBS_FEATURES = 48
 const MEMORY_REWARD_WINDOW = Math.max(
   4,
-  Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 8, { min: 4, max: 32 }))
+  Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 16, { min: 4, max: 64 }))
 )
 const MEMORY_ACTION_WINDOW = Math.max(
   4,
-  Math.floor(readNumberEnv('BOT_MEMORY_ACTION_WINDOW', 8, { min: 4, max: 32 }))
+  Math.floor(readNumberEnv('BOT_MEMORY_ACTION_WINDOW', 16, { min: 4, max: 64 }))
 )
-const MEMORY_AGGREGATE_COUNT = 8
+const MEMORY_AGGREGATE_COUNT = 13
 const MEMORY_OBS_SIZE = MEMORY_REWARD_WINDOW + MEMORY_ACTION_WINDOW + MEMORY_AGGREGATE_COUNT
 const MEMORY_OBS_START = BASE_OBS_FEATURES
 const OBS_SIZE = BASE_OBS_FEATURES + MEMORY_OBS_SIZE
 const NOVELTY_HASH_PRECISION = 2
 const NOVELTY_TARGET = 500
+const CONTEXT_TICK_NORMALIZER = readNumberEnv('BOT_CONTEXT_TICK_NORMALIZER', 2400, { min: 240, max: 48000 })
+const CONTEXT_TRAINING_NORMALIZER = readNumberEnv('BOT_CONTEXT_TRAINING_NORMALIZER', 600, { min: 60, max: 40000 })
+const CONTEXT_REWARD_NORMALIZER = readNumberEnv('BOT_CONTEXT_REWARD_NORMALIZER', 300, { min: 10, max: 5000 })
+const NOVELTY_COUNT_NORMALIZER = readNumberEnv('BOT_NOVELTY_COUNT_NORMALIZER', NOVELTY_TARGET, { min: 50, max: 5000 })
+const MUTATION_QUEUE_CLAMP = readNumberEnv('BOT_MUTATION_QUEUE_CLAMP', 12, { min: 1, max: 128 })
+const EPSILON_BOOST_NORMALIZER = readNumberEnv('BOT_EPSILON_BOOST_NORMALIZER', 1, { min: 0.05, max: 10 })
 const STAGNATION_WINDOW = 40
 const STAGNATION_VARIANCE_THRESHOLD = 0.0025
 const STAGNATION_MUTATION_THRESHOLD = 3
@@ -2655,6 +2661,20 @@ function populateMemoryObservation(context, obs, startIndex) {
   obs[index++] = normalizeMagnitude(context.actionMemoryWorst, ACTION_VALUE_CLAMP)
   obs[index++] = normalizePositive(context.damageDebt, DAMAGE_MEMORY_CLAMP)
   obs[index++] = normalizePositive(context.recentDamage, DAMAGE_MEMORY_CLAMP)
+  const pendingMutations = Array.isArray(context.pendingMutations)
+    ? context.pendingMutations.length
+    : 0
+  obs[index++] = normalizePositive(pendingMutations, MUTATION_QUEUE_CLAMP)
+  const epsilonBoost = Number.isFinite(context.epsilonBoost) ? Math.abs(context.epsilonBoost) : 0
+  obs[index++] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
+  const stagnation = context.stagnation?.streak ?? 0
+  const stagnationWindow = STAGNATION_WINDOW > 0 ? STAGNATION_WINDOW : 1
+  const normalizedStagnation = Number.isFinite(stagnation)
+    ? Math.max(0, Math.min(1, stagnation / stagnationWindow))
+    : 0
+  obs[index++] = normalizedStagnation
+  obs[index++] = context.waitingForBrain ? 1 : 0
+  obs[index++] = context.weightsSuspect ? 1 : 0
 
   return index
 }
@@ -3005,6 +3025,15 @@ function gatherObservations(context) {
   obs[42] = Math.max(0, Math.min(1, lineagePrestige))
   const diversityRatio = Math.min(1, GLOBAL_RESOURCE_POOL.diversity.size / RESOURCE_TYPES.length)
   obs[43] = diversityRatio
+
+  const tickCount = Number.isFinite(context.tickCount) ? context.tickCount : 0
+  obs[44] = normalizePositive(tickCount, CONTEXT_TICK_NORMALIZER)
+  const trainingSteps = Number.isFinite(context.trainingSteps) ? context.trainingSteps : 0
+  obs[45] = normalizePositive(trainingSteps, CONTEXT_TRAINING_NORMALIZER)
+  const cumulativeReward = Number.isFinite(context.cumulativeReward) ? context.cumulativeReward : 0
+  obs[46] = normalizeMagnitude(cumulativeReward, CONTEXT_REWARD_NORMALIZER)
+  const noveltyTotal = Number.isFinite(context.noveltyCount) ? context.noveltyCount : 0
+  obs[47] = normalizePositive(noveltyTotal, NOVELTY_COUNT_NORMALIZER)
 
   populateMemoryObservation(context, obs, MEMORY_OBS_START)
 
