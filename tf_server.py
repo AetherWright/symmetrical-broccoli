@@ -9,14 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import tensorflow as tf
+import torch
 from fastapi import Body, FastAPI, HTTPException
 import uvicorn
-
-try:
-    import h5py  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    h5py = None
 
 ALLOWED_SEGMENT_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
 STORAGE_ROOT = os.environ.get("TF_SERVER_STORAGE_ROOT") or os.path.join(os.getcwd(), "tf_server_storage")
@@ -25,79 +20,46 @@ os.makedirs(STORAGE_ROOT, exist_ok=True)
 LOGGER = logging.getLogger("tf_server")
 
 
-def _configure_tensorflow_devices():
-    info = {
-        "available": False,
-        "physical": 0,
-        "logical": 0,
-        "memory_growth": 0,
-        "names": [],
-    }
-    try:
-        gpus = tf.config.list_physical_devices("GPU")
-    except Exception as exc:  # pragma: no cover - defensive
-        LOGGER.warning("Unable to inspect GPU devices: %s", exc)
-        return info
-    if not gpus:
-        LOGGER.info("No GPU devices detected; TensorFlow will run on CPU.")
-        return info
-    info["available"] = True
-    info["physical"] = len(gpus)
-    info["names"] = [getattr(device, "name", str(device)) for device in gpus]
-    configured = 0
-    for device in gpus:
+def _configure_torch_devices() -> Dict[str, Any]:
+    gpu_available = torch.cuda.is_available()
+    device_count = torch.cuda.device_count() if gpu_available else 0
+    if not gpu_available:
+        LOGGER.info("No CUDA devices detected; running on CPU.")
+        return {
+            "available": False,
+            "count": 0,
+            "names": [],
+        }
+    names = []
+    for index in range(device_count):
         try:
-            tf.config.experimental.set_memory_growth(device, True)
-            configured += 1
+            names.append(torch.cuda.get_device_name(index))
         except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Failed to enable memory growth for %s: %s", device, exc)
-    info["memory_growth"] = configured
-    try:
-        logical = tf.config.list_logical_devices("GPU")
-        info["logical"] = len(logical)
-        LOGGER.info(
-            "TensorFlow GPU acceleration detected (%d physical, %d logical). Memory growth configured on %d device(s).",
-            info["physical"],
-            info["logical"],
-            configured,
-        )
-    except Exception:  # pragma: no cover - defensive
-        LOGGER.info(
-            "TensorFlow GPU acceleration detected (%d physical GPU devices). Memory growth configured on %d device(s).",
-            info["physical"],
-            configured,
-        )
-    return info
+            names.append(f"cuda:{index} ({exc})")
+    LOGGER.info("CUDA acceleration enabled (%d device(s)).", device_count)
+    return {"available": True, "count": device_count, "names": names}
 
 
-def _configure_float_policy(gpu_info):
+def _configure_float_policy(gpu_info: Dict[str, Any]) -> Dict[str, Any]:
     requested_gpu = str(os.environ.get("TF_SERVER_ENABLE_GPU", "0")).lower() in {"1", "true", "yes", "on"}
-    using_gpu = bool(gpu_info.get("available") and requested_gpu)
-    if not using_gpu and gpu_info.get("available"):
-        try:
-            tf.config.set_visible_devices([], "GPU")
-            LOGGER.info("GPU devices disabled; running on CPU with float64 policy.")
-        except Exception as exc:  # pragma: no cover - defensive
-            LOGGER.warning("Failed to disable GPU devices: %s", exc)
-    floatx = "float32" if using_gpu else "float64"
-    try:
-        tf.keras.backend.set_floatx(floatx)
-    except Exception as exc:  # pragma: no cover - defensive
-        LOGGER.warning("Failed to set TensorFlow floatx to %s: %s", floatx, exc)
-    if using_gpu:
-        try:
-            tf.config.experimental.enable_tensor_float_32_execution(True)
-        except Exception:  # pragma: no cover - best effort
-            pass
+    use_gpu = bool(requested_gpu and gpu_info.get("available"))
+    if use_gpu:
+        device = torch.device("cuda")
+        torch.cuda.init()
+        dtype = torch.float32
+    else:
+        device = torch.device("cpu")
+        dtype = torch.float64
+    torch.set_default_dtype(dtype)
+    LOGGER.info("Torch default dtype set to %s on device %s", dtype, device)
     return {
-        "floatx": floatx,
-        "tf": tf.float32 if floatx == "float32" else tf.float64,
-        "np": np.float32 if floatx == "float32" else np.float64,
-        "using_gpu": using_gpu,
+        "device": device,
+        "dtype": dtype,
+        "using_gpu": use_gpu,
     }
 
 
-def _sanitize_segment(value, fallback="default"):
+def _sanitize_segment(value: Any, fallback: str = "default") -> str:
     if not value:
         return fallback
     text = str(value).strip()
@@ -107,35 +69,89 @@ def _sanitize_segment(value, fallback="default"):
     return sanitized or fallback
 
 
-def _resolve_storage_path(*segments, create=False):
+def _resolve_storage_path(*segments: str, create: bool = False) -> str:
     parts = [_sanitize_segment(seg) for seg in segments if seg is not None]
     directory = os.path.join(STORAGE_ROOT, *parts)
     if create:
         os.makedirs(directory, exist_ok=True)
     return directory
 
+
 app = FastAPI()
 
-BRAINS = {}
+BRAINS: Dict[str, "RemoteBrain"] = {}
 STATE_LOCK = threading.Lock()
 
 
-def natural_log_relu(inputs):
-    tensor = tf.convert_to_tensor(inputs)
-    return tf.math.log1p(tf.nn.relu(tensor))
+STATUS: Dict[str, Any] = {
+    "started_at": time.time(),
+    "total_requests": 0,
+    "requests": [],
+    "bots": {},
+    "workers": {},
+}
+
+GPU_INFO = _configure_torch_devices()
+STATUS["accelerators"] = {"gpu": GPU_INFO}
+FLOAT_POLICY = _configure_float_policy(GPU_INFO)
+STATUS["float_policy"] = {
+    "dtype": str(FLOAT_POLICY["dtype"]),
+    "using_gpu": FLOAT_POLICY["using_gpu"],
+    "device": str(FLOAT_POLICY["device"]),
+}
 
 
-tf.keras.utils.get_custom_objects()["natural_log_relu"] = natural_log_relu
+class EndpointWorkerPool:
+    def __init__(self, limits: Dict[str, int]):
+        self._limits = dict(limits)
+        self._executors: Dict[str, ThreadPoolExecutor] = {}
+        self._lock = threading.Lock()
+
+    def _get_limit(self, endpoint: str) -> int:
+        return max(1, int(self._limits.get(endpoint, self._limits.get("default", 1))))
+
+    def _get_executor(self, endpoint: str) -> ThreadPoolExecutor:
+        with self._lock:
+            executor = self._executors.get(endpoint)
+            if executor is None:
+                max_workers = self._get_limit(endpoint)
+                executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{endpoint}-worker")
+                self._executors[endpoint] = executor
+            return executor
+
+    def run(self, endpoint: str, func, *args, **kwargs):
+        executor = self._get_executor(endpoint)
+        future = executor.submit(func, *args, **kwargs)
+        return future.result()
+
+    def snapshot(self) -> Dict[str, Dict[str, int]]:
+        snapshot: Dict[str, Dict[str, int]] = {}
+        with self._lock:
+            for endpoint, executor in self._executors.items():
+                queue = getattr(executor, "_work_queue", None)
+                pending = queue.qsize() if queue is not None else 0
+                snapshot[endpoint] = {
+                    "max_workers": executor._max_workers,  # type: ignore[attr-defined]
+                    "pending": pending,
+                }
+        return snapshot
+
+    def shutdown(self) -> None:
+        with self._lock:
+            executors = list(self._executors.values())
+            self._executors.clear()
+        for executor in executors:
+            executor.shutdown(wait=False)
 
 
-def _read_int(name, default):
+def _read_int(name: str, default: int) -> int:
     try:
         return max(1, int(os.environ.get(name, default)))
     except (TypeError, ValueError):
         return max(1, int(default))
 
 
-def _read_float(name, default):
+def _read_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
@@ -151,91 +167,8 @@ ENDPOINT_WORKER_LIMITS = {
     "copy": _read_int("TF_SERVER_COPY_WORKERS", DEFAULT_WORKERS),
     "save": _read_int("TF_SERVER_SAVE_WORKERS", DEFAULT_WORKERS),
     "load": _read_int("TF_SERVER_LOAD_WORKERS", DEFAULT_WORKERS),
-    "default": DEFAULT_WORKERS
+    "default": DEFAULT_WORKERS,
 }
-
-ACT_SANITIZATION_STRIKE_WINDOW = max(1.0, _read_float("TF_SERVER_ACT_STRIKE_WINDOW", 30.0))
-ACT_SANITIZATION_STRIKE_THRESHOLD = max(1, _read_int("TF_SERVER_ACT_STRIKE_THRESHOLD", 2))
-ACT_SANITIZATION_FORCE_THRESHOLD = max(
-    ACT_SANITIZATION_STRIKE_THRESHOLD,
-    _read_int("TF_SERVER_ACT_FORCE_THRESHOLD", 4),
-)
-
-STATUS = {
-    "started_at": time.time(),
-    "total_requests": 0,
-    "requests": [],
-    "bots": {},
-    "workers": {}
-}
-
-GPU_INFO = _configure_tensorflow_devices()
-STATUS["accelerators"] = {"gpu": GPU_INFO}
-
-FLOAT_POLICY = _configure_float_policy(GPU_INFO)
-TF_FLOAT = FLOAT_POLICY["tf"]
-NP_FLOAT = FLOAT_POLICY["np"]
-STATUS["float_policy"] = {
-    "floatx": FLOAT_POLICY["floatx"],
-    "using_gpu": FLOAT_POLICY["using_gpu"],
-}
-STATUS["policy_guard"] = {
-    "act_strike_window": ACT_SANITIZATION_STRIKE_WINDOW,
-    "act_strike_threshold": ACT_SANITIZATION_STRIKE_THRESHOLD,
-    "act_force_threshold": ACT_SANITIZATION_FORCE_THRESHOLD,
-}
-LOGGER.info(
-    "TensorFlow float policy set to %s (using_gpu=%s).",
-    FLOAT_POLICY["floatx"],
-    FLOAT_POLICY["using_gpu"],
-)
-
-
-class EndpointWorkerPool:
-    def __init__(self, limits):
-        self._limits = dict(limits)
-        self._executors = {}
-        self._lock = threading.Lock()
-
-    def _get_limit(self, endpoint):
-        return max(1, int(self._limits.get(endpoint, self._limits.get("default", 1))))
-
-    def _get_executor(self, endpoint):
-        with self._lock:
-            executor = self._executors.get(endpoint)
-            if executor is None:
-                max_workers = self._get_limit(endpoint)
-                executor = ThreadPoolExecutor(
-                    max_workers=max_workers,
-                    thread_name_prefix=f"{endpoint}-worker"
-                )
-                self._executors[endpoint] = executor
-            return executor
-
-    def run(self, endpoint, func, *args, **kwargs):
-        executor = self._get_executor(endpoint)
-        future = executor.submit(func, *args, **kwargs)
-        return future.result()
-
-    def snapshot(self):
-        snapshot = {}
-        with self._lock:
-            for endpoint, executor in self._executors.items():
-                queue = getattr(executor, "_work_queue", None)
-                pending = queue.qsize() if queue is not None else 0
-                snapshot[endpoint] = {
-                    "max_workers": executor._max_workers,
-                    "pending": pending
-                }
-        return snapshot
-
-    def shutdown(self):
-        with self._lock:
-            executors = list(self._executors.values())
-            self._executors.clear()
-        for executor in executors:
-            executor.shutdown(wait=False)
-
 
 WORKERS = EndpointWorkerPool(ENDPOINT_WORKER_LIMITS)
 atexit.register(WORKERS.shutdown)
@@ -249,194 +182,113 @@ BRAIN_CONFIG = {
     "hebbian_learning_rate": 0.01,
     "hebbian_decay_multiplier": 1.5,
     "hebbian_clip": 0.75,
+    "transformer_tokens": 4,
+    "transformer_embed": 24,
+    "transformer_heads": 4,
+    "transformer_layers": 2,
+    "transformer_ff": 192,
     "learning_rate": 2e-3,
-    "cosine_first_decay_steps": 1024,
-    "cosine_t_mul": 2.0,
-    "cosine_m_mul": 1.0,
-    "cosine_alpha": 0.0,
     "lion_beta_1": 0.9,
     "lion_beta_2": 0.99,
-    "lion_ema_momentum": 0.99,
+    "lion_weight_decay": 0.0,
+    "lookahead_sync": 6,
+    "lookahead_alpha": 0.5,
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
 GRAD_CLIP_VALUE = abs(_read_float("TF_SERVER_GRADIENT_CLIP_VALUE", 100.0))
 GRAD_CLIP_GLOBAL_NORM = abs(_read_float("TF_SERVER_GRADIENT_GLOBAL_NORM", 250.0))
+GRAD_SKIP_GLOBAL_NORM = abs(_read_float("TF_SERVER_GRADIENT_SKIP_GLOBAL_NORM", 0.0))
 WEIGHT_CLAMP = abs(_read_float("TF_SERVER_WEIGHT_CLAMP", 1e6))
+ACT_SANITIZATION_STRIKE_WINDOW = max(1.0, _read_float("TF_SERVER_ACT_STRIKE_WINDOW", 30.0))
+ACT_SANITIZATION_STRIKE_THRESHOLD = max(1, _read_int("TF_SERVER_ACT_STRIKE_THRESHOLD", 2))
+ACT_SANITIZATION_FORCE_THRESHOLD = max(
+    ACT_SANITIZATION_STRIKE_THRESHOLD,
+    _read_int("TF_SERVER_ACT_FORCE_THRESHOLD", 4),
+)
 
 
-def _sanitize_vector(vector, expected_size=None, label="vector"):
-    if vector is None:
-        return None, 0, 0, False
-    try:
-        arr = np.asarray(vector, dtype=NP_FLOAT).reshape(-1)
-    except (TypeError, ValueError):
-        LOGGER.warning("Failed to coerce %s payload into float array", label)
-        return None, 0, 0, False
-    invalid_mask = ~np.isfinite(arr)
-    replaced = int(np.count_nonzero(invalid_mask))
-    if replaced:
-        arr = np.where(invalid_mask, 0.0, arr)
-    clipped = 0
-    if OBS_CLAMP > 0:
-        clipped_mask = np.abs(arr) > OBS_CLAMP
-        clipped = int(np.count_nonzero(clipped_mask))
-        if clipped:
-            arr = np.clip(arr, -OBS_CLAMP, OBS_CLAMP)
-    adjusted = False
-    if expected_size and expected_size > 0 and arr.size != expected_size:
-        adjusted = True
-        if arr.size > expected_size:
-            arr = arr[:expected_size]
-        else:
-            arr = np.pad(arr, (0, expected_size - arr.size), constant_values=0.0)
-    if replaced or clipped or adjusted:
-        LOGGER.warning(
-            "Sanitized %s payload (replaced=%d, clipped=%d, adjusted=%s)",
-            label,
-            replaced,
-            clipped,
-            adjusted,
-        )
-    return arr.astype(NP_FLOAT, copy=False), replaced, clipped, adjusted
+NP_FLOAT = np.float32 if FLOAT_POLICY["dtype"] == torch.float32 else np.float64
+
+
+def natural_log_relu(inputs: torch.Tensor) -> torch.Tensor:
+    return torch.log1p(torch.relu(inputs))
 
 
 class LookaheadOptimizer:
-    def __init__(self, optimizer, sync_period=6, slow_step_size=0.5):
+    def __init__(self, optimizer: torch.optim.Optimizer, sync_period: int = 6, slow_step_size: float = 0.5):
         self.optimizer = optimizer
         self.sync_period = max(1, int(sync_period))
         self.slow_step_size = float(slow_step_size)
-        self._fast_vars = []
-        self._slow_vars = []
-        self._fast_var_ids = {}
+        self._fast_params = [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad]
+        self._slow_params = [p.detach().clone().to(p.device) for p in self._fast_params]
         self._step = 0
 
-    @staticmethod
-    def _read_variable(variable):
-        value_attr = getattr(variable, "value", None)
-        if value_attr is not None:
-            if callable(value_attr):
-                return value_attr()
-            try:
-                return tf.convert_to_tensor(value_attr)
-            except TypeError:
-                pass
-        if hasattr(variable, "read_value"):
-            return variable.read_value()
-        if hasattr(variable, "numpy"):
-            return tf.convert_to_tensor(variable.numpy())
-        return tf.convert_to_tensor(variable)
+    def zero_grad(self) -> None:
+        self.optimizer.zero_grad(set_to_none=True)
 
-    def _ensure_slot_variables(self, variables):
-        for var in variables:
-            var_id = id(var)
-            if var_id in self._fast_var_ids:
-                continue
-            self._fast_vars.append(var)
-            initial_value = self._read_variable(var)
-            var_dtype = getattr(var, "dtype", None)
-            if var_dtype is not None:
-                slow_var = tf.Variable(initial_value, dtype=var_dtype, trainable=False)
-            else:
-                slow_var = tf.Variable(initial_value, trainable=False)
-            self._slow_vars.append(slow_var)
-            self._fast_var_ids[var_id] = len(self._fast_vars) - 1
+    def _maybe_refresh(self) -> None:
+        if len(self._slow_params) != len(self._fast_params):
+            self._fast_params = [p for group in self.optimizer.param_groups for p in group["params"] if p.requires_grad]
+            self._slow_params = [p.detach().clone().to(p.device) for p in self._fast_params]
 
-    def sync_slow_variables(self, variables=None):
-        if variables is None:
-            variables = list(self._fast_vars)
-        else:
-            self._ensure_slot_variables(variables)
-        for var in variables:
-            index = self._fast_var_ids.get(id(var))
-            if index is None:
-                continue
-            fast_value = self._read_variable(self._fast_vars[index])
-            self._slow_vars[index].assign(fast_value)
-
-    def apply_gradients(self, grads_and_vars):
-        if not grads_and_vars:
-            return
-        variables = [var for grad, var in grads_and_vars if var is not None]
-        if not variables:
-            return
-        self._ensure_slot_variables(variables)
-        self.optimizer.apply_gradients(grads_and_vars)
+    def step(self) -> None:
+        self._maybe_refresh()
+        self.optimizer.step()
         self._step += 1
         if self.sync_period and self._step % self.sync_period == 0:
-            for slow_var, fast_var in zip(self._slow_vars, self._fast_vars):
-                fast_value = self._read_variable(fast_var)
-                slow_value = self._read_variable(slow_var)
-                slow_var.assign(slow_value + (fast_value - slow_value) * self.slow_step_size)
-                fast_var.assign(self._read_variable(slow_var))
+            for fast, slow in zip(self._fast_params, self._slow_params):
+                slow.add_(self.slow_step_size * (fast.data - slow))
+                fast.data.copy_(slow)
+
+    def sync_slow_parameters(self, params: Optional[List[torch.nn.Parameter]] = None) -> None:
+        self._maybe_refresh()
+        if params is None:
+            params = self._fast_params
+        param_ids = {id(p): index for index, p in enumerate(self._fast_params)}
+        for param in params:
+            index = param_ids.get(id(param))
+            if index is None:
+                continue
+            self._slow_params[index].data.copy_(param.data)
 
 
-class HebbianDense(tf.keras.layers.Layer):
+class HebbianLinear(torch.nn.Module):
     def __init__(
         self,
-        units,
+        in_features: int,
+        out_features: int,
         activation=natural_log_relu,
-        hebbian_learning_rate=0.01,
-        decay_multiplier=1.5,
-        clip=0.75,
-        **kwargs,
+        hebbian_learning_rate: float = 0.01,
+        decay_multiplier: float = 1.5,
+        clip: float = 0.75,
     ):
-        super().__init__(**kwargs)
-        self.units = int(units)
-        self.activation = tf.keras.activations.get(activation)
+        super().__init__()
+        self.base = torch.nn.Linear(in_features, out_features)
+        self.activation = activation
         self.hebbian_learning_rate = float(abs(hebbian_learning_rate))
         self.decay_multiplier = float(abs(decay_multiplier))
         self.clip = float(abs(clip))
-        self._last_input = None
-        self._last_output = None
+        self.register_buffer("hebbian_weight", torch.zeros(out_features, in_features))
+        self.register_buffer("hebbian_bias", torch.zeros(out_features))
+        self._last_input: Optional[torch.Tensor] = None
+        self._last_output: Optional[torch.Tensor] = None
 
-    def build(self, input_shape):
-        last_dim = int(input_shape[-1])
-        dtype = self.dtype or TF_FLOAT
-        self.base_kernel = self.add_weight(
-            name="base_kernel",
-            shape=(last_dim, self.units),
-            initializer="glorot_uniform",
-            trainable=True,
-            dtype=dtype,
-        )
-        self.base_bias = self.add_weight(
-            name="base_bias",
-            shape=(self.units,),
-            initializer="zeros",
-            trainable=True,
-            dtype=dtype,
-        )
-        self.hebbian_kernel = self.add_weight(
-            name="hebbian_kernel",
-            shape=(last_dim, self.units),
-            initializer="zeros",
-            trainable=False,
-            dtype=dtype,
-        )
-        self.hebbian_bias = self.add_weight(
-            name="hebbian_bias",
-            shape=(self.units,),
-            initializer="zeros",
-            trainable=False,
-            dtype=dtype,
-        )
-        super().build(input_shape)
-
-    def call(self, inputs, training=None):
-        tensor = tf.cast(inputs, self.base_kernel.dtype)
-        combined_kernel = self.base_kernel + self.hebbian_kernel
-        combined_bias = self.base_bias + self.hebbian_bias
-        outputs = tf.linalg.matmul(tensor, combined_kernel)
-        outputs = tf.nn.bias_add(outputs, combined_bias)
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        weight = self.base.weight + self.hebbian_weight
+        bias = self.base.bias + self.hebbian_bias
+        outputs = torch.nn.functional.linear(inputs, weight, bias)
         if self.activation is not None:
             outputs = self.activation(outputs)
-        if training:
-            self._last_input = tf.stop_gradient(tf.identity(tensor))
-            self._last_output = tf.stop_gradient(tf.identity(outputs))
+        if self.training:
+            self._last_input = inputs.detach()
+            self._last_output = outputs.detach()
+        else:
+            self._last_input = None
+            self._last_output = None
         return outputs
 
-    def _apply_decay(self):
+    def _apply_decay(self) -> float:
         if self.hebbian_learning_rate <= 0:
             return 0.0
         decay_rate = self.hebbian_learning_rate * self.decay_multiplier
@@ -444,367 +296,283 @@ class HebbianDense(tf.keras.layers.Layer):
         if decay_rate == 0:
             return 0.0
         keep_ratio = 1.0 - decay_rate
-        keep_ratio_tensor = tf.cast(keep_ratio, self.hebbian_kernel.dtype)
-        self.hebbian_kernel.assign(self.hebbian_kernel * keep_ratio_tensor)
-        self.hebbian_bias.assign(self.hebbian_bias * keep_ratio_tensor)
+        self.hebbian_weight.mul_(keep_ratio)
+        self.hebbian_bias.mul_(keep_ratio)
         return float(decay_rate)
 
-    def update_hebbian(self, reinforcement):
+    def update_hebbian(self, reinforcement: float) -> Dict[str, Any]:
         decay_rate = self._apply_decay()
         reinforcement = float(np.clip(reinforcement, -1.0, 1.0))
         applied = False
         if reinforcement != 0.0 and self._last_input is not None and self._last_output is not None:
             lr = self.hebbian_learning_rate * reinforcement
-            pre = tf.cast(self._last_input, self.hebbian_kernel.dtype)
-            post = tf.cast(self._last_output, self.hebbian_kernel.dtype)
-            pre = tf.nn.l2_normalize(pre, axis=-1)
-            post = tf.nn.l2_normalize(post, axis=-1)
-            kernel_update = tf.einsum("bi,bj->ij", pre, post)
-            kernel_update /= tf.cast(tf.shape(pre)[0], self.hebbian_kernel.dtype)
-            bias_update = tf.reduce_mean(post, axis=0)
-            step = tf.cast(lr, self.hebbian_kernel.dtype)
-            self.hebbian_kernel.assign_add(kernel_update * step)
-            self.hebbian_bias.assign_add(bias_update * step)
+            pre = torch.nn.functional.normalize(self._last_input, dim=-1)
+            post = torch.nn.functional.normalize(self._last_output, dim=-1)
+            kernel_update = torch.einsum("bi,bj->ij", post, pre)
+            kernel_update /= max(1.0, float(pre.shape[0]))
+            bias_update = post.mean(dim=0)
+            self.hebbian_weight.add_(kernel_update * lr)
+            self.hebbian_bias.add_(bias_update * lr)
             applied = True
         if self.clip > 0:
-            clip_value = tf.cast(self.clip, self.hebbian_kernel.dtype)
-            self.hebbian_kernel.assign(
-                tf.clip_by_value(self.hebbian_kernel, -clip_value, clip_value)
-            )
-            self.hebbian_bias.assign(
-                tf.clip_by_value(self.hebbian_bias, -clip_value, clip_value)
-            )
+            self.hebbian_weight.clamp_(-self.clip, self.clip)
+            self.hebbian_bias.clamp_(-self.clip, self.clip)
         self._last_input = None
         self._last_output = None
         return {"applied": applied, "decay_rate": decay_rate}
 
-    def get_config(self):
-        config = super().get_config()
-        config.update(
-            {
-                "units": self.units,
-                "activation": tf.keras.activations.serialize(self.activation),
-                "hebbian_learning_rate": self.hebbian_learning_rate,
-                "decay_multiplier": self.decay_multiplier,
-                "clip": self.clip,
-            }
+
+class BrainModel(torch.nn.Module):
+    def __init__(self, input_size: int, action_count: int):
+        super().__init__()
+        self.input_bn = torch.nn.BatchNorm1d(input_size)
+        self.hidden_dense_1 = torch.nn.Linear(input_size, BRAIN_CONFIG["hidden_units"])
+        self.hidden_dropout_1 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.hebbian_dense_1 = HebbianLinear(
+            BRAIN_CONFIG["hidden_units"],
+            BRAIN_CONFIG["hebbian_units"][0],
+            hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
+            decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
+            clip=BRAIN_CONFIG["hebbian_clip"],
         )
-        return config
+        self.hebbian_dropout_1 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.hidden_dense_2 = torch.nn.Linear(BRAIN_CONFIG["hebbian_units"][0], BRAIN_CONFIG["mid_units"])
+        self.hidden_dropout_2 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.hebbian_dense_2 = HebbianLinear(
+            BRAIN_CONFIG["mid_units"],
+            BRAIN_CONFIG["hebbian_units"][1],
+            hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
+            decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
+            clip=BRAIN_CONFIG["hebbian_clip"],
+        )
+        self.shared_dense = torch.nn.Linear(BRAIN_CONFIG["hebbian_units"][1], BRAIN_CONFIG["shared_units"])
+        self.shared_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.transformer_tokens = int(BRAIN_CONFIG["transformer_tokens"])
+        self.transformer_embed = int(BRAIN_CONFIG["transformer_embed"])
+        total_transformer_dim = self.transformer_tokens * self.transformer_embed
+        if total_transformer_dim <= 0:
+            raise ValueError("Transformer configuration must produce a positive feature size")
+        if self.transformer_embed % max(1, int(BRAIN_CONFIG["transformer_heads"])) != 0:
+            raise ValueError("Transformer embed dimension must be divisible by the number of heads")
+        self.transformer_project = torch.nn.Linear(BRAIN_CONFIG["shared_units"], total_transformer_dim)
+        encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model=self.transformer_embed,
+            nhead=int(BRAIN_CONFIG["transformer_heads"]),
+            dim_feedforward=int(BRAIN_CONFIG["transformer_ff"]),
+            batch_first=True,
+            dropout=BRAIN_CONFIG["dropout_rate"],
+            activation="gelu",
+        )
+        self.transformer_encoder = torch.nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=int(BRAIN_CONFIG["transformer_layers"]),
+        )
+        self.transformer_norm = torch.nn.LayerNorm(self.transformer_embed)
+        self.transformer_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.transformer_merge = torch.nn.Linear(total_transformer_dim, BRAIN_CONFIG["shared_units"])
+        self.policy_dense = torch.nn.Linear(BRAIN_CONFIG["shared_units"], BRAIN_CONFIG["shared_units"])
+        self.policy_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.action_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
+        self.action_count = action_count
 
+    @staticmethod
+    def _activate(tensor: torch.Tensor) -> torch.Tensor:
+        return natural_log_relu(tensor)
 
-tf.keras.utils.get_custom_objects()["HebbianDense"] = HebbianDense
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x = self.input_bn(inputs)
+        x = self._activate(self.hidden_dense_1(x))
+        x = self.hidden_dropout_1(x)
+        x = self.hebbian_dense_1(x)
+        x = self.hebbian_dropout_1(x)
+        x = self._activate(self.hidden_dense_2(x))
+        x = self.hidden_dropout_2(x)
+        x = self.hebbian_dense_2(x)
+        shared = self._activate(self.shared_dense(x))
+        shared = self.shared_dropout(shared)
+        transformer_state = self.transformer_project(shared)
+        transformer_state = transformer_state.view(
+            shared.size(0), self.transformer_tokens, self.transformer_embed
+        )
+        transformer_state = self.transformer_norm(transformer_state)
+        transformer_state = self.transformer_encoder(transformer_state)
+        transformer_state = self.transformer_dropout(transformer_state)
+        transformer_state = transformer_state.reshape(shared.size(0), -1)
+        shared = shared + self.transformer_merge(transformer_state)
+        policy_features = self._activate(self.policy_dense(shared))
+        policy_features = self.policy_dropout(policy_features)
+        logits = self.action_head(policy_features)
+        return torch.nn.functional.softmax(logits, dim=-1)
 
-
-def build_model(input_size, action_count):
-    inputs = tf.keras.Input(shape=(input_size,), name="observation")
-    x = tf.keras.layers.BatchNormalization(name="input_batchnorm")(inputs)
-    x = tf.keras.layers.Dense(
-        BRAIN_CONFIG["hidden_units"],
-        activation=natural_log_relu,
-        name="hidden_dense_1",
-    )(x)
-    x = tf.keras.layers.Dropout(
-        BRAIN_CONFIG["dropout_rate"], name="hidden_dropout_1"
-    )(x)
-    hebbian_layers = []
-    hebbian_1 = HebbianDense(
-        BRAIN_CONFIG["hebbian_units"][0],
-        activation=natural_log_relu,
-        hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
-        decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
-        clip=BRAIN_CONFIG["hebbian_clip"],
-        name="hebbian_dense_1",
-    )
-    x = hebbian_1(x)
-    hebbian_layers.append(hebbian_1)
-    x = tf.keras.layers.Dropout(
-        BRAIN_CONFIG["dropout_rate"], name="hebbian_dropout_1"
-    )(x)
-    x = tf.keras.layers.Dense(
-        BRAIN_CONFIG["mid_units"],
-        activation=natural_log_relu,
-        name="hidden_dense_2",
-    )(x)
-    x = tf.keras.layers.Dropout(
-        BRAIN_CONFIG["dropout_rate"], name="hidden_dropout_2"
-    )(x)
-    hebbian_2 = HebbianDense(
-        BRAIN_CONFIG["hebbian_units"][1],
-        activation=natural_log_relu,
-        hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
-        decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
-        clip=BRAIN_CONFIG["hebbian_clip"],
-        name="hebbian_dense_2",
-    )
-    x = hebbian_2(x)
-    hebbian_layers.append(hebbian_2)
-    shared = tf.keras.layers.Dense(
-        max(1, BRAIN_CONFIG["shared_units"]),
-        activation=natural_log_relu,
-        name="shared_dense",
-    )(x)
-    shared = tf.keras.layers.Dropout(
-        BRAIN_CONFIG["dropout_rate"], name="shared_dropout"
-    )(shared)
-    policy_features = tf.keras.layers.Dense(
-        max(1, BRAIN_CONFIG["shared_units"]),
-        activation=natural_log_relu,
-        name="policy_dense",
-    )(shared)
-    policy_features = tf.keras.layers.Dropout(
-        BRAIN_CONFIG["dropout_rate"], name="policy_features"
-    )(policy_features)
-    action_head = tf.keras.layers.Dense(
-        action_count, activation="softmax", name="action_head"
-    )(policy_features)
-    model = tf.keras.Model(inputs=inputs, outputs=action_head)
-    model._hebbian_layers = hebbian_layers  # type: ignore[attr-defined]
-    return model
+    def hebbian_layers(self) -> List[HebbianLinear]:
+        return [self.hebbian_dense_1, self.hebbian_dense_2]
 
 
 class RemoteBrain:
-    def __init__(self, input_size, action_count):
+    def __init__(self, input_size: int, action_count: int):
         self.input_size = int(input_size)
         self.action_count = int(action_count)
-        self.model = build_model(self.input_size, self.action_count)
-        self.hebbian_layers = list(getattr(self.model, "_hebbian_layers", []))
-        first_decay_steps = max(1, int(BRAIN_CONFIG["cosine_first_decay_steps"]))
-        learning_rate = float(BRAIN_CONFIG["learning_rate"])
-        cosine_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-            initial_learning_rate=learning_rate,
-            first_decay_steps=first_decay_steps,
-            t_mul=float(BRAIN_CONFIG["cosine_t_mul"]),
-            m_mul=float(BRAIN_CONFIG["cosine_m_mul"]),
-            alpha=float(BRAIN_CONFIG["cosine_alpha"]),
+        self.model = BrainModel(self.input_size, self.action_count).to(FLOAT_POLICY["device"])
+        self.optimizer = LookaheadOptimizer(
+            torch.optim.AdamW(
+                self.model.parameters(),
+                lr=BRAIN_CONFIG["learning_rate"],
+                betas=(BRAIN_CONFIG["lion_beta_1"], BRAIN_CONFIG["lion_beta_2"]),
+                weight_decay=BRAIN_CONFIG["lion_weight_decay"],
+            ),
+            sync_period=BRAIN_CONFIG["lookahead_sync"],
+            slow_step_size=BRAIN_CONFIG["lookahead_alpha"],
         )
-        lion = tf.keras.optimizers.Lion(
-            learning_rate=cosine_schedule,
-            beta_1=float(BRAIN_CONFIG["lion_beta_1"]),
-            beta_2=float(BRAIN_CONFIG["lion_beta_2"]),
-            use_ema=True,
-            ema_momentum=float(BRAIN_CONFIG["lion_ema_momentum"]),
-        )
-        self.optimizer = LookaheadOptimizer(lion, sync_period=6, slow_step_size=0.5)
-        self.learning_rate_schedule = cosine_schedule
         self._lock = threading.RLock()
         self.policy_strikes = 0
         self.policy_last_reset = time.time()
 
-    def _prepare_observation(self, vector, label):
-        prepared, replaced, clipped, adjusted = _sanitize_vector(
-            vector, expected_size=self.input_size, label=label
-        )
-        if prepared is None:
+    @property
+    def device(self) -> torch.device:
+        return FLOAT_POLICY["device"]
+
+    def _prepare_observation(self, vector: Any, label: str) -> Tuple[np.ndarray, Dict[str, Any]]:
+        if vector is None:
             raise ValueError(f"{label} payload missing")
-        metadata = {
-            "replaced": int(replaced),
-            "clipped": int(clipped),
-            "adjusted": bool(adjusted),
-        }
-        metadata["sanitized"] = bool(replaced or clipped or adjusted)
-        return prepared.reshape(1, -1), metadata
-
-    def _current_learning_rate(self):
-        base_optimizer = getattr(self.optimizer, "optimizer", None)
-        if base_optimizer is None:
-            return None
-        learning_rate = getattr(base_optimizer, "learning_rate", None)
-        if learning_rate is None:
-            return None
         try:
-            if isinstance(learning_rate, tf.keras.optimizers.schedules.LearningRateSchedule):
-                iterations = getattr(base_optimizer, "iterations", None)
-                step = iterations if iterations is not None else tf.constant(0, dtype=tf.int64)
-                value = learning_rate(step)
-            else:
-                value = learning_rate
-            if isinstance(value, tf.Tensor):
-                value = value.numpy()
-            elif hasattr(value, "numpy"):
-                value = value.numpy()
-            return float(value)
-        except Exception:  # pragma: no cover - defensive
-            return None
-
-    @staticmethod
-    def _filter_gradients(grads_and_vars):
-        gradients = []
-        variables = []
-        dropped = 0
+            arr = np.asarray(vector, dtype=NP_FLOAT).reshape(-1)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label} payload missing") from None
+        invalid_mask = ~np.isfinite(arr)
+        replaced = int(np.count_nonzero(invalid_mask))
+        if replaced:
+            arr = np.where(invalid_mask, 0.0, arr)
         clipped = 0
-        for grad, var in grads_and_vars:
-            if grad is None:
-                continue
-            tensor = grad.values if isinstance(grad, tf.IndexedSlices) else grad
-            finite = bool(tf.reduce_all(tf.math.is_finite(tensor)).numpy())
-            if not finite:
-                dropped += 1
-                LOGGER.warning(
-                    "Dropped non-finite gradients for variable %s",
-                    getattr(var, "name", "?"),
-                )
-                continue
-            clipped_grad = grad
-            if GRAD_CLIP_VALUE > 0:
-                clip_limit = tf.cast(GRAD_CLIP_VALUE, dtype=tensor.dtype)
-                exceeds = bool(
-                    tf.reduce_any(tf.math.greater(tf.math.abs(tensor), clip_limit)).numpy()
-                )
-                if exceeds:
-                    clipped_tensor = tf.clip_by_value(tensor, -clip_limit, clip_limit)
-                    if isinstance(grad, tf.IndexedSlices):
-                        clipped_grad = tf.IndexedSlices(
-                            clipped_tensor, grad.indices, grad.dense_shape
-                        )
-                    else:
-                        clipped_grad = clipped_tensor
-                    clipped += 1
-            gradients.append(clipped_grad)
-            variables.append(var)
-        global_norm = None
-        if gradients:
-            if GRAD_CLIP_GLOBAL_NORM > 0:
-                try:
-                    clipped_list, original_norm = tf.clip_by_global_norm(
-                        gradients, GRAD_CLIP_GLOBAL_NORM
-                    )
-                    gradients = clipped_list
-                    try:
-                        norm_value = original_norm.numpy()
-                    except AttributeError:
-                        norm_value = float(original_norm)
-                    global_norm = float(norm_value)
-                    if global_norm > GRAD_CLIP_GLOBAL_NORM:
-                        clipped += 1
-                        LOGGER.debug(
-                            "Clipped gradients by global norm (norm=%.3f limit=%.3f)",
-                            global_norm,
-                            GRAD_CLIP_GLOBAL_NORM,
-                        )
-                except Exception as exc:  # pragma: no cover - defensive
-                    LOGGER.warning("Failed to apply global norm clipping: %s", exc)
-                    gradients = list(gradients)
+        if OBS_CLAMP > 0:
+            clip_mask = np.abs(arr) > OBS_CLAMP
+            clipped = int(np.count_nonzero(clip_mask))
+            if clipped:
+                arr = np.clip(arr, -OBS_CLAMP, OBS_CLAMP)
+        adjusted = False
+        if arr.size != self.input_size:
+            adjusted = True
+            if arr.size > self.input_size:
+                arr = arr[: self.input_size]
             else:
-                try:
-                    norm_tensor = tf.linalg.global_norm(
-                        [
-                            grad.values if isinstance(grad, tf.IndexedSlices) else grad
-                            for grad in gradients
-                        ]
-                    )
-                    global_norm = float(norm_tensor.numpy())
-                except Exception:  # pragma: no cover - monitoring best effort
-                    global_norm = None
-        cleaned = list(zip(gradients, variables))
-        return cleaned, dropped, clipped, global_norm
-
-    @staticmethod
-    def _sanitize_weight_list(weights):
-        sanitized_weights = []
-        replaced_total = 0
-        clipped_total = 0
-        sanitized_any = False
-        for weight in weights:
-            array = np.asarray(weight)
-            dtype = getattr(weight, "dtype", array.dtype)
-            invalid_mask = ~np.isfinite(array)
-            invalid_count = int(np.count_nonzero(invalid_mask))
-            clip_count = 0
-            clip_needed = False
-            if WEIGHT_CLAMP > 0:
-                clip_needed = bool(np.any(np.abs(array) > WEIGHT_CLAMP))
-            if invalid_count or clip_needed:
-                sanitized = array.astype(dtype, copy=True)
-                if invalid_count:
-                    sanitized[invalid_mask] = 0.0
-                if WEIGHT_CLAMP > 0:
-                    clip_mask = np.abs(sanitized) > WEIGHT_CLAMP
-                    clip_count = int(np.count_nonzero(clip_mask))
-                    if clip_count:
-                        np.clip(sanitized, -WEIGHT_CLAMP, WEIGHT_CLAMP, out=sanitized)
-                sanitized_weights.append(sanitized.astype(dtype, copy=False))
-                sanitized_any = True
-            else:
-                sanitized_weights.append(array.astype(dtype, copy=False))
-            replaced_total += invalid_count
-            clipped_total += clip_count
-        return sanitized_weights, {
-            "sanitized": bool(sanitized_any),
-            "replaced": int(replaced_total),
-            "clipped": int(clipped_total),
+                arr = np.pad(arr, (0, self.input_size - arr.size), constant_values=0.0)
+        metadata = {
+            "replaced": replaced,
+            "clipped": clipped,
+            "adjusted": adjusted,
+            "sanitized": bool(replaced or clipped or adjusted),
         }
+        return arr.astype(NP_FLOAT, copy=False), metadata
 
-    def _assign_weights(self, weights, reason):
-        sanitized_weights, meta = self._sanitize_weight_list(weights)
-        final_weights = []
-        for original, sanitized in zip(weights, sanitized_weights):
-            array = np.asarray(sanitized)
-            dtype = getattr(original, "dtype", array.dtype)
-            if array.dtype != dtype:
-                array = array.astype(dtype, copy=False)
-            final_weights.append(array)
-        self.model.set_weights(final_weights)
-        self.optimizer.sync_slow_variables(self.model.trainable_variables)
-        if meta["sanitized"]:
-            LOGGER.warning(
-                "Sanitized %s weights (replaced=%d, clipped=%d)",
-                reason,
-                meta["replaced"],
-                meta["clipped"],
-            )
-        return meta
-
-    def _sanitize_model_weights(self, reason):
-        weights = self.model.get_weights()
-        sanitized_weights, meta = self._sanitize_weight_list(weights)
-        if meta["sanitized"]:
-            final_weights = []
-            for original, sanitized in zip(weights, sanitized_weights):
-                array = np.asarray(sanitized)
-                dtype = getattr(original, "dtype", array.dtype)
-                if array.dtype != dtype:
-                    array = array.astype(dtype, copy=False)
-                final_weights.append(array)
-            self.model.set_weights(final_weights)
-            self.optimizer.sync_slow_variables(self.model.trainable_variables)
-            LOGGER.warning(
-                "Sanitized %s weights (replaced=%d, clipped=%d)",
-                reason,
-                meta["replaced"],
-                meta["clipped"],
-            )
-        return meta
-
-    def _weights_are_finite(self):
-        for weight in self.model.get_weights():
-            if not np.all(np.isfinite(weight)):
+    def _weights_are_finite(self) -> bool:
+        for param in self.model.parameters():
+            if not torch.isfinite(param).all():
                 return False
         return True
 
-    def _apply_hebbian_updates(self, reinforcement):
-        if not self.hebbian_layers:
-            return {"layers": 0, "applied": 0, "decay_rates": []}
-        applied = 0
-        decay_rates = []
-        for layer in self.hebbian_layers:
-            result = layer.update_hebbian(reinforcement)
-            if not isinstance(result, dict):
-                continue
-            decay_rate = result.get("decay_rate")
-            if decay_rate is not None:
-                decay_rates.append(float(decay_rate))
-            if result.get("applied"):
-                applied += 1
+    def _sanitize_model_weights(self, reason: str) -> Dict[str, Any]:
+        replaced_total = 0
+        clipped_total = 0
+        sanitized = False
+        for param in self.model.parameters():
+            tensor = param.data
+            finite_mask = torch.isfinite(tensor)
+            replaced = (~finite_mask).sum().item()
+            if replaced:
+                tensor[~finite_mask] = 0.0
+            replaced_total += int(replaced)
+            if WEIGHT_CLAMP > 0:
+                clip_mask = tensor.abs() > WEIGHT_CLAMP
+                if clip_mask.any():
+                    tensor.clamp_(-WEIGHT_CLAMP, WEIGHT_CLAMP)
+                    clipped_total += int(clip_mask.sum().item())
+            if replaced or clipped_total:
+                sanitized = True
+        if sanitized:
+            LOGGER.warning(
+                "Sanitized %s weights (replaced=%d, clipped=%d)",
+                reason,
+                replaced_total,
+                clipped_total,
+            )
+            self.optimizer.sync_slow_parameters(list(self.model.parameters()))
         return {
-            "layers": len(self.hebbian_layers),
-            "applied": applied,
-            "decay_rates": decay_rates,
+            "sanitized": sanitized,
+            "replaced": replaced_total,
+            "clipped": clipped_total,
         }
 
-    def choose_actions_batch(self, observations, epsilons):
+    def _filter_gradients(self) -> Tuple[List[torch.nn.Parameter], int, int, Optional[float]]:
+        dropped = 0
+        clipped = 0
+        params = [p for p in self.model.parameters() if p.grad is not None]
+        for param in list(params):
+            grad = param.grad
+            if grad is None:
+                continue
+            if not torch.isfinite(grad).all():
+                param.grad = None
+                params.remove(param)
+                dropped += 1
+                LOGGER.warning("Dropped non-finite gradients for parameter %s", getattr(param, "name", "?"))
+        if not params:
+            return [], dropped, clipped, None
+        if GRAD_CLIP_VALUE > 0:
+            for param in params:
+                grad = param.grad
+                if grad is None:
+                    continue
+                if grad.abs().gt(GRAD_CLIP_VALUE).any():
+                    grad.data.clamp_(-GRAD_CLIP_VALUE, GRAD_CLIP_VALUE)
+                    clipped += 1
+        global_norm: Optional[float] = None
+        try:
+            if GRAD_CLIP_GLOBAL_NORM > 0:
+                norm = torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP_GLOBAL_NORM)
+                global_norm = float(norm)
+                if global_norm > GRAD_CLIP_GLOBAL_NORM:
+                    clipped += 1
+            else:
+                total = sum(torch.sum(param.grad.detach() ** 2) for param in params if param.grad is not None)
+                global_norm = float(torch.sqrt(total).item()) if total > 0 else 0.0
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning("Failed to compute gradient norm: %s", exc)
+            global_norm = None
+        if global_norm is not None:
+            if not np.isfinite(global_norm):
+                LOGGER.warning("Global gradient norm became non-finite; skipping step")
+                for param in params:
+                    param.grad = None
+                return [], dropped, clipped, None
+            if GRAD_SKIP_GLOBAL_NORM > 0 and global_norm > GRAD_SKIP_GLOBAL_NORM:
+                LOGGER.warning(
+                    "Global gradient norm %.3f exceeded skip threshold %.3f; skipping gradient application",
+                    global_norm,
+                    GRAD_SKIP_GLOBAL_NORM,
+                )
+                for param in params:
+                    param.grad = None
+                return [], dropped, clipped, global_norm
+        return params, dropped, clipped, global_norm
+
+    def _apply_hebbian_updates(self, reinforcement: float) -> Dict[str, Any]:
+        applied = 0
+        decay_rates: List[float] = []
+        for layer in self.model.hebbian_layers():
+            result = layer.update_hebbian(reinforcement)
+            if result.get("applied"):
+                applied += 1
+            if "decay_rate" in result:
+                decay_rates.append(float(result["decay_rate"]))
+        return {"layers": len(self.model.hebbian_layers()), "applied": applied, "decay_rates": decay_rates}
+
+    def _tensor_from_array(self, array: np.ndarray) -> torch.Tensor:
+        tensor = torch.from_numpy(array.astype(NP_FLOAT, copy=False)).to(self.device)
+        return tensor
+
+    def choose_actions_batch(self, observations: List[Any], epsilons: List[float]) -> List[Dict[str, Any]]:
         with self._lock:
-            count = len(observations)
-            results = [None] * count
+            self.model.eval()
+            results: List[Optional[Dict[str, Any]]] = [None] * len(observations)
             valid_entries = []
             for index, observation in enumerate(observations):
                 epsilon = 0.1
@@ -822,18 +590,17 @@ class RemoteBrain:
                     {
                         "index": index,
                         "epsilon": float(np.clip(epsilon, 0.0, 0.999)),
-                        "tensor": obs.reshape(-1),
+                        "tensor": obs,
                         "meta": obs_meta,
                     }
                 )
             if valid_entries:
-                batch = np.stack([entry["tensor"] for entry in valid_entries], axis=0).astype(
-                    NP_FLOAT, copy=False
-                )
-                action_probs = self.model(batch, training=False)
-                probs_np = action_probs.numpy().astype(NP_FLOAT, copy=False)
-                for entry, row in zip(valid_entries, probs_np):
-                    raw_probs = row.astype(NP_FLOAT, copy=False).reshape(-1)
+                batch = np.stack([entry["tensor"] for entry in valid_entries], axis=0).astype(NP_FLOAT, copy=False)
+                with torch.no_grad():
+                    tensor = torch.from_numpy(batch).to(self.device)
+                    probs = self.model(tensor).cpu().numpy().astype(NP_FLOAT, copy=False)
+                for entry, row in zip(valid_entries, probs):
+                    raw_probs = row.reshape(-1)
                     replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
                     sanitized_policy = replaced > 0
                     safe_probs = np.nan_to_num(
@@ -846,26 +613,17 @@ class RemoteBrain:
                     total = float(np.sum(safe_probs))
                     if not np.isfinite(total) or total <= 0:
                         sanitized_policy = True
-                        safe_probs = np.full(
-                            self.action_count,
-                            1.0 / max(1, self.action_count),
-                            dtype=NP_FLOAT,
-                        )
+                        safe_probs = np.full(self.action_count, 1.0 / max(1, self.action_count), dtype=NP_FLOAT)
                     else:
                         safe_probs = safe_probs / total
                     if not np.all(np.isfinite(safe_probs)):
                         sanitized_policy = True
-                        safe_probs = np.nan_to_num(
-                            safe_probs,
-                            nan=1.0 / max(1, self.action_count),
-                        )
+                        safe_probs = np.full(self.action_count, 1.0 / max(1, self.action_count), dtype=NP_FLOAT)
                     now = time.time()
                     weights_ok = replaced == 0
-                    strikes = None
+                    strikes: Optional[int] = None
                     if sanitized_policy:
-                        LOGGER.warning(
-                            "Sanitized action probabilities due to non-finite values"
-                        )
+                        LOGGER.warning("Sanitized action probabilities due to non-finite values")
                         if now - self.policy_last_reset > ACT_SANITIZATION_STRIKE_WINDOW:
                             self.policy_strikes = 0
                             self.policy_last_reset = now
@@ -896,18 +654,12 @@ class RemoteBrain:
                     policy_meta = {
                         "replaced": int(replaced),
                         "fallback": bool(sanitized_policy),
+                        "sanitized": bool(replaced or sanitized_policy),
                     }
-                    policy_meta["sanitized"] = bool(
-                        policy_meta["replaced"] or policy_meta["fallback"]
-                    )
                     if strikes is not None:
                         policy_meta["strikes"] = int(strikes)
-                        policy_meta["strike_threshold"] = int(
-                            ACT_SANITIZATION_FORCE_THRESHOLD
-                        )
-                        policy_meta["window_ms"] = int(
-                            ACT_SANITIZATION_STRIKE_WINDOW * 1000
-                        )
+                        policy_meta["strike_threshold"] = int(ACT_SANITIZATION_FORCE_THRESHOLD)
+                        policy_meta["window_ms"] = int(ACT_SANITIZATION_STRIKE_WINDOW * 1000)
                     results[entry["index"]] = {
                         "action": action_index,
                         "weights_ok": bool(weights_ok),
@@ -917,24 +669,58 @@ class RemoteBrain:
                             "exploration": bool(exploration),
                         },
                     }
-            for index, value in enumerate(results):
-                if value is None:
-                    results[index] = {"error": "Observation could not be processed"}
-            return results
+            return [result or {"error": "Observation could not be processed"} for result in results]
 
-    def choose_action(self, observation, epsilon):
+    def choose_action(self, observation: Any, epsilon: float) -> Dict[str, Any]:
         batch = self.choose_actions_batch([observation], [epsilon])
-        if not batch:
-            raise RuntimeError("Failed to compute action")
         result = batch[0]
         if result.get("error"):
             raise RuntimeError(str(result["error"]))
         return result
 
-    def train_batch(self, observations, actions, rewards, next_observations):
+    @staticmethod
+    def _sanitize_scalar(value: Any, label: str) -> float:
+        if value is None:
+            return 0.0
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            LOGGER.warning("Received invalid %s value: %s", label, value)
+            return 0.0
+        if not np.isfinite(numeric):
+            LOGGER.warning("%s contained non-finite value: %s", label, value)
+            return 0.0
+        if numeric < 0.0:
+            LOGGER.warning("%s was negative; clamping to zero: %s", label, value)
+            numeric = 0.0
+        return float(numeric)
+
+    def _transform_reward(self, reward_value: Any, penalty_value: Any) -> Tuple[float, Dict[str, Any]]:
+        reward_component = self._sanitize_scalar(reward_value, "reward")
+        penalty_component = self._sanitize_scalar(penalty_value, "penalty")
+        positive_component = max(0.0, reward_component)
+        log_reward_component = np.log1p(positive_component)
+        log_penalty_component = np.log1p(penalty_component)
+        scaled_reward = log_reward_component - log_penalty_component
+        return float(scaled_reward), {
+            "raw": reward_component,
+            "positive": positive_component,
+            "penalty": penalty_component,
+            "log_positive": float(log_reward_component),
+            "log_penalty": float(log_penalty_component),
+        }
+
+    def train_batch(
+        self,
+        observations: List[Any],
+        actions: List[Any],
+        rewards: List[Any],
+        penalties: List[Any],
+        next_observations: List[Any],
+    ) -> List[Dict[str, Any]]:
         with self._lock:
-            count = len(observations)
-            results = [None] * count
+            self.model.train()
+            results: List[Optional[Dict[str, Any]]] = [None] * len(observations)
             valid_entries = []
             for index, observation in enumerate(observations):
                 try:
@@ -947,31 +733,20 @@ class RemoteBrain:
                         "dropped_gradients": 0,
                         "clipped_gradients": 0,
                         "sanitized": {
-                            "observation": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "adjusted": False,
-                                "sanitized": False,
-                            },
-                            "next_observation": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "adjusted": False,
-                                "sanitized": False,
-                            },
-                            "weights": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "sanitized": False,
-                            },
+                            "observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
+                            "next_observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
+                            "weights": {"replaced": 0, "clipped": 0, "sanitized": False},
                         },
                     }
                     continue
-
-                bounded_action = None
-                reward_value = rewards[index] if index < len(rewards) else None
+                next_meta = {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False}
+                next_obs = None
+                if index < len(next_observations) and isinstance(next_observations[index], (list, tuple)):
+                    next_obs, next_meta = self._prepare_observation(next_observations[index], "next_observation")
                 action_value = actions[index] if index < len(actions) else None
-                if action_value is None or reward_value is None:
+                reward_value = rewards[index] if index < len(rewards) else None
+                penalty_value = penalties[index] if index < len(penalties) else None
+                if action_value is None and reward_value is None and penalty_value is None:
                     results[index] = {
                         "trained": False,
                         "weights_ok": True,
@@ -979,24 +754,23 @@ class RemoteBrain:
                         "clipped_gradients": 0,
                         "sanitized": {
                             "observation": obs_meta,
-                            "next_observation": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "adjusted": False,
-                                "sanitized": False,
-                            },
-                            "weights": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "sanitized": False,
+                            "next_observation": next_meta,
+                            "weights": {"replaced": 0, "clipped": 0, "sanitized": False},
+                            "reward": {
+                                "raw": 0.0,
+                                "positive": 0.0,
+                                "penalty": 0.0,
+                                "log_positive": 0.0,
+                                "log_penalty": 0.0,
                             },
                         },
                     }
                     continue
                 try:
-                    bounded_action = int(action_value)
+                    action_index = int(action_value) if action_value is not None else None
                 except (TypeError, ValueError):
-                    LOGGER.warning("Received invalid action index: %s", action_value)
+                    action_index = None
+                if action_index is None or action_index < 0 or action_index >= self.action_count:
                     results[index] = {
                         "trained": False,
                         "weights_ok": True,
@@ -1004,408 +778,182 @@ class RemoteBrain:
                         "clipped_gradients": 0,
                         "sanitized": {
                             "observation": obs_meta,
-                            "next_observation": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "adjusted": False,
-                                "sanitized": False,
-                            },
-                            "weights": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "sanitized": False,
+                            "next_observation": next_meta,
+                            "weights": {"replaced": 0, "clipped": 0, "sanitized": False},
+                            "reward": {
+                                "raw": 0.0,
+                                "positive": 0.0,
+                                "penalty": 0.0,
+                                "log_positive": 0.0,
+                                "log_penalty": 0.0,
                             },
                         },
                     }
                     continue
-                bounded_action = int(np.clip(bounded_action, 0, self.action_count - 1))
-                try:
-                    reward_float = float(reward_value)
-                except (TypeError, ValueError):
-                    LOGGER.warning("Received invalid reward value: %s", reward_value)
-                    reward_float = 0.0
-                if not np.isfinite(reward_float):
-                    LOGGER.warning("Reward contained non-finite value: %s", reward_value)
-                    reward_float = 0.0
-                scaled_reward = float(np.clip(reward_float, -1.0, 1.0))
-
-                next_meta = {
-                    "replaced": 0,
-                    "clipped": 0,
-                    "adjusted": False,
-                    "sanitized": False,
-                }
-                if index < len(next_observations):
-                    next_observation = next_observations[index]
-                    if next_observation is not None:
-                        try:
-                            _, next_meta = self._prepare_observation(
-                                next_observation, "next_observation"
-                            )
-                        except ValueError:
-                            LOGGER.warning(
-                                "Skipping next observation sanitization due to invalid payload"
-                            )
-
+                scaled_reward, reward_meta = self._transform_reward(reward_value, penalty_value)
                 valid_entries.append(
                     {
                         "index": index,
-                        "obs": obs.reshape(-1),
+                        "obs": obs,
+                        "action": action_index,
+                        "reward": scaled_reward,
                         "obs_meta": obs_meta,
                         "next_meta": next_meta,
-                        "action": bounded_action,
-                        "reward": scaled_reward,
+                        "reward_meta": reward_meta,
                     }
                 )
-
             if valid_entries:
-                obs_matrix = np.stack([entry["obs"] for entry in valid_entries], axis=0).astype(
-                    NP_FLOAT, copy=False
-                )
-                actions_tensor = tf.convert_to_tensor(
-                    [entry["action"] for entry in valid_entries], dtype=tf.int32
-                )
-                rewards_tensor = tf.convert_to_tensor(
-                    [entry["reward"] for entry in valid_entries], dtype=TF_FLOAT
-                )
-
-                with tf.GradientTape() as tape:
-                    action_pred = self.model(obs_matrix, training=True)
-                    action_pred = tf.cast(action_pred, TF_FLOAT)
-                    total_loss = tf.constant(0.0, dtype=TF_FLOAT)
-                    one_hot = tf.one_hot(
-                        actions_tensor, self.action_count, dtype=TF_FLOAT
-                    )
-                    log_probs = tf.math.log(
-                        action_pred + tf.constant(1e-8, dtype=TF_FLOAT)
-                    )
-                    policy_loss = -tf.reduce_mean(
-                        tf.reduce_sum(log_probs * one_hot, axis=-1) * rewards_tensor
-                    )
-                    total_loss += policy_loss
-                    total_loss = tf.where(
-                        tf.math.is_finite(total_loss),
-                        total_loss,
-                        tf.constant(0.0, dtype=TF_FLOAT),
-                    )
-
-                gradients = tape.gradient(total_loss, self.model.trainable_variables)
-                grads_and_vars = [
-                    (grad, var)
-                    for grad, var in zip(gradients, self.model.trainable_variables)
-                    if grad is not None
-                ]
-                cleaned_grads, dropped, clipped_grads, gradient_norm = self._filter_gradients(
-                    grads_and_vars
-                )
-                if dropped:
-                    LOGGER.warning(
-                        "Skipped %d gradient tensors due to non-finite values", dropped
-                    )
-                weights_ok = True
-                weight_meta = {
-                    "sanitized": False,
-                    "replaced": 0,
-                    "clipped": 0,
-                    "reason": "post-train-batch",
-                }
-                if cleaned_grads:
-                    self.optimizer.apply_gradients(cleaned_grads)
-                    weights_ok = self._weights_are_finite()
-                    if not weights_ok:
-                        LOGGER.error(
-                            "Model weights contain non-finite values after training step"
-                        )
-                    weight_meta = self._sanitize_model_weights("post-train-batch")
-                    if weight_meta.get("sanitized"):
-                        if weight_meta.get("replaced"):
-                            weights_ok = False
-                        else:
-                            weights_ok = weights_ok and self._weights_are_finite()
+                obs_matrix = np.stack([entry["obs"] for entry in valid_entries], axis=0).astype(NP_FLOAT, copy=False)
+                action_tensor = torch.tensor([entry["action"] for entry in valid_entries], dtype=torch.long, device=self.device)
+                reward_tensor = torch.tensor([entry["reward"] for entry in valid_entries], dtype=FLOAT_POLICY["dtype"], device=self.device)
+                obs_tensor = torch.from_numpy(obs_matrix).to(self.device)
+                self.optimizer.zero_grad()
+                probs = self.model(obs_tensor)
+                log_probs = torch.log(probs + 1e-8)
+                selected_log_probs = log_probs.gather(1, action_tensor.view(-1, 1)).squeeze(1)
+                loss = -(selected_log_probs * reward_tensor).mean()
+                if not torch.isfinite(loss):
+                    LOGGER.warning("Loss became non-finite; skipping update")
+                else:
+                    loss.backward()
+                    params, dropped, clipped_grads, gradient_norm = self._filter_gradients()
+                    weights_ok = True
+                    weight_meta = {"sanitized": False, "replaced": 0, "clipped": 0}
+                    if params:
+                        self.optimizer.step()
+                        weights_ok = self._weights_are_finite()
+                        if not weights_ok:
+                            LOGGER.error("Model weights contain non-finite values after training step")
+                        weight_meta = self._sanitize_model_weights("post-train-batch")
+                        if weight_meta.get("sanitized"):
+                            weights_ok = weights_ok and weight_meta.get("replaced", 0) == 0 and self._weights_are_finite()
                     else:
-                        weights_ok = weights_ok and self._weights_are_finite()
-
-                mean_reward = float(np.mean([entry["reward"] for entry in valid_entries]))
-                hebbian_info = self._apply_hebbian_updates(mean_reward)
-                current_lr = self._current_learning_rate()
-
-                for entry in valid_entries:
-                    results[entry["index"]] = {
-                        "trained": bool(cleaned_grads),
-                        "weights_ok": bool(weights_ok),
-                        "dropped_gradients": int(dropped),
-                        "clipped_gradients": int(clipped_grads),
-                        "gradient_norm": float(gradient_norm) if gradient_norm is not None else None,
-                        "learning_rate": current_lr,
-                        "sanitized": {
-                            "observation": entry["obs_meta"],
-                            "next_observation": entry["next_meta"],
-                            "weights": {
-                                "replaced": int(weight_meta.get("replaced", 0)),
-                                "clipped": int(weight_meta.get("clipped", 0)),
-                                "sanitized": bool(weight_meta.get("sanitized", False)),
+                        dropped = max(dropped, 1)
+                        clipped_grads = clipped_grads
+                        gradient_norm = None
+                        self.optimizer.zero_grad()
+                        weights_ok = self._weights_are_finite()
+                    mean_reward = float(np.mean([entry["reward"] for entry in valid_entries])) if valid_entries else 0.0
+                    hebbian_info = self._apply_hebbian_updates(mean_reward)
+                    for entry in valid_entries:
+                        results[entry["index"]] = {
+                            "trained": bool(params),
+                            "weights_ok": bool(weights_ok),
+                            "dropped_gradients": int(dropped),
+                            "clipped_gradients": int(clipped_grads),
+                            "gradient_norm": float(gradient_norm) if gradient_norm is not None else None,
+                            "sanitized": {
+                                "observation": entry["obs_meta"],
+                                "next_observation": entry["next_meta"],
+                                "weights": {
+                                    "replaced": int(weight_meta.get("replaced", 0)),
+                                    "clipped": int(weight_meta.get("clipped", 0)),
+                                    "sanitized": bool(weight_meta.get("sanitized", False)),
+                                },
+                                "reward": entry["reward_meta"],
                             },
+                            "hebbian": hebbian_info,
+                        }
+            return [
+                value
+                if value is not None
+                else {
+                    "trained": False,
+                    "weights_ok": True,
+                    "dropped_gradients": 0,
+                    "clipped_gradients": 0,
+                    "gradient_norm": None,
+                    "sanitized": {
+                        "observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
+                        "next_observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
+                        "weights": {"replaced": 0, "clipped": 0, "sanitized": False},
+                        "reward": {
+                            "raw": 0.0,
+                            "positive": 0.0,
+                            "penalty": 0.0,
+                            "log_positive": 0.0,
+                            "log_penalty": 0.0,
                         },
-                        "hebbian": hebbian_info,
-                    }
+                    },
+                }
+                for value in results
+            ]
 
-            for index, value in enumerate(results):
-                if value is None:
-                    results[index] = {
-                        "trained": False,
-                        "weights_ok": True,
-                        "dropped_gradients": 0,
-                        "clipped_gradients": 0,
-                        "gradient_norm": None,
-                        "sanitized": {
-                            "observation": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "adjusted": False,
-                                "sanitized": False,
-                            },
-                            "next_observation": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "adjusted": False,
-                                "sanitized": False,
-                            },
-                            "weights": {
-                                "replaced": 0,
-                                "clipped": 0,
-                                "sanitized": False,
-                            },
-                        },
-                    }
-            return results
-
-    def train(self, observation, action_index, reward, next_observation):
-        batch = self.train_batch(
-            [observation],
-            [action_index],
-            [reward],
-            [next_observation],
-        )
-        if not batch:
-            return False
+    def train(self, observation: Any, action_index: Any, reward: Any, penalty: Any, next_observation: Any) -> Dict[str, Any]:
+        batch = self.train_batch([observation], [action_index], [reward], [penalty], [next_observation])
         return batch[0]
 
-    def copy_from(self, other):
+    def copy_from(self, other: "RemoteBrain") -> None:
         if other is self:
             return
         first, second = (self, other) if id(self) <= id(other) else (other, self)
         with first._lock:
             with second._lock:
-                weights = other.model.get_weights()
-                self._assign_weights(weights, "copy")
+                self.model.load_state_dict(other.model.state_dict())
+                self.optimizer.sync_slow_parameters(list(self.model.parameters()))
 
-    def average_from(self, sources):
+    def average_from(self, sources: List["RemoteBrain"]) -> None:
         if not sources:
             return
         with self._lock:
-            weights = []
+            state_dicts = []
             for source in sources:
                 if source is None:
                     continue
                 with source._lock:
-                    weights.append(source.model.get_weights())
-            if not weights:
+                    state_dicts.append({key: value.detach().clone() for key, value in source.model.state_dict().items()})
+            if not state_dicts:
                 return
-            averaged = []
-            for layer_weights in zip(*weights):
-                layer_stack = np.stack(layer_weights, axis=0)
-                averaged_layer = layer_stack.mean(axis=0)
-                if averaged_layer.dtype != layer_stack.dtype:
-                    averaged_layer = averaged_layer.astype(layer_stack.dtype)
-                averaged.append(averaged_layer)
-            self._assign_weights(averaged, "average")
+            averaged = {}
+            for key in state_dicts[0]:
+                stacked = torch.stack([state[key] for state in state_dicts], dim=0)
+                averaged[key] = stacked.mean(dim=0)
+            self.model.load_state_dict(averaged)
+            self.optimizer.sync_slow_parameters(list(self.model.parameters()))
 
-    def mutate(self, stddev):
+    def mutate(self, stddev: float) -> None:
         with self._lock:
-            weights = self.model.get_weights()
-            mutated = []
-            for weight in weights:
-                noise = np.random.normal(0, stddev, size=weight.shape).astype(weight.dtype, copy=False)
-                mutated_weight = (weight + noise).astype(weight.dtype, copy=False)
-                mutated.append(mutated_weight)
-            self._assign_weights(mutated, "mutate")
+            for param in self.model.parameters():
+                noise = torch.randn_like(param) * stddev
+                param.data.add_(noise)
+            self._sanitize_model_weights("mutate")
+            self.optimizer.sync_slow_parameters(list(self.model.parameters()))
 
-    def save(self, directory):
+    def save(self, directory: str) -> None:
         with self._lock:
             os.makedirs(directory, exist_ok=True)
-            with open(os.path.join(directory, "model.json"), "w", encoding="utf-8") as handle:
-                handle.write(self.model.to_json())
-            weights_path = os.path.join(directory, "weights.weights.h5")
-            legacy_path = os.path.join(directory, "weights.h5")
-            if os.path.exists(legacy_path) and legacy_path != weights_path:
-                try:
-                    os.remove(legacy_path)
-                except OSError:
-                    pass
-            self.model.save_weights(weights_path)
+            torch.save(self.model.state_dict(), os.path.join(directory, "model.pt"))
+            metadata = {
+                "input_size": self.input_size,
+                "action_count": self.action_count,
+                "created_at": time.time(),
+                "dtype": str(FLOAT_POLICY["dtype"]),
+            }
+            with open(os.path.join(directory, "metadata.json"), "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
 
-    @staticmethod
-    def _decode_name(name):
-        if isinstance(name, (bytes, bytearray)):
-            return name.decode("utf-8")
-        return str(name)
-
-    def _load_partial_weights(self, weights_path):
-        if h5py is None or not os.path.exists(weights_path):
-            return 0, 0
-        loaded_variables = 0
-        attempted_variables = 0
-        try:
-            with h5py.File(weights_path, "r") as handle:  # type: ignore[call-arg]
-                root_group = handle
-                if "model_weights" in handle:
-                    root_group = handle["model_weights"]
-                layer_names = root_group.attrs.get("layer_names")
-                if isinstance(layer_names, np.ndarray):
-                    layer_names = layer_names.tolist()
-                if not layer_names:
-                    return 0, 0
-                layer_lookup = {}
-                for raw_name in layer_names:
-                    layer_name = self._decode_name(raw_name)
-                    if layer_name in root_group:
-                        layer_lookup[layer_name] = root_group[layer_name]
-                if not layer_lookup:
-                    return 0, 0
-                for layer in self.model.layers:
-                    group = layer_lookup.get(layer.name)
-                    if group is None:
-                        continue
-                    weight_names = group.attrs.get("weight_names")
-                    if isinstance(weight_names, np.ndarray):
-                        weight_names = weight_names.tolist()
-                    if not weight_names:
-                        continue
-                    for index, weight_var in enumerate(layer.weights):
-                        attempted_variables += 1
-                        try:
-                            raw_weight_name = weight_names[index]
-                        except IndexError:
-                            break
-                        weight_name = self._decode_name(raw_weight_name)
-                        if weight_name not in group:
-                            continue
-                        value = group[weight_name][()]
-                        target_shape = tuple(int(dim) for dim in weight_var.shape)
-                        if value.shape != target_shape:
-                            continue
-                        if (
-                            hasattr(weight_var, "dtype")
-                            and hasattr(weight_var.dtype, "as_numpy_dtype")
-                        ):
-                            value = value.astype(weight_var.dtype.as_numpy_dtype, copy=False)
-                        try:
-                            weight_var.assign(value)
-                            loaded_variables += 1
-                        except Exception:  # pylint: disable=broad-except
-                            LOGGER.exception(
-                                "Failed assigning partial weight %s for layer %s", weight_name, layer.name
-                            )
-                return loaded_variables, attempted_variables
-        except Exception:  # pylint: disable=broad-except
-            LOGGER.exception("Partial weight load failed for %s", weights_path)
-            return loaded_variables, attempted_variables
-
-    def load_weights(self, directory):
-        with self._lock:
-            weights_path = os.path.join(directory, "weights.weights.h5")
-            if not os.path.exists(weights_path):
-                legacy_path = os.path.join(directory, "weights.h5")
-                if os.path.exists(legacy_path):
-                    weights_path = legacy_path
-            if not os.path.exists(weights_path):
-                return {"status": "fresh"}
-
-            loaded_info = {"status": "fresh"}
-            try:
-                self.model.load_weights(weights_path)
-                loaded_info = {"status": "exact", "path": weights_path}
-                weight_meta = self._sanitize_model_weights("load")
-                if weight_meta.get("sanitized"):
-                    loaded_info["weight_sanitized"] = {
-                        "replaced": int(weight_meta.get("replaced", 0)),
-                        "clipped": int(weight_meta.get("clipped", 0)),
-                    }
-                LOGGER.info("Restored weights exactly from %s", weights_path)
-            except ValueError as exc:
-                LOGGER.warning(
-                    "Exact weight load failed for %s: %s. Attempting relaxed restore.",
-                    weights_path,
-                    exc,
-                )
-                relaxed_loaded = False
-                try:
-                    self.model.load_weights(weights_path, by_name=True, skip_mismatch=True)
-                    relaxed_loaded = True
-                    loaded_info = {
-                        "status": "relaxed",
-                        "path": weights_path,
-                    }
-                    weight_meta = self._sanitize_model_weights("load-relaxed")
-                    if weight_meta.get("sanitized"):
-                        loaded_info["weight_sanitized"] = {
-                            "replaced": int(weight_meta.get("replaced", 0)),
-                            "clipped": int(weight_meta.get("clipped", 0)),
-                        }
-                    LOGGER.info("Restored compatible weights with skip_mismatch from %s", weights_path)
-                except (TypeError, ValueError) as relaxed_exc:
-                    LOGGER.info(
-                        "Relaxed weight load unavailable for %s: %s",
-                        weights_path,
-                        relaxed_exc,
-                    )
-                if not relaxed_loaded:
-                    loaded_vars, attempted = self._load_partial_weights(weights_path)
-                    if loaded_vars:
-                        loaded_info = {
-                            "status": "partial",
-                            "path": weights_path,
-                            "loaded_variables": loaded_vars,
-                            "attempted_variables": attempted,
-                        }
-                        weight_meta = self._sanitize_model_weights("load-partial")
-                        if weight_meta.get("sanitized"):
-                            loaded_info["weight_sanitized"] = {
-                                "replaced": int(weight_meta.get("replaced", 0)),
-                                "clipped": int(weight_meta.get("clipped", 0)),
-                            }
-                        LOGGER.info(
-                            "Partially restored %s/%s variables from %s",
-                            loaded_vars,
-                            attempted or "?",
-                            weights_path,
-                        )
-                    else:
-                        loaded_info = {
-                            "status": "mismatch",
-                            "path": weights_path,
-                            "loaded_variables": loaded_vars,
-                            "attempted_variables": attempted,
-                        }
-                        LOGGER.warning(
-                            "No compatible tensors found when loading %s; keeping initialized weights",
-                            weights_path,
-                        )
-            if loaded_info["status"] != "fresh":
-                self.optimizer.sync_slow_variables(self.model.trainable_variables)
-            else:
-                LOGGER.info("No compatible weights found at %s; using fresh initialization", weights_path)
-            return loaded_info
+    def load_weights(self, directory: str) -> Dict[str, Any]:
+        path = os.path.join(directory, "model.pt")
+        if not os.path.exists(path):
+            return {"status": "fresh", "path": path}
+        state_dict = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(state_dict, strict=False)
+        self.optimizer.sync_slow_parameters(list(self.model.parameters()))
+        meta = self._sanitize_model_weights("load")
+        status = "exact"
+        if meta.get("sanitized"):
+            status = "sanitized"
+        return {"status": status, "path": path, "weights": meta}
 
 
-def require_brain(brain_id):
+def require_brain(brain_id: str) -> RemoteBrain:
     brain = BRAINS.get(brain_id)
     if brain is None:
         raise HTTPException(status_code=404, detail="Unknown brain")
     return brain
 
 
-def _execute(endpoint, func, *args, **kwargs):
+def _execute(endpoint: str, func, *args, **kwargs):
     try:
         return WORKERS.run(endpoint, func, *args, **kwargs)
     except Exception as exc:  # pylint: disable=broad-except
@@ -1413,7 +961,7 @@ def _execute(endpoint, func, *args, **kwargs):
         raise RuntimeError(f"Failed to process {endpoint} request") from exc
 
 
-def log_request(bot_id, endpoint, payload):
+def log_request(bot_id: Any, endpoint: str, payload: Dict[str, Any]) -> None:
     with STATE_LOCK:
         STATUS["total_requests"] += 1
         entry = {
@@ -1421,6 +969,7 @@ def log_request(bot_id, endpoint, payload):
             "bot_id": bot_id,
             "endpoint": endpoint,
             "reward": payload.get("reward"),
+            "penalty": payload.get("penalty"),
             "action": payload.get("action"),
             "epsilon": payload.get("epsilon"),
             "gradient_norm": payload.get("gradient_norm"),
@@ -1435,6 +984,7 @@ def log_request(bot_id, endpoint, payload):
                     "last_seen": entry["timestamp"],
                     "last_action": payload.get("action"),
                     "last_reward": payload.get("reward"),
+                    "last_penalty": payload.get("penalty"),
                     "epsilon": payload.get("epsilon"),
                     "gradient_norm": payload.get("gradient_norm"),
                 }
@@ -1442,15 +992,10 @@ def log_request(bot_id, endpoint, payload):
             sanitized = payload.get("sanitized")
             if isinstance(sanitized, dict):
                 policy_meta = sanitized.get("policy")
-                if isinstance(policy_meta, dict):
-                    if "strikes" in policy_meta:
-                        try:
-                            bot_state["policy_strikes"] = int(policy_meta["strikes"])
-                        except (TypeError, ValueError):  # pragma: no cover - defensive
-                            bot_state["policy_strikes"] = policy_meta["strikes"]
-                        bot_state["policy_strike_threshold"] = ACT_SANITIZATION_FORCE_THRESHOLD
-                    if policy_meta.get("sanitized"):
-                        bot_state["policy_last_sanitized"] = entry["timestamp"]
+                if isinstance(policy_meta, dict) and "strikes" in policy_meta:
+                    bot_state["policy_strikes"] = int(policy_meta["strikes"])
+                    bot_state["policy_strike_threshold"] = ACT_SANITIZATION_FORCE_THRESHOLD
+                    bot_state["policy_last_sanitized"] = entry["timestamp"]
 
 
 @app.post("/api/brains")
@@ -1466,9 +1011,7 @@ def create_brain_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)
 
 
 @app.post("/api/brains/{brain_id}/act")
-def choose_action_endpoint(
-    brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)
-):
+def choose_action_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(default=None)):
     brain = require_brain(brain_id)
     payload = payload or {}
     observation = payload.get("observation")
@@ -1479,18 +1022,11 @@ def choose_action_endpoint(
         result = _execute("act", brain.choose_action, observation, epsilon)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if isinstance(result, dict):
-        response_payload = {
-            "action": int(result.get("action", 0)),
-            "weights_ok": bool(result.get("weights_ok", True)),
-            "sanitized": result.get("sanitized") or {},
-        }
-    else:
-        response_payload = {
-            "action": int(result),
-            "weights_ok": True,
-            "sanitized": {},
-        }
+    response_payload = {
+        "action": int(result.get("action", 0)),
+        "weights_ok": bool(result.get("weights_ok", True)),
+        "sanitized": result.get("sanitized") or {},
+    }
     log_request(payload.get("bot_id"), "act", {**payload, **response_payload})
     return response_payload
 
@@ -1510,19 +1046,17 @@ def train_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(defau
             observation,
             payload.get("action"),
             payload.get("reward"),
+            payload.get("penalty"),
             next_observation if isinstance(next_observation, (list, tuple)) else None,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    if isinstance(result, dict):
-        response_payload = {
-            "trained": bool(result.get("trained")),
-            "weights_ok": bool(result.get("weights_ok", True)),
-            "dropped_gradients": int(result.get("dropped_gradients", 0)),
-            "sanitized": result.get("sanitized") or {},
-        }
-    else:
-        response_payload = {"trained": bool(result), "weights_ok": True}
+    response_payload = {
+        "trained": bool(result.get("trained")),
+        "weights_ok": bool(result.get("weights_ok", True)),
+        "dropped_gradients": int(result.get("dropped_gradients", 0)),
+        "sanitized": result.get("sanitized") or {},
+    }
     log_request(payload.get("bot_id"), "train", {**payload, **response_payload})
     return response_payload
 
@@ -1618,27 +1152,18 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
         observations: List[List[Any]] = []
         actions: List[Any] = []
         rewards: List[Any] = []
+        penalties: List[Any] = []
         next_observations: List[Any] = []
         valid_indices: List[int] = []
         for index, item in entries:
             observation = item.get("observation")
             if not isinstance(observation, (list, tuple)):
-                results[index] = {
-                    "trained": False,
-                    "weights_ok": True,
-                    "dropped_gradients": 0,
-                    "clipped_gradients": 0,
-                    "gradient_norm": None,
-                    "sanitized": {
-                        "observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
-                        "next_observation": {"replaced": 0, "clipped": 0, "adjusted": False, "sanitized": False},
-                        "weights": {"replaced": 0, "clipped": 0, "sanitized": False},
-                    },
-                }
+                results[index] = {"error": "Observation must be a list"}
                 continue
             observations.append(observation)
             actions.append(item.get("action"))
             rewards.append(item.get("reward"))
+            penalties.append(item.get("penalty"))
             next_observations.append(item.get("next_observation"))
             valid_indices.append(index)
         if not observations:
@@ -1650,6 +1175,7 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
                 observations,
                 actions,
                 rewards,
+                penalties,
                 next_observations,
             )
         except RuntimeError as exc:
@@ -1662,16 +1188,13 @@ def batch_train_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None))
             if not isinstance(entry_result, dict):
                 results[index] = {"error": "Failed to process training request"}
                 continue
-            results[index] = {
+            response_payload = {
                 "trained": bool(entry_result.get("trained")),
                 "weights_ok": bool(entry_result.get("weights_ok", True)),
                 "dropped_gradients": int(entry_result.get("dropped_gradients", 0)),
-                "clipped_gradients": int(entry_result.get("clipped_gradients", 0)),
-                "gradient_norm": entry_result.get("gradient_norm"),
-                "learning_rate": entry_result.get("learning_rate"),
-                "hebbian": entry_result.get("hebbian"),
                 "sanitized": entry_result.get("sanitized") or {},
             }
+            results[index] = response_payload
         for index, item in entries:
             response_payload = results[index] or {}
             log_request(item.get("bot_id"), "train", {**item, **response_payload})
@@ -1701,9 +1224,7 @@ def average_endpoint(brain_id: str, payload: Optional[Dict[str, Any]] = Body(def
     brain = require_brain(brain_id)
     payload = payload or {}
     source_ids = payload.get("source_ids") or []
-    sources = []
-    for source_id in source_ids:
-        sources.append(require_brain(source_id))
+    sources = [require_brain(source_id) for source_id in source_ids]
     try:
         _execute("average", brain.average_from, sources)
     except RuntimeError as exc:
@@ -1759,7 +1280,7 @@ def load_endpoint(payload: Optional[Dict[str, Any]] = Body(default=None)):
     response = {"brain_id": brain_id}
     if isinstance(load_result, dict):
         response.update({key: value for key, value in load_result.items() if key not in {"path"}})
-        if load_result.get("status") in {"exact", "relaxed", "partial"}:
+        if load_result.get("status"):
             response["source_path"] = load_result.get("path")
     return response
 
@@ -1802,13 +1323,16 @@ def status_endpoint():
             "uptime": time.time() - STATUS["started_at"],
             "total_requests": STATUS["total_requests"],
             "brain_count": len(BRAINS),
-            "bots": STATUS["bots"],
-            "recent_requests": STATUS["requests"][-10:],
-            "workers": STATUS["workers"],
+            "accelerators": STATUS.get("accelerators"),
+            "float_policy": STATUS.get("float_policy"),
+            "bots": list(STATUS.get("bots", {}).items()),
+            "recent_requests": STATUS.get("requests", []),
+            "workers": STATUS.get("workers", {}),
         }
     return payload
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     port = int(os.environ.get("TF_SERVER_PORT", 5000))
-    uvicorn.run("tf_server:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("tf_server:app", host="0.0.0.0", port=port, reload=False)

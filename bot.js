@@ -310,10 +310,64 @@ function ensureRewardSign(amount, expectation = REWARD_SIGN.EITHER, context = nu
   return corrected
 }
 
+function createRewardAccumulator() {
+  return { total: 0, reward: 0, penalty: 0 }
+}
+
+function ensureRewardAccumulator(value) {
+  if (
+    value &&
+    typeof value === 'object' &&
+    Object.prototype.hasOwnProperty.call(value, 'total') &&
+    Object.prototype.hasOwnProperty.call(value, 'reward') &&
+    Object.prototype.hasOwnProperty.call(value, 'penalty')
+  ) {
+    const accumulator = value
+    accumulator.total = Number.isFinite(accumulator.total) ? accumulator.total : 0
+    accumulator.reward = Number.isFinite(accumulator.reward) && accumulator.reward > 0
+      ? accumulator.reward
+      : 0
+    accumulator.penalty = Number.isFinite(accumulator.penalty) && accumulator.penalty > 0
+      ? accumulator.penalty
+      : 0
+    return accumulator
+  }
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric === 0) {
+    return createRewardAccumulator()
+  }
+  if (numeric > 0) {
+    return { total: numeric, reward: numeric, penalty: 0 }
+  }
+  const magnitude = Math.abs(numeric)
+  return { total: numeric, reward: 0, penalty: magnitude }
+}
+
+function finalizeRewardAccumulator(value) {
+  const accumulator = ensureRewardAccumulator(value)
+  return {
+    total: clampReward(accumulator.total),
+    reward: limitPositive(accumulator.reward, MAX_REWARD_MAGNITUDE),
+    penalty: limitPositive(accumulator.penalty, MAX_REWARD_MAGNITUDE)
+  }
+}
+
 function applyRewardComponent(total, amount, expectation = REWARD_SIGN.EITHER, context = null, reason = 'unspecified') {
+  const accumulator = ensureRewardAccumulator(total)
   const corrected = ensureRewardSign(amount, expectation, context, reason, 'reward')
   const adjusted = applyCosinePenaltyScaling(context, reason, corrected)
-  return total + adjusted
+  if (!Number.isFinite(adjusted) || adjusted === 0) {
+    return accumulator
+  }
+  accumulator.total += adjusted
+  if (adjusted > 0) {
+    accumulator.reward += adjusted
+  } else if (adjusted < 0) {
+    accumulator.penalty += Math.abs(adjusted)
+  }
+  accumulator.reward = Math.max(0, accumulator.reward)
+  accumulator.penalty = Math.max(0, accumulator.penalty)
+  return accumulator
 }
 
 function addBlockReward(context, amount, expectation = REWARD_SIGN.EITHER, reason = 'block') {
@@ -2715,6 +2769,7 @@ function ensureEmotionVector(context) {
 }
 
 function adjustMorale(context, reward) {
+  const accumulator = ensureRewardAccumulator(reward)
   if (!context.morale) {
     context.morale = {
       value: MORALE_BASELINE,
@@ -2726,7 +2781,7 @@ function adjustMorale(context, reward) {
   }
 
   const morale = context.morale
-  const bounded = Math.max(-2, Math.min(2, reward))
+  const bounded = Math.max(-2, Math.min(2, accumulator.total))
 
   if (bounded > 0.2) {
     morale.value = Math.min(1, morale.value + 0.04 + bounded * 0.02)
@@ -2751,11 +2806,19 @@ function adjustMorale(context, reward) {
   const frustrationPenalty = 1 - Math.min(0.6, morale.frustration * 0.4)
   const moraleBoost = 1 + (morale.value - MORALE_BASELINE) * 0.25
   const sharpnessBoost = 1 + ((morale.sharpness ?? 0.5) - 0.5) * 0.15
-  let modified = reward * moraleBoost * frustrationPenalty * sharpnessBoost * rewardProfile.morale
-
-  if (!Number.isFinite(modified)) {
-    modified = reward
+  let factor = moraleBoost * frustrationPenalty * sharpnessBoost * rewardProfile.morale
+  if (!Number.isFinite(factor)) {
+    factor = 1
   }
+  let modifiedTotal = accumulator.total * factor
+  if (!Number.isFinite(modifiedTotal)) {
+    modifiedTotal = accumulator.total
+    factor = 1
+  }
+  const scale = Math.max(0, Number.isFinite(factor) ? Math.abs(factor) : 1)
+  accumulator.total = modifiedTotal
+  accumulator.reward *= scale
+  accumulator.penalty *= scale
 
   const emotion = ensureEmotionVector(context)
   const targets = [morale.value, morale.frustration, morale.sharpness ?? 0.5]
@@ -2763,7 +2826,7 @@ function adjustMorale(context, reward) {
     emotion[i] = emotion[i] * EMOTION_DECAY + targets[i] * (1 - EMOTION_DECAY)
   }
 
-  return modified
+  return accumulator
 }
 
 function mutateRewardProfile() {
@@ -3915,7 +3978,7 @@ function shouldCullForDowntrend(context) {
 }
 
 function computeReward(context, obs) {
-  let reward = 0
+  let reward = createRewardAccumulator()
 
   ensureTemporalMemoryState(context)
   context.damageDebt = limitPositive((context.damageDebt ?? 0) * DAMAGE_DEBT_DECAY, DAMAGE_MEMORY_CLAMP)
@@ -4140,13 +4203,15 @@ function computeReward(context, obs) {
 
   reward = adjustMorale(context, reward)
 
-  updateStagnation(context, reward)
-  updateSkillChains(context, reward)
+  const summary = finalizeRewardAccumulator(reward)
+
+  updateStagnation(context, summary.total)
+  updateSkillChains(context, summary.total)
 
   context.lineagePrestige = getLineagePrestige(context.lineage)
 
   context.lastPos = { ...pos }
-  return clampReward(reward)
+  return summary
 }
 
 async function tickLoop(context) {
@@ -4243,10 +4308,9 @@ async function tickLoop(context) {
       console.warn(`[${label(context)}] Observation contained invalid values; skipping tick.`)
       return
     }
-    let reward = computeReward(context, observation)
-    reward = clampReward(reward)
+    const reward = computeReward(context, observation)
 
-    updateTemporalMemory(context, reward)
+    updateTemporalMemory(context, reward.total)
 
     if (context.stagnation.active && context.stagnation.streak >= STAGNATION_WINDOW / 2) {
       context.epsilonBoost = Math.max(context.epsilonBoost, EPSILON_STAGNATION_BOOST)
@@ -4275,7 +4339,8 @@ async function tickLoop(context) {
               brain,
               context.lastObs,
               context.lastAction,
-              reward,
+              reward.reward,
+              reward.penalty,
               observation
             )
           } catch (err) {
@@ -4297,7 +4362,7 @@ async function tickLoop(context) {
             nextObservation: observation,
             actionIndex: context.lastAction,
             actions: ACTIONS,
-            reward,
+            reward: reward.total,
             botId: label(context)
           })
         }
@@ -4388,10 +4453,10 @@ async function tickLoop(context) {
     context.lastAction = action
     context.tickCount += 1
     context.generationTicks += 1
-    context.cumulativeReward += reward
-    context.generationReward += reward
+    context.cumulativeReward += reward.total
+    context.generationReward += reward.total
     baselineState.tickCount += 1
-    baselineState.cumulativeReward += reward
+    baselineState.cumulativeReward += reward.total
     if (baselineState.tickCount >= nextRewardMutationTick) {
       mutateRewardProfile()
     }
@@ -4412,7 +4477,7 @@ async function tickLoop(context) {
     }
 
     console.log(
-      `[${label(context)}] Tick done | Reward: ${reward.toFixed(3)} | Eps: ${effectiveEpsilon.toFixed(3)} | Entropy: ${context.behaviorEntropy.toFixed(2)}`
+      `[${label(context)}] Tick done | Reward: ${reward.total.toFixed(3)} (R=${reward.reward.toFixed(3)} P=${reward.penalty.toFixed(3)}) | Eps: ${effectiveEpsilon.toFixed(3)} | Entropy: ${context.behaviorEntropy.toFixed(2)}`
     )
     maybeTriggerAutosave()
     await maybeCompleteGeneration(context)

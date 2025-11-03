@@ -291,14 +291,13 @@ function clampEpsilon(epsilon) {
   return epsilon
 }
 
-function sanitizeRewardValue(reward) {
-  if (!Number.isFinite(reward)) {
+function sanitizeRewardComponent(value) {
+  if (!Number.isFinite(value) || value <= 0) {
     return 0
   }
   const limit = 1e6
-  if (reward > limit) return limit
-  if (reward < -limit) return -limit
-  return reward
+  if (value > limit) return limit
+  return value
 }
 
 function makeDefaultTrainResult(sanitizedObservation, sanitizedNext) {
@@ -406,7 +405,7 @@ export async function trainBrainsBatch(argsList) {
   const indexMap = []
 
   for (let i = 0; i < argsList.length; i++) {
-    const [brain, observation, actionIndex, reward, nextObservation] = argsList[i] ?? []
+    const [brain, observation, actionIndex, reward, penalty, nextObservation] = argsList[i] ?? []
     const brainId = ensureBrainId(brain)
     const sanitizedObservation = sanitizeObservationPayload(observation, {
       expectedLength: brain?.inputSize,
@@ -445,7 +444,8 @@ export async function trainBrainsBatch(argsList) {
       brain_id: brainId,
       observation: sanitizedObservation.values,
       action: sanitizedAction,
-      reward: sanitizeRewardValue(reward),
+      reward: sanitizeRewardComponent(reward),
+      penalty: sanitizeRewardComponent(penalty),
       next_observation: Array.isArray(sanitizedNext.values) ? sanitizedNext.values : undefined,
       bot_id: brain?.owner ?? null
     })
@@ -534,8 +534,8 @@ export async function chooseAction(brain, observation, epsilon = 0.1) {
   return result.value
 }
 
-export async function trainBrain(brain, observation, actionIndex, reward, nextObservation) {
-  const [result] = await trainBrainsBatch([[brain, observation, actionIndex, reward, nextObservation]])
+export async function trainBrain(brain, observation, actionIndex, reward, penalty, nextObservation) {
+  const [result] = await trainBrainsBatch([[brain, observation, actionIndex, reward, penalty, nextObservation]])
   if (!result) {
     return makeDefaultTrainResult(
       { replaced: 0, clipped: 0, adjusted: false },
