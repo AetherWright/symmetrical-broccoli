@@ -1,6 +1,7 @@
 import atexit
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -187,12 +188,14 @@ BRAIN_CONFIG = {
     "transformer_heads": 4,
     "transformer_layers": 2,
     "transformer_ff": 256,
+    "transformer_rotary_base": 10000.0,
     "learning_rate": 2e-3,
     "lion_beta_1": 0.9,
     "lion_beta_2": 0.99,
     "lion_weight_decay": 0.0,
     "lookahead_sync": 6,
     "lookahead_alpha": 0.5,
+    "ema_decay": 0.995,
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
@@ -322,6 +325,175 @@ class HebbianLinear(torch.nn.Module):
         return {"applied": applied, "decay_rate": decay_rate}
 
 
+class ParameterEMA:
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.decay = float(min(max(decay, 0.0), 0.999999))
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
+        self.sync(model)
+
+    def sync(self, model: torch.nn.Module) -> None:
+        self.shadow = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            self.shadow[name] = param.detach().clone()
+
+    def update(self, model: torch.nn.Module) -> None:
+        if not self.shadow:
+            self.sync(model)
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            current = param.detach()
+            cached = self.shadow.get(name)
+            if cached is None or cached.shape != current.shape:
+                self.shadow[name] = current.clone()
+            else:
+                cached.mul_(self.decay).add_(current, alpha=1.0 - self.decay)
+
+    def apply_shadow(self, model: torch.nn.Module) -> None:
+        if not self.shadow:
+            self.sync(model)
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            self.backup[name] = param.data.detach().clone()
+            shadow = self.shadow.get(name)
+            if shadow is not None:
+                param.data.copy_(shadow)
+
+    def restore(self, model: torch.nn.Module) -> None:
+        for name, param in model.named_parameters():
+            backup = self.backup.get(name)
+            if backup is not None:
+                param.data.copy_(backup)
+        self.backup = {}
+
+
+def _apply_rotary_pos_emb(tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    even = tensor[..., ::2]
+    odd = tensor[..., 1::2]
+    cos = cos[..., :even.shape[-1]]
+    sin = sin[..., :even.shape[-1]]
+    rotated_even = even * cos - odd * sin
+    rotated_odd = odd * cos + even * sin
+    output = torch.empty_like(tensor)
+    output[..., ::2] = rotated_even
+    output[..., 1::2] = rotated_odd
+    return output
+
+
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError("Rotary embedding dimension must be even")
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = self.inv_freq.to(device=device, dtype=dtype)
+        positions = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+        freqs = torch.outer(positions, inv_freq)
+        cos = freqs.cos()[None, None, :, :]
+        sin = freqs.sin()[None, None, :, :]
+        return cos, sin
+
+
+class RotarySelfAttention(torch.nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float, base: float):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("Embed dimension must be divisible by number of heads")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("Head dimension must be even for rotary embeddings")
+        self.q_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.k_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.v_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.out_proj = torch.nn.Linear(embed_dim, embed_dim)
+        self.attn_dropout = torch.nn.Dropout(dropout)
+        self.rotary = RotaryEmbedding(self.head_dim, base)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = inputs.shape
+        q = self.q_proj(inputs)
+        k = self.k_proj(inputs)
+        v = self.v_proj(inputs)
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        cos, sin = self.rotary(seq_len, inputs.device, inputs.dtype)
+        q = _apply_rotary_pos_emb(q, cos, sin)
+        k = _apply_rotary_pos_emb(k, cos, sin)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_len, self.embed_dim)
+        return self.out_proj(attn_output)
+
+
+class RotaryEncoderLayer(torch.nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str,
+        rotary_base: float,
+    ):
+        super().__init__()
+        self.self_attn = RotarySelfAttention(embed_dim, num_heads, dropout, rotary_base)
+        self.dropout1 = torch.nn.Dropout(dropout)
+        self.norm1 = torch.nn.LayerNorm(embed_dim)
+        self.linear1 = torch.nn.Linear(embed_dim, dim_feedforward)
+        self.activation = torch.nn.GELU() if activation == "gelu" else torch.nn.ReLU()
+        self.dropout = torch.nn.Dropout(dropout)
+        self.linear2 = torch.nn.Linear(dim_feedforward, embed_dim)
+        self.dropout2 = torch.nn.Dropout(dropout)
+        self.norm2 = torch.nn.LayerNorm(embed_dim)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x = self.norm1(inputs)
+        attn_output = self.self_attn(x)
+        inputs = inputs + self.dropout1(attn_output)
+        x = self.norm2(inputs)
+        ff_output = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return inputs + self.dropout2(ff_output)
+
+
+class RotaryTransformerEncoder(torch.nn.Module):
+    def __init__(
+        self,
+        num_layers: int,
+        embed_dim: int,
+        num_heads: int,
+        dim_feedforward: int,
+        dropout: float,
+        activation: str,
+        rotary_base: float,
+    ):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            [
+                RotaryEncoderLayer(embed_dim, num_heads, dim_feedforward, dropout, activation, rotary_base)
+                for _ in range(max(1, num_layers))
+            ]
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        output = inputs
+        for layer in self.layers:
+            output = layer(output)
+        return output
+
+
 class BrainModel(torch.nn.Module):
     def __init__(self, input_size: int, action_count: int):
         super().__init__()
@@ -355,21 +527,20 @@ class BrainModel(torch.nn.Module):
         if self.transformer_embed % max(1, int(BRAIN_CONFIG["transformer_heads"])) != 0:
             raise ValueError("Transformer embed dimension must be divisible by the number of heads")
         self.transformer_project = torch.nn.Linear(BRAIN_CONFIG["shared_units"], total_transformer_dim)
-        encoder_layer = torch.nn.TransformerEncoderLayer(
-            d_model=self.transformer_embed,
-            nhead=int(BRAIN_CONFIG["transformer_heads"]),
+        self.transformer_encoder = RotaryTransformerEncoder(
+            num_layers=int(BRAIN_CONFIG["transformer_layers"]),
+            embed_dim=self.transformer_embed,
+            num_heads=int(BRAIN_CONFIG["transformer_heads"]),
             dim_feedforward=int(BRAIN_CONFIG["transformer_ff"]),
-            batch_first=True,
             dropout=BRAIN_CONFIG["dropout_rate"],
             activation="gelu",
+            rotary_base=float(BRAIN_CONFIG["transformer_rotary_base"]),
         )
-        self.transformer_encoder = torch.nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=int(BRAIN_CONFIG["transformer_layers"]),
-        )
-        self.transformer_norm = torch.nn.LayerNorm(self.transformer_embed)
+        self.transformer_input_norm = torch.nn.LayerNorm(self.transformer_embed)
+        self.transformer_output_norm = torch.nn.LayerNorm(self.transformer_embed)
         self.transformer_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
         self.transformer_merge = torch.nn.Linear(total_transformer_dim, BRAIN_CONFIG["shared_units"])
+        self.context_gate = torch.nn.Linear(BRAIN_CONFIG["shared_units"] * 2, BRAIN_CONFIG["shared_units"])
         self.policy_dense = torch.nn.Linear(BRAIN_CONFIG["shared_units"], BRAIN_CONFIG["shared_units"])
         self.policy_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
         self.action_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
@@ -408,11 +579,15 @@ class BrainModel(torch.nn.Module):
         transformer_state = transformer_state.view(
             shared.size(0), self.transformer_tokens, self.transformer_embed
         )
-        transformer_state = self.transformer_norm(transformer_state)
+        transformer_state = self.transformer_input_norm(transformer_state)
         transformer_state = self.transformer_encoder(transformer_state)
+        transformer_state = self.transformer_output_norm(transformer_state)
         transformer_state = self.transformer_dropout(transformer_state)
         transformer_state = transformer_state.reshape(shared.size(0), -1)
-        shared = shared + self.transformer_merge(transformer_state)
+        transformer_features = self.transformer_merge(transformer_state)
+        gate_input = torch.cat([shared, transformer_features], dim=-1)
+        context_weights = torch.sigmoid(self.context_gate(gate_input))
+        shared = shared + context_weights * transformer_features
         policy_features = self._activate(self.policy_dense(shared))
         policy_features = self.policy_dropout(policy_features)
         logits = self.action_head(policy_features)
@@ -437,6 +612,7 @@ class RemoteBrain:
             sync_period=BRAIN_CONFIG["lookahead_sync"],
             slow_step_size=BRAIN_CONFIG["lookahead_alpha"],
         )
+        self.ema = ParameterEMA(self.model, decay=BRAIN_CONFIG["ema_decay"])
         self._lock = threading.RLock()
         self.policy_strikes = 0
         self.policy_last_reset = time.time()
@@ -509,6 +685,8 @@ class RemoteBrain:
                 clipped_total,
             )
             self.optimizer.sync_slow_parameters(list(self.model.parameters()))
+            if hasattr(self, "ema"):
+                self.ema.sync(self.model)
         return {
             "sanitized": sanitized,
             "replaced": replaced_total,
@@ -611,8 +789,16 @@ class RemoteBrain:
             if valid_entries:
                 batch = np.stack([entry["tensor"] for entry in valid_entries], axis=0).astype(NP_FLOAT, copy=False)
                 with torch.no_grad():
-                    tensor = torch.from_numpy(batch).to(self.device)
-                    probs = self.model(tensor).cpu().numpy().astype(NP_FLOAT, copy=False)
+                    ema_applied = False
+                    try:
+                        if hasattr(self, "ema") and self.ema is not None:
+                            self.ema.apply_shadow(self.model)
+                            ema_applied = True
+                        tensor = torch.from_numpy(batch).to(self.device)
+                        probs = self.model(tensor).cpu().numpy().astype(NP_FLOAT, copy=False)
+                    finally:
+                        if ema_applied:
+                            self.ema.restore(self.model)
                 for entry, row in zip(valid_entries, probs):
                     raw_probs = row.reshape(-1)
                     replaced = int(raw_probs.size - np.count_nonzero(np.isfinite(raw_probs)))
@@ -842,6 +1028,11 @@ class RemoteBrain:
                         weight_meta = self._sanitize_model_weights("post-train-batch")
                         if weight_meta.get("sanitized"):
                             weights_ok = weights_ok and weight_meta.get("replaced", 0) == 0 and self._weights_are_finite()
+                        if hasattr(self, "ema") and self.ema is not None:
+                            if weight_meta.get("sanitized"):
+                                self.ema.sync(self.model)
+                            else:
+                                self.ema.update(self.model)
                     else:
                         dropped = max(dropped, 1)
                         clipped_grads = clipped_grads
@@ -907,6 +1098,8 @@ class RemoteBrain:
             with second._lock:
                 self.model.load_state_dict(other.model.state_dict())
                 self.optimizer.sync_slow_parameters(list(self.model.parameters()))
+                if hasattr(self, "ema") and self.ema is not None:
+                    self.ema.sync(self.model)
 
     def average_from(self, sources: List["RemoteBrain"]) -> None:
         if not sources:
@@ -930,6 +1123,8 @@ class RemoteBrain:
                 averaged[key] = averaged_value
             self.model.load_state_dict(averaged)
             self.optimizer.sync_slow_parameters(list(self.model.parameters()))
+            if hasattr(self, "ema") and self.ema is not None:
+                self.ema.sync(self.model)
 
     def mutate(self, stddev: float) -> None:
         with self._lock:
@@ -938,6 +1133,8 @@ class RemoteBrain:
                 param.data.add_(noise)
             self._sanitize_model_weights("mutate")
             self.optimizer.sync_slow_parameters(list(self.model.parameters()))
+            if hasattr(self, "ema") and self.ema is not None:
+                self.ema.sync(self.model)
 
     def save(self, directory: str) -> None:
         with self._lock:
@@ -960,6 +1157,8 @@ class RemoteBrain:
         self.model.load_state_dict(state_dict, strict=False)
         self.optimizer.sync_slow_parameters(list(self.model.parameters()))
         meta = self._sanitize_model_weights("load")
+        if hasattr(self, "ema") and self.ema is not None:
+            self.ema.sync(self.model)
         status = "exact"
         if meta.get("sanitized"):
             status = "sanitized"
