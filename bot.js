@@ -362,6 +362,7 @@ function applyRewardComponent(total, amount, expectation = REWARD_SIGN.EITHER, c
   accumulator.total += adjusted
   if (adjusted > 0) {
     accumulator.reward += adjusted
+    noteRewardHighlight(context, reason, adjusted)
   } else if (adjusted < 0) {
     accumulator.penalty += Math.abs(adjusted)
   }
@@ -1406,6 +1407,11 @@ const ACTIONS = [
   'build_above',
   'build_forward',
   'use_item',
+  'signal_resource',
+  'signal_danger',
+  'signal_assist',
+  'signal_gather',
+  'signal_status',
   ...Object.keys(CRAFTING_ACTIONS)
 ]
 
@@ -1419,21 +1425,155 @@ const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
 const EMOTION_VECTOR_SIZE = 3
-const BASE_OBS_FEATURES = 44
+const COMMUNICATION_TYPES = ['resource', 'danger', 'assist', 'gather', 'status']
+const COMMUNICATION_TYPE_COUNT = COMMUNICATION_TYPES.length
+const COMMUNICATION_TYPE_INDEX = new Map(
+  COMMUNICATION_TYPES.map((type, index) => [type, index])
+)
+const COMMUNICATION_RANGE = readNumberEnv('BOT_COMMUNICATION_RANGE', 96, { min: 4, max: 512 })
+const COMMUNICATION_DECAY_MS = readNumberEnv('BOT_COMMUNICATION_DECAY_MS', 15000, {
+  min: 250,
+  max: 60000
+})
+const COMMUNICATION_COOLDOWN_MS = readNumberEnv('BOT_COMMUNICATION_COOLDOWN_MS', 1200, {
+  min: 100,
+  max: 60000
+})
+const COMMUNICATION_MESSAGE_LIMIT = Math.max(
+  COMMUNICATION_TYPE_COUNT * 8,
+  Math.floor(readNumberEnv('BOT_COMMUNICATION_MESSAGE_LIMIT', 320, { min: 32, max: 2000 }))
+)
+const COMMUNICATION_PRUNE_INTERVAL_MS = readNumberEnv('BOT_COMMUNICATION_PRUNE_INTERVAL', 500, {
+  min: 50,
+  max: 5000
+})
+const COMMUNICATION_INTENSITY_CLAMP = readNumberEnv('BOT_COMMUNICATION_INTENSITY_CLAMP', 3, {
+  min: 0.5,
+  max: 10
+})
+const COMMUNICATION_TIME_NORMALIZER = readNumberEnv('BOT_COMMUNICATION_TIME_NORMALIZER', 12000, {
+  min: 250,
+  max: 120000
+})
+const COMMUNICATION_DIRECTION_NORMALIZER = readNumberEnv(
+  'BOT_COMMUNICATION_DIRECTION_NORMALIZER',
+  COMMUNICATION_RANGE,
+  { min: 1, max: 512 }
+)
+const COMMUNICATION_REWARD = readNumberEnv('BOT_COMMUNICATION_REWARD', 0.15, {
+  min: 0,
+  max: 1
+})
+const COMMUNICATION_COOLDOWN_PENALTY = readNumberEnv('BOT_COMMUNICATION_COOLDOWN_PENALTY', 0.05, {
+  min: 0,
+  max: 1
+})
+
+const REWARD_EVENT_RANGE = readNumberEnv('BOT_REWARD_EVENT_RANGE', 48, { min: 4, max: 256 })
+const REWARD_EVENT_DECAY_MS = readNumberEnv('BOT_REWARD_EVENT_DECAY_MS', 10000, {
+  min: 250,
+  max: 120000
+})
+const REWARD_EVENT_VALUE_CLAMP = readNumberEnv('BOT_REWARD_EVENT_VALUE_CLAMP', 4, {
+  min: 0.1,
+  max: 50
+})
+const REWARD_EVENT_THRESHOLD = readNumberEnv('BOT_REWARD_EVENT_THRESHOLD', 0.25, {
+  min: 0.01,
+  max: 5
+})
+const REWARD_EVENT_REFRESH_MS = readNumberEnv('BOT_REWARD_EVENT_REFRESH_MS', 3000, {
+  min: 100,
+  max: 60000
+})
+const REWARD_EVENT_BUS_LIMIT = Math.max(
+  64,
+  Math.floor(readNumberEnv('BOT_REWARD_EVENT_BUS_LIMIT', 256, { min: 32, max: 2000 }))
+)
+
+const CROWDING_RADIUS = readNumberEnv('BOT_CROWDING_RADIUS', 5, { min: 1, max: 32 })
+const CROWDING_THRESHOLD = Math.max(
+  2,
+  Math.floor(readNumberEnv('BOT_CROWDING_THRESHOLD', 4, { min: 2, max: 32 }))
+)
+const CROWDING_PENALTY_BASE = readNumberEnv('BOT_CROWDING_PENALTY_BASE', 0.05, {
+  min: 0,
+  max: 1
+})
+const CROWDING_PENALTY_STEP = readNumberEnv('BOT_CROWDING_PENALTY_STEP', 0.015, {
+  min: 0,
+  max: 1
+})
+const CROWDING_ACTION_WINDOW_MS = readNumberEnv('BOT_CROWDING_ACTION_WINDOW_MS', 500, {
+  min: 50,
+  max: 5000
+})
+const CROWDING_PENALTY_CLAMP = readNumberEnv('BOT_CROWDING_PENALTY_CLAMP', 1, {
+  min: 0.1,
+  max: 5
+})
+
+const GROUP_AFFINITY_DECAY = readNumberEnv('BOT_GROUP_AFFINITY_DECAY', 0.92, {
+  min: 0.1,
+  max: 0.999
+})
+const GROUP_AFFINITY_GAIN = readNumberEnv('BOT_GROUP_AFFINITY_GAIN', 0.2, {
+  min: 0.01,
+  max: 1
+})
+const GROUP_AFFINITY_INTENSITY_CLAMP = readNumberEnv('BOT_GROUP_AFFINITY_INTENSITY_CLAMP', 4, {
+  min: 0.5,
+  max: 20
+})
+const GROUP_AFFINITY_CLAMP = readNumberEnv('BOT_GROUP_AFFINITY_CLAMP', 3, {
+  min: 0.5,
+  max: 20
+})
+const GROUP_AFFINITY_RIVALRY_WEIGHT = readNumberEnv('BOT_GROUP_AFFINITY_RIVALRY_WEIGHT', 0.75, {
+  min: 0,
+  max: 3
+})
+const GROUP_AFFINITY_REWARD_SCALE = readNumberEnv('BOT_GROUP_AFFINITY_REWARD_SCALE', 0.18, {
+  min: 0,
+  max: 2
+})
+const GROUP_AFFINITY_REWARD_CLAMP = readNumberEnv('BOT_GROUP_AFFINITY_REWARD_CLAMP', 0.25, {
+  min: 0.01,
+  max: 2
+})
+
+const BASE_OBS_FEATURES = 75
 const MEMORY_REWARD_WINDOW = Math.max(
   4,
-  Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 8, { min: 4, max: 32 }))
+  Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 16, { min: 4, max: 64 }))
 )
 const MEMORY_ACTION_WINDOW = Math.max(
   4,
-  Math.floor(readNumberEnv('BOT_MEMORY_ACTION_WINDOW', 8, { min: 4, max: 32 }))
+  Math.floor(readNumberEnv('BOT_MEMORY_ACTION_WINDOW', 16, { min: 4, max: 64 }))
 )
-const MEMORY_AGGREGATE_COUNT = 8
+const MEMORY_AGGREGATE_COUNT = 13
 const MEMORY_OBS_SIZE = MEMORY_REWARD_WINDOW + MEMORY_ACTION_WINDOW + MEMORY_AGGREGATE_COUNT
 const MEMORY_OBS_START = BASE_OBS_FEATURES
 const OBS_SIZE = BASE_OBS_FEATURES + MEMORY_OBS_SIZE
 const NOVELTY_HASH_PRECISION = 2
 const NOVELTY_TARGET = 500
+const CONTEXT_TICK_NORMALIZER = readNumberEnv('BOT_CONTEXT_TICK_NORMALIZER', 2400, { min: 240, max: 48000 })
+const CONTEXT_TRAINING_NORMALIZER = readNumberEnv('BOT_CONTEXT_TRAINING_NORMALIZER', 600, { min: 60, max: 40000 })
+const CONTEXT_REWARD_NORMALIZER = readNumberEnv('BOT_CONTEXT_REWARD_NORMALIZER', 300, { min: 10, max: 5000 })
+const NOVELTY_COUNT_NORMALIZER = readNumberEnv('BOT_NOVELTY_COUNT_NORMALIZER', NOVELTY_TARGET, { min: 50, max: 5000 })
+const MUTATION_QUEUE_CLAMP = readNumberEnv('BOT_MUTATION_QUEUE_CLAMP', 12, { min: 1, max: 128 })
+const EPSILON_BOOST_NORMALIZER = readNumberEnv('BOT_EPSILON_BOOST_NORMALIZER', 1, { min: 0.05, max: 10 })
+const EPSILON_NORMALIZER = readNumberEnv('BOT_EPSILON_NORMALIZER', 1, { min: 0.1, max: 2 })
+const FERAL_FURY_NORMALIZER = readNumberEnv('BOT_FERAL_FURY_NORMALIZER', 5, { min: 0.5, max: 20 })
+const COOPERATION_CLAMP = readNumberEnv('BOT_COOPERATION_CLAMP', 1.5, { min: 0.1, max: 10 })
+const GROUP_RESOURCE_ALIGNMENT_WEIGHT = readNumberEnv('BOT_GROUP_RESOURCE_ALIGNMENT_WEIGHT', 0.6, {
+  min: 0,
+  max: 1
+})
+const STREAK_NORMALIZER = readNumberEnv('BOT_STREAK_NORMALIZER', 24, { min: 1, max: 200 })
+const REPETITION_NORMALIZER = readNumberEnv('BOT_REPETITION_NORMALIZER', 24, { min: 1, max: 200 })
+const MORALE_FRUSTRATION_CLAMP = readNumberEnv('BOT_MORALE_FRUSTRATION_CLAMP', 2, { min: 0.1, max: 10 })
+const MORALE_SHARPNESS_CLAMP = readNumberEnv('BOT_MORALE_SHARPNESS_CLAMP', 2, { min: 0.1, max: 10 })
 const STAGNATION_WINDOW = 40
 const STAGNATION_VARIANCE_THRESHOLD = 0.0025
 const STAGNATION_MUTATION_THRESHOLD = 3
@@ -1510,6 +1650,15 @@ const GLOBAL_RESOURCE_POOL = {
   totalContribution: 0,
   totalWithdrawal: 0,
   diversity: new Set()
+}
+const GROUP_RESOURCE_POOLS = new Map()
+const COMMUNICATION_BUS = {
+  messages: [],
+  lastPrune: 0
+}
+const REWARD_EVENT_BUS = {
+  events: [],
+  lastPrune: 0
 }
 const rewardProfile = {
   novelty: 1,
@@ -2521,6 +2670,568 @@ function normalizePositive(value, limit) {
   return scaled
 }
 
+function createGroupAffinityState() {
+  return {
+    same: 0,
+    other: 0,
+    lastTick: 0,
+    lastUpdatedChannel: null,
+    lastProximity: { same: 0, other: 0, updatedAt: 0 }
+  }
+}
+
+function ensureGroupAffinityState(context) {
+  if (!context) return null
+  if (!context.groupAffinity) {
+    context.groupAffinity = createGroupAffinityState()
+  }
+  const affinity = context.groupAffinity
+  if (!Number.isFinite(affinity.lastTick)) {
+    affinity.lastTick = Number.isFinite(context?.tickCount) ? context.tickCount : 0
+  }
+  if (!affinity.lastProximity) {
+    affinity.lastProximity = { same: 0, other: 0, updatedAt: 0 }
+  }
+  affinity.same = Number.isFinite(affinity.same) && affinity.same >= 0 ? affinity.same : 0
+  affinity.other = Number.isFinite(affinity.other) && affinity.other >= 0 ? affinity.other : 0
+  return affinity
+}
+
+function decayGroupAffinity(context) {
+  const affinity = ensureGroupAffinityState(context)
+  if (!affinity) return null
+  const tick = Number.isFinite(context?.tickCount) ? context.tickCount : 0
+  const lastTick = Number.isFinite(affinity.lastTick) ? affinity.lastTick : tick
+  const steps = Math.max(0, tick - lastTick)
+  if (steps > 0) {
+    const decay = Math.pow(GROUP_AFFINITY_DECAY, steps)
+    affinity.same *= decay
+    affinity.other *= decay
+    affinity.lastTick = tick
+  } else if (!Number.isFinite(affinity.lastTick)) {
+    affinity.lastTick = tick
+  }
+  affinity.same = Math.max(0, Math.min(GROUP_AFFINITY_CLAMP, affinity.same))
+  affinity.other = Math.max(0, Math.min(GROUP_AFFINITY_CLAMP, affinity.other))
+  return affinity
+}
+
+function noteGroupInteraction(context, sameGroup, intensity, channel = 'generic') {
+  if (!context || !Number.isFinite(intensity) || !context.mode) return
+  const magnitude = limitPositive(Math.abs(intensity), GROUP_AFFINITY_INTENSITY_CLAMP)
+  if (magnitude <= 0) return
+  const affinity = decayGroupAffinity(context) || ensureGroupAffinityState(context)
+  if (!affinity) return
+  const gain = magnitude * GROUP_AFFINITY_GAIN
+  if (sameGroup) {
+    affinity.same = Math.min(GROUP_AFFINITY_CLAMP, affinity.same + gain)
+  } else {
+    affinity.other = Math.min(GROUP_AFFINITY_CLAMP, affinity.other + gain)
+  }
+  affinity.lastUpdatedChannel = channel
+}
+
+function registerGroupProximity(context, sameGroupCount, otherGroupCount, timestamp = Date.now()) {
+  const affinity = ensureGroupAffinityState(context)
+  if (!affinity) return
+  if (sameGroupCount > 0) {
+    noteGroupInteraction(context, true, sameGroupCount, 'proximity')
+  }
+  if (otherGroupCount > 0) {
+    noteGroupInteraction(context, false, otherGroupCount, 'proximity')
+  }
+  affinity.lastProximity = {
+    same: Math.max(0, sameGroupCount || 0),
+    other: Math.max(0, otherGroupCount || 0),
+    updatedAt: timestamp
+  }
+}
+
+function computeGroupAffinityBonus(context) {
+  const affinity = decayGroupAffinity(context)
+  if (!affinity) return 0
+  const same = Number.isFinite(affinity.same) ? affinity.same : 0
+  const other = Number.isFinite(affinity.other) ? affinity.other : 0
+  const net = same - other * GROUP_AFFINITY_RIVALRY_WEIGHT
+  if (!Number.isFinite(net) || Math.abs(net) < 1e-3) {
+    return 0
+  }
+  const scaled = net * GROUP_AFFINITY_REWARD_SCALE
+  return limitMagnitude(scaled, GROUP_AFFINITY_REWARD_CLAMP)
+}
+
+function sanitizeCommunicationPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null
+  const result = {}
+  for (const [key, value] of Object.entries(payload)) {
+    if (typeof value === 'number') {
+      if (Number.isFinite(value)) {
+        result[key] = value
+      }
+    } else if (typeof value === 'string') {
+      if (value) {
+        result[key] = value.slice(0, 64)
+      }
+    } else if (typeof value === 'boolean') {
+      result[key] = value
+    }
+  }
+  return Object.keys(result).length ? result : null
+}
+
+function createCommunicationState() {
+  return {
+    lastSentAt: 0,
+    lastHeardAt: 0,
+    nextAvailableAt: 0,
+    totalSent: 0,
+    sentCounts: Object.create(null),
+    summary: {
+      allies: new Float32Array(COMMUNICATION_TYPE_COUNT),
+      others: new Float32Array(COMMUNICATION_TYPE_COUNT),
+      alliesCount: new Uint16Array(COMMUNICATION_TYPE_COUNT),
+      othersCount: new Uint16Array(COMMUNICATION_TYPE_COUNT),
+      direction: { x: 0, z: 0 },
+      updatedAt: 0
+    }
+  }
+}
+
+function ensureCommunicationState(context) {
+  if (!context) return null
+  if (!context.communication) {
+    context.communication = createCommunicationState()
+  }
+  const summary = context.communication.summary
+  if (!(summary.allies instanceof Float32Array) || summary.allies.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.allies = new Float32Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!(summary.others instanceof Float32Array) || summary.others.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.others = new Float32Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!(summary.alliesCount instanceof Uint16Array) || summary.alliesCount.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.alliesCount = new Uint16Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!(summary.othersCount instanceof Uint16Array) || summary.othersCount.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.othersCount = new Uint16Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!summary.direction) {
+    summary.direction = { x: 0, z: 0 }
+  }
+  return context.communication
+}
+
+function pruneCommunicationBus(now = Date.now()) {
+  const bus = COMMUNICATION_BUS
+  if (!bus) return
+  if (now < bus.lastPrune + COMMUNICATION_PRUNE_INTERVAL_MS) {
+    return
+  }
+  bus.lastPrune = now
+  const cutoff = now - COMMUNICATION_DECAY_MS
+  if (!Number.isFinite(cutoff) || cutoff <= 0) {
+    return
+  }
+  if (!Array.isArray(bus.messages) || bus.messages.length === 0) {
+    bus.messages = []
+    return
+  }
+  const filtered = []
+  for (const message of bus.messages) {
+    const createdAt = Number(message?.createdAt)
+    if (!Number.isFinite(createdAt) || createdAt < cutoff) {
+      continue
+    }
+    filtered.push(message)
+  }
+  if (filtered.length > COMMUNICATION_MESSAGE_LIMIT) {
+    bus.messages = filtered.slice(filtered.length - COMMUNICATION_MESSAGE_LIMIT)
+  } else {
+    bus.messages = filtered
+  }
+}
+
+function broadcastCommunication(context, type, intensity = 1, payload = null) {
+  if (!context || !COMMUNICATION_TYPE_INDEX.has(type)) {
+    return null
+  }
+  const comm = ensureCommunicationState(context)
+  if (!comm) return null
+  const now = Date.now()
+  pruneCommunicationBus(now)
+  const sanitizedIntensity = limitPositive(Math.abs(Number(intensity)) || 0, COMMUNICATION_INTENSITY_CLAMP)
+  if (sanitizedIntensity <= 0) {
+    return null
+  }
+  const position = context.bot?.entity?.position
+  const record = {
+    senderId: context.id,
+    lineage: context.lineage ?? null,
+    mode: context.mode ?? null,
+    type,
+    intensity: sanitizedIntensity,
+    createdAt: now,
+    position: position
+      ? {
+          x: Number(position.x) || 0,
+          y: Number(position.y) || 0,
+          z: Number(position.z) || 0
+        }
+      : null,
+    payload: sanitizeCommunicationPayload(payload)
+  }
+  COMMUNICATION_BUS.messages.push(record)
+  if (COMMUNICATION_BUS.messages.length > COMMUNICATION_MESSAGE_LIMIT) {
+    COMMUNICATION_BUS.messages.splice(
+      0,
+      Math.max(0, COMMUNICATION_BUS.messages.length - COMMUNICATION_MESSAGE_LIMIT)
+    )
+  }
+  comm.lastSentAt = now
+  comm.nextAvailableAt = now + COMMUNICATION_COOLDOWN_MS
+  comm.totalSent += 1
+  comm.sentCounts[type] = (comm.sentCounts[type] ?? 0) + 1
+  return record
+}
+
+function pruneRewardEventBus(now = Date.now()) {
+  const bus = REWARD_EVENT_BUS
+  if (!bus) return
+  if (now < bus.lastPrune + 200) {
+    return
+  }
+  bus.lastPrune = now
+  const cutoff = now - REWARD_EVENT_DECAY_MS
+  if (!Number.isFinite(cutoff) || cutoff <= 0) {
+    return
+  }
+  if (!Array.isArray(bus.events) || bus.events.length === 0) {
+    bus.events = []
+    return
+  }
+  const filtered = []
+  for (const event of bus.events) {
+    const createdAt = Number(event?.createdAt)
+    if (!Number.isFinite(createdAt) || createdAt < cutoff) {
+      continue
+    }
+    filtered.push(event)
+  }
+  if (filtered.length > REWARD_EVENT_BUS_LIMIT) {
+    bus.events = filtered.slice(filtered.length - REWARD_EVENT_BUS_LIMIT)
+  } else {
+    bus.events = filtered
+  }
+}
+
+function refreshRewardHighlight(context, now = Date.now()) {
+  if (!context?.rewardHighlight) {
+    return
+  }
+  const createdAt = Number(context.rewardHighlight.createdAt)
+  if (!Number.isFinite(createdAt) || now - createdAt > REWARD_EVENT_DECAY_MS) {
+    context.rewardHighlight = null
+  }
+}
+
+function broadcastRewardHighlight(context, now = Date.now()) {
+  if (!context?.rewardHighlight) return
+  const highlight = context.rewardHighlight
+  const amount = limitPositive(Number(highlight.amount) || 0, REWARD_EVENT_VALUE_CLAMP)
+  if (amount <= 0) return
+  const position = context.bot?.entity?.position
+  if (!position) return
+  const record = {
+    senderId: context.id,
+    lineage: context.lineage ?? null,
+    mode: context.mode ?? null,
+    reason: highlight.reason ?? 'unspecified',
+    amount,
+    createdAt: Number(highlight.createdAt) || now,
+    position: {
+      x: Number(position.x) || 0,
+      y: Number(position.y) || 0,
+      z: Number(position.z) || 0
+    }
+  }
+  pruneRewardEventBus(now)
+  REWARD_EVENT_BUS.events.push(record)
+  if (REWARD_EVENT_BUS.events.length > REWARD_EVENT_BUS_LIMIT) {
+    REWARD_EVENT_BUS.events.splice(
+      0,
+      Math.max(0, REWARD_EVENT_BUS.events.length - REWARD_EVENT_BUS_LIMIT)
+    )
+  }
+}
+
+function noteRewardHighlight(context, reason, amount, now = Date.now()) {
+  if (!context || !Number.isFinite(amount) || amount <= 0) {
+    return
+  }
+  if (amount < REWARD_EVENT_THRESHOLD) {
+    return
+  }
+  const normalizedReason = typeof reason === 'string' && reason ? reason : 'unspecified'
+  const clampedAmount = limitPositive(amount, REWARD_EVENT_VALUE_CLAMP)
+  const highlight = context.rewardHighlight
+  const shouldReplace =
+    !highlight ||
+    !Number.isFinite(highlight.amount) ||
+    clampedAmount > highlight.amount * 1.05 ||
+    now - (Number(highlight.createdAt) || 0) >= REWARD_EVENT_REFRESH_MS
+  if (!shouldReplace) {
+    return
+  }
+  context.rewardHighlight = {
+    amount: clampedAmount,
+    reason: normalizedReason,
+    createdAt: now
+  }
+  broadcastRewardHighlight(context, now)
+}
+
+function hashRewardReason(reason) {
+  if (!reason) return 0
+  const text = String(reason)
+  let hash = 0
+  for (let i = 0; i < text.length; i++) {
+    hash = (hash * 33 + text.charCodeAt(i)) >>> 0
+  }
+  const bucket = hash % 997
+  return bucket / 996
+}
+
+function ensureRewardSignalState(context) {
+  if (!context) return null
+  if (!context.rewardSignal) {
+    context.rewardSignal = { amount: 0, reason: 0, freshness: 0, updatedAt: 0 }
+  }
+  return context.rewardSignal
+}
+
+function updateRewardEventAwareness(context) {
+  const signal = ensureRewardSignalState(context)
+  if (!signal || !context?.bot?.entity?.position) {
+    if (signal) {
+      signal.amount = 0
+      signal.reason = 0
+      signal.freshness = 0
+      signal.updatedAt = Date.now()
+    }
+    return signal
+  }
+  const now = Date.now()
+  pruneRewardEventBus(now)
+  const position = context.bot.entity.position
+  let topIntensity = 0
+  let topReason = 0
+  let topFreshness = 0
+  for (const event of REWARD_EVENT_BUS.events) {
+    if (!event) continue
+    const dt = now - Number(event.createdAt)
+    if (!Number.isFinite(dt) || dt < 0 || dt > REWARD_EVENT_DECAY_MS) continue
+    let intensity = limitPositive(Number(event.amount) || 0, REWARD_EVENT_VALUE_CLAMP)
+    if (intensity <= 0) continue
+    const timeDecay = Math.max(0, 1 - dt / REWARD_EVENT_DECAY_MS)
+    intensity *= timeDecay
+    const eventPos = event.position
+    if (eventPos && position) {
+      const dx = Number(eventPos.x) - Number(position.x)
+      const dy = Number(eventPos.y) - Number(position.y)
+      const dz = Number(eventPos.z) - Number(position.z)
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+      if (!Number.isFinite(dist) || dist > REWARD_EVENT_RANGE) {
+        continue
+      }
+      const spatialDecay = Math.max(0, 1 - dist / REWARD_EVENT_RANGE)
+      intensity *= spatialDecay
+    } else if (event.senderId !== context.id) {
+      continue
+    }
+    if (event.senderId !== context.id && context.mode && event.mode) {
+      const sameMode = event.mode === context.mode
+      noteGroupInteraction(context, sameMode, intensity, 'reward-highlight')
+    }
+    if (intensity <= topIntensity) continue
+    topIntensity = intensity
+    topReason = hashRewardReason(event.reason)
+    topFreshness = timeDecay
+  }
+  signal.amount = topIntensity
+  signal.reason = Math.max(0, Math.min(1, topReason))
+  signal.freshness = Math.max(0, Math.min(1, topFreshness))
+  signal.updatedAt = now
+  refreshRewardHighlight(context, now)
+  return signal
+}
+
+function computeCommunicationIntensity(context, type) {
+  switch (type) {
+    case 'resource': {
+      const inventory = Number.isFinite(context.lastInvTotal) ? context.lastInvTotal : 0
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + inventory / 32)
+    }
+    case 'danger': {
+      const health = Number(context?.bot?.health ?? 20)
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + Math.max(0, (20 - health) / 5))
+    }
+    case 'assist': {
+      const repetition = Number.isFinite(context.repetitionStreak) ? context.repetitionStreak : 0
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + repetition / 6)
+    }
+    case 'gather': {
+      const resources = context.resources ?? {}
+      const focus = Math.max(0, resources.ore ?? 0, resources.wood ?? 0, resources.stone ?? 0)
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + focus / 16)
+    }
+    case 'status': {
+      const morale = Number.isFinite(context?.morale?.value) ? context.morale.value : MORALE_BASELINE
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + Math.abs(morale - MORALE_BASELINE) * 2)
+    }
+    default:
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1)
+  }
+}
+
+function deriveCommunicationPayload(context, type) {
+  switch (type) {
+    case 'resource': {
+      const resources = context.resources ?? {}
+      const entries = Object.entries(resources)
+      entries.sort((a, b) => Number(b[1] ?? 0) - Number(a[1] ?? 0))
+      const top = entries[0]?.[0] ?? null
+      return {
+        focus: top,
+        total: Number.isFinite(context.lastInvTotal) ? context.lastInvTotal : 0
+      }
+    }
+    case 'danger':
+      return {
+        health: Number(context?.bot?.health ?? 20),
+        food: Number(context?.bot?.food ?? 20),
+        oxygen: Number(context?.bot?.oxygenLevel ?? context?.bot?.oxygen ?? 20)
+      }
+    case 'assist':
+      return {
+        mode: context.mode,
+        stagnation: context.stagnation?.active ?? false,
+        chain: context.currentChainScore ?? 0
+      }
+    case 'gather':
+      return {
+        novelty: context.noveltyFlag ?? false,
+        diversity: GLOBAL_RESOURCE_POOL.diversity.size
+      }
+    case 'status':
+      return {
+        morale: Number.isFinite(context?.morale?.value) ? context.morale.value : MORALE_BASELINE,
+        epsilon: Number.isFinite(context?.epsilon) ? context.epsilon : EPSILON_START
+      }
+    default:
+      return null
+  }
+}
+
+function updateCommunicationAwareness(context) {
+  const comm = ensureCommunicationState(context)
+  if (!comm) return
+  const summary = comm.summary
+  summary.allies.fill(0)
+  summary.others.fill(0)
+  summary.alliesCount.fill(0)
+  summary.othersCount.fill(0)
+  let directionX = 0
+  let directionZ = 0
+  let directionWeight = 0
+  const now = Date.now()
+  pruneCommunicationBus(now)
+  const position = context.bot?.entity?.position ?? null
+  let lastHeard = comm.lastHeardAt || 0
+
+  for (const message of COMMUNICATION_BUS.messages) {
+    if (!message || !COMMUNICATION_TYPE_INDEX.has(message.type)) continue
+    const dt = now - Number(message.createdAt)
+    if (!Number.isFinite(dt) || dt < 0 || dt > COMMUNICATION_DECAY_MS) continue
+    let intensity = limitPositive(Number(message.intensity) || 0, COMMUNICATION_INTENSITY_CLAMP)
+    if (intensity <= 0) continue
+    const decay = 1 - dt / COMMUNICATION_DECAY_MS
+    if (decay <= 0) continue
+    intensity *= decay
+    let withinRange = true
+    let dx = 0
+    let dz = 0
+    if (position && message.position) {
+      dx = Number(message.position.x) - Number(position.x)
+      const dy = Number(message.position.y) - Number(position.y)
+      dz = Number(message.position.z) - Number(position.z)
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+      if (!Number.isFinite(dist) || dist > COMMUNICATION_RANGE) {
+        withinRange = false
+      } else {
+        const falloff = Math.max(0, 1 - dist / COMMUNICATION_RANGE)
+        intensity *= falloff
+      }
+    }
+    if (!withinRange || intensity <= 0) continue
+    const index = COMMUNICATION_TYPE_INDEX.get(message.type)
+    if (index == null) continue
+    const sameMode = context.mode && message.mode && message.mode === context.mode
+    const sameLineage = message.lineage && context.lineage && message.lineage === context.lineage
+    const isAlly = sameMode || (!message.mode && sameLineage)
+    if (isAlly) {
+      summary.allies[index] += intensity
+      summary.alliesCount[index] += 1
+      if (position && message.position) {
+        directionX += dx * intensity
+        directionZ += dz * intensity
+        directionWeight += intensity
+      }
+    } else {
+      summary.others[index] += intensity
+      summary.othersCount[index] += 1
+    }
+    if (message.senderId !== context.id) {
+      if (context.mode && message.mode) {
+        noteGroupInteraction(context, sameMode, intensity, 'communication-heard')
+      }
+      lastHeard = Math.max(lastHeard, Number(message.createdAt))
+    }
+  }
+
+  summary.direction.x = directionWeight > 0 ? directionX / directionWeight : 0
+  summary.direction.z = directionWeight > 0 ? directionZ / directionWeight : 0
+  summary.updatedAt = now
+  comm.lastHeardAt = lastHeard
+}
+
+async function performCommunicationAction(context, signalType) {
+  const type = typeof signalType === 'string' ? signalType.toLowerCase() : ''
+  if (!COMMUNICATION_TYPE_INDEX.has(type)) {
+    addBlockReward(context, COMMUNICATION_COOLDOWN_PENALTY, REWARD_SIGN.NEGATIVE, 'communication-invalid')
+    return false
+  }
+  const comm = ensureCommunicationState(context)
+  if (!comm) {
+    return false
+  }
+  const now = Date.now()
+  if (now < comm.nextAvailableAt) {
+    addBlockReward(context, COMMUNICATION_COOLDOWN_PENALTY, REWARD_SIGN.NEGATIVE, `communication-cooldown-${type}`)
+    return false
+  }
+
+  const intensity = computeCommunicationIntensity(context, type)
+  const payload = deriveCommunicationPayload(context, type)
+  const record = broadcastCommunication(context, type, intensity, payload)
+  if (record) {
+    console.log(`[${label(context)}] Broadcast ${type} signal (intensity=${record.intensity.toFixed(2)}).`)
+    addBlockReward(context, COMMUNICATION_REWARD, REWARD_SIGN.POSITIVE, `communication-${type}`)
+    return true
+  }
+  addBlockReward(context, COMMUNICATION_COOLDOWN_PENALTY, REWARD_SIGN.NEGATIVE, `communication-failed-${type}`)
+  return false
+}
+
 function ensureTemporalMemoryState(context) {
   if (!context) return
   if (!Array.isArray(context.memoryRewards)) {
@@ -2655,6 +3366,20 @@ function populateMemoryObservation(context, obs, startIndex) {
   obs[index++] = normalizeMagnitude(context.actionMemoryWorst, ACTION_VALUE_CLAMP)
   obs[index++] = normalizePositive(context.damageDebt, DAMAGE_MEMORY_CLAMP)
   obs[index++] = normalizePositive(context.recentDamage, DAMAGE_MEMORY_CLAMP)
+  const pendingMutations = Array.isArray(context.pendingMutations)
+    ? context.pendingMutations.length
+    : 0
+  obs[index++] = normalizePositive(pendingMutations, MUTATION_QUEUE_CLAMP)
+  const epsilonBoost = Number.isFinite(context.epsilonBoost) ? Math.abs(context.epsilonBoost) : 0
+  obs[index++] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
+  const stagnation = context.stagnation?.streak ?? 0
+  const stagnationWindow = STAGNATION_WINDOW > 0 ? STAGNATION_WINDOW : 1
+  const normalizedStagnation = Number.isFinite(stagnation)
+    ? Math.max(0, Math.min(1, stagnation / stagnationWindow))
+    : 0
+  obs[index++] = normalizedStagnation
+  obs[index++] = context.waitingForBrain ? 1 : 0
+  obs[index++] = context.weightsSuspect ? 1 : 0
 
   return index
 }
@@ -2725,14 +3450,26 @@ function categorizeResource(name) {
   return null
 }
 
+function ensureGroupResourcePool(mode) {
+  const key = typeof mode === 'string' && mode ? mode : 'unknown'
+  if (!GROUP_RESOURCE_POOLS.has(key)) {
+    GROUP_RESOURCE_POOLS.set(key, { totalContribution: 0, totalWithdrawal: 0 })
+  }
+  return GROUP_RESOURCE_POOLS.get(key)
+}
+
 function registerContribution(context, amount) {
   context.resourceLedger.contributed += amount
   GLOBAL_RESOURCE_POOL.totalContribution += amount
+  const pool = ensureGroupResourcePool(context?.mode)
+  pool.totalContribution += amount
 }
 
 function registerWithdrawal(context, amount) {
   context.resourceLedger.withdrawn += amount
   GLOBAL_RESOURCE_POOL.totalWithdrawal += amount
+  const pool = ensureGroupResourcePool(context?.mode)
+  pool.totalWithdrawal += amount
 }
 
 function updateCooperationScore(context) {
@@ -2740,8 +3477,13 @@ function updateCooperationScore(context) {
   const withdrawal = context.resourceLedger.withdrawn
   const totalContribution = GLOBAL_RESOURCE_POOL.totalContribution || 1
   const totalWithdrawal = GLOBAL_RESOURCE_POOL.totalWithdrawal || 1
-  const fairness = contribution / totalContribution - withdrawal / totalWithdrawal
-  context.cooperationScore = fairness
+  const fairnessGlobal = contribution / totalContribution - withdrawal / totalWithdrawal
+  const groupPool = ensureGroupResourcePool(context?.mode)
+  const groupContribution = groupPool.totalContribution || 1
+  const groupWithdrawal = groupPool.totalWithdrawal || 1
+  const fairnessGroup = contribution / groupContribution - withdrawal / groupWithdrawal
+  context.cooperationScore =
+    fairnessGlobal * (1 - GROUP_RESOURCE_ALIGNMENT_WEIGHT) + fairnessGroup * GROUP_RESOURCE_ALIGNMENT_WEIGHT
 }
 
 function noteResourceDiversity(type) {
@@ -3005,6 +3747,74 @@ function gatherObservations(context) {
   obs[42] = Math.max(0, Math.min(1, lineagePrestige))
   const diversityRatio = Math.min(1, GLOBAL_RESOURCE_POOL.diversity.size / RESOURCE_TYPES.length)
   obs[43] = diversityRatio
+
+  const tickCount = Number.isFinite(context.tickCount) ? context.tickCount : 0
+  obs[44] = normalizePositive(tickCount, CONTEXT_TICK_NORMALIZER)
+  const trainingSteps = Number.isFinite(context.trainingSteps) ? context.trainingSteps : 0
+  obs[45] = normalizePositive(trainingSteps, CONTEXT_TRAINING_NORMALIZER)
+  const cumulativeReward = Number.isFinite(context.cumulativeReward) ? context.cumulativeReward : 0
+  obs[46] = normalizeMagnitude(cumulativeReward, CONTEXT_REWARD_NORMALIZER)
+  const noveltyTotal = Number.isFinite(context.noveltyCount) ? context.noveltyCount : 0
+  obs[47] = normalizePositive(noveltyTotal, NOVELTY_COUNT_NORMALIZER)
+
+  const feralFury = Number.isFinite(context.feralFury) ? Math.max(0, context.feralFury) : 0
+  obs[48] = normalizePositive(feralFury, FERAL_FURY_NORMALIZER)
+  const cooperationScore = Number.isFinite(context.cooperationScore) ? context.cooperationScore : 0
+  obs[49] = normalizeMagnitude(cooperationScore, COOPERATION_CLAMP)
+  const epsilon = Number.isFinite(context.epsilon) ? Math.max(0, context.epsilon) : EPSILON_START
+  obs[50] = normalizePositive(epsilon, EPSILON_NORMALIZER)
+  const epsilonBoost = Number.isFinite(context.epsilonBoost) ? Math.abs(context.epsilonBoost) : 0
+  obs[51] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
+  const morale = context.morale ?? { successStreak: 0, failureStreak: 0, frustration: 0, sharpness: 0.5 }
+  obs[52] = normalizePositive(Number(morale.successStreak) || 0, STREAK_NORMALIZER)
+  obs[53] = normalizePositive(Number(morale.failureStreak) || 0, STREAK_NORMALIZER)
+  obs[54] = normalizeMagnitude(Number(morale.frustration) || 0, MORALE_FRUSTRATION_CLAMP)
+  obs[55] = normalizeMagnitude(Number(morale.sharpness) || 0, MORALE_SHARPNESS_CLAMP)
+
+  const comm = ensureCommunicationState(context)
+  const commSummary = comm?.summary
+  if (commSummary) {
+    for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
+      const allyValue = Number.isFinite(commSummary.allies?.[i]) ? commSummary.allies[i] : 0
+      obs[56 + i] = normalizePositive(allyValue, COMMUNICATION_INTENSITY_CLAMP)
+    }
+    for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
+      const otherValue = Number.isFinite(commSummary.others?.[i]) ? commSummary.others[i] : 0
+      obs[56 + COMMUNICATION_TYPE_COUNT + i] = normalizePositive(otherValue, COMMUNICATION_INTENSITY_CLAMP)
+    }
+    const now = Date.now()
+    const lastSentAgo = comm?.lastSentAt ? Math.max(0, now - comm.lastSentAt) : Number.POSITIVE_INFINITY
+    const lastHeardAgo = comm?.lastHeardAt ? Math.max(0, now - comm.lastHeardAt) : Number.POSITIVE_INFINITY
+    const sentFreshness = 1 - normalizePositive(lastSentAgo, COMMUNICATION_TIME_NORMALIZER)
+    const heardFreshness = 1 - normalizePositive(lastHeardAgo, COMMUNICATION_TIME_NORMALIZER)
+    obs[56 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, sentFreshness))
+    obs[57 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, heardFreshness))
+    const direction = commSummary.direction ?? { x: 0, z: 0 }
+    obs[58 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+      Number(direction.x) || 0,
+      COMMUNICATION_DIRECTION_NORMALIZER
+    )
+    obs[59 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+      Number(direction.z) || 0,
+      COMMUNICATION_DIRECTION_NORMALIZER
+    )
+  } else {
+    for (let i = 0; i < COMMUNICATION_TYPE_COUNT * 2 + 4; i++) {
+      obs[56 + i] = 0
+    }
+  }
+
+  const rewardSignalIndex = 56 + COMMUNICATION_TYPE_COUNT * 2 + 4
+  const rewardSignal = updateRewardEventAwareness(context)
+  const rewardSignalAmount = normalizePositive(rewardSignal?.amount ?? 0, REWARD_EVENT_VALUE_CLAMP)
+  obs[rewardSignalIndex] = rewardSignalAmount
+  obs[rewardSignalIndex + 1] = Math.max(0, Math.min(1, rewardSignal?.reason ?? 0))
+  obs[rewardSignalIndex + 2] = Math.max(0, Math.min(1, rewardSignal?.freshness ?? 0))
+  const affinityState = ensureGroupAffinityState(context)
+  const affinitySame = normalizePositive(affinityState?.same ?? 0, GROUP_AFFINITY_CLAMP)
+  const affinityOther = normalizePositive(affinityState?.other ?? 0, GROUP_AFFINITY_CLAMP)
+  obs[rewardSignalIndex + 3] = affinitySame
+  obs[rewardSignalIndex + 4] = affinityOther
 
   populateMemoryObservation(context, obs, MEMORY_OBS_START)
 
@@ -3884,6 +4694,15 @@ async function executeAction(context, index) {
         }
         break
       }
+      case 'signal_resource':
+      case 'signal_danger':
+      case 'signal_assist':
+      case 'signal_gather':
+      case 'signal_status': {
+        const signalType = act.slice('signal_'.length)
+        await performCommunicationAction(context, signalType)
+        break
+      }
       default:
         break
     }
@@ -3977,10 +4796,54 @@ function shouldCullForDowntrend(context) {
   return true
 }
 
+function computeCrowdingPenalty(context, now = Date.now()) {
+  if (!context?.bot?.entity?.position) return 0
+  if (!Array.isArray(contexts) || contexts.length === 0) return 0
+  if (!Number.isFinite(context.tickCount) || context.tickCount <= 0) return 0
+  const lastAction = Number(context.lastActionAt) || 0
+  if (!Number.isFinite(lastAction) || now - lastAction > CROWDING_ACTION_WINDOW_MS) {
+    return 0
+  }
+  const pos = context.bot.entity.position
+  let nearby = 1
+  let sameGroupNearby = 0
+  let otherGroupNearby = 0
+  for (const other of contexts) {
+    if (!other || other === context) continue
+    const otherPos = other.bot?.entity?.position
+    if (!otherPos) continue
+    const otherLastAction = Number(other.lastActionAt) || 0
+    if (!Number.isFinite(otherLastAction) || now - otherLastAction > CROWDING_ACTION_WINDOW_MS) {
+      continue
+    }
+    const dx = Number(otherPos.x) - Number(pos.x)
+    const dy = Number(otherPos.y) - Number(pos.y)
+    const dz = Number(otherPos.z) - Number(pos.z)
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+    if (!Number.isFinite(dist) || dist > CROWDING_RADIUS) continue
+    nearby += 1
+    if (context.mode && other.mode) {
+      if (other.mode === context.mode) {
+        sameGroupNearby += 1
+      } else {
+        otherGroupNearby += 1
+      }
+    }
+  }
+  registerGroupProximity(context, sameGroupNearby, otherGroupNearby, now)
+  if (nearby <= CROWDING_THRESHOLD) {
+    return 0
+  }
+  const excess = nearby - CROWDING_THRESHOLD
+  const penalty = CROWDING_PENALTY_BASE + excess * CROWDING_PENALTY_STEP
+  return limitPositive(penalty, CROWDING_PENALTY_CLAMP)
+}
+
 function computeReward(context, obs) {
   let reward = createRewardAccumulator()
 
   ensureTemporalMemoryState(context)
+  decayGroupAffinity(context)
   context.damageDebt = limitPositive((context.damageDebt ?? 0) * DAMAGE_DEBT_DECAY, DAMAGE_MEMORY_CLAMP)
   context.recentDamage = limitPositive((context.recentDamage ?? 0) * DAMAGE_RECENT_DECAY, DAMAGE_MEMORY_CLAMP)
 
@@ -4097,6 +4960,11 @@ function computeReward(context, obs) {
     reward = applyRewardComponent(reward, fatiguePenalty, REWARD_SIGN.NEGATIVE, context, 'action-fatigue')
   }
 
+  const crowdPenalty = computeCrowdingPenalty(context)
+  if (crowdPenalty > 0) {
+    reward = applyRewardComponent(reward, -crowdPenalty, REWARD_SIGN.NEGATIVE, context, 'crowding')
+  }
+
   if (context.noveltyFlag) {
     reward = applyRewardComponent(
       reward,
@@ -4197,6 +5065,17 @@ function computeReward(context, obs) {
   } else {
     const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
     context.feralFury = Math.max(0, fury * 0.85)
+  }
+
+  const affinityBonus = computeGroupAffinityBonus(context)
+  if (affinityBonus !== 0) {
+    reward = applyRewardComponent(
+      reward,
+      affinityBonus,
+      REWARD_SIGN.EITHER,
+      context,
+      'group-affinity'
+    )
   }
 
   reward = applyRewardComponent(reward, 0.02, REWARD_SIGN.NEGATIVE, context, 'tick-cost')
@@ -4302,6 +5181,7 @@ async function tickLoop(context) {
       return
     }
 
+    updateCommunicationAwareness(context)
     const observation = gatherObservations(context)
     sanitizeVector(observation)
     if (!vectorHasFiniteValues(observation)) {
@@ -4442,6 +5322,7 @@ async function tickLoop(context) {
 
     const action = actionResult.action
     await executeAction(context, action)
+    context.lastActionAt = Date.now()
 
     recordActionMemory(context, action)
 
@@ -5446,6 +6327,7 @@ function createContext(index, options = {}) {
     lastObs: null,
     lastAction: null,
     prevAction: null,
+    lastActionAt: 0,
     lastPos: null,
     lastHealth: 20,
     lastFood: 20,
@@ -5512,6 +6394,8 @@ function createContext(index, options = {}) {
       lastNetDrop: 0,
       lastUpdatedGeneration: baselineState.generation ?? 0
     },
+    rewardHighlight: null,
+    rewardSignal: null,
     morale: {
       value: MORALE_BASELINE,
       frustration: 0,
@@ -5537,7 +6421,9 @@ function createContext(index, options = {}) {
       partner: partner?.username ?? null,
       partnerLineage: partner?.lineage ?? null
     },
-    nonFiniteTracker: null
+    nonFiniteTracker: null,
+    communication: createCommunicationState(),
+    groupAffinity: createGroupAffinityState()
   }
 
   resetNonFiniteTracker(context)

@@ -1,5 +1,5 @@
 fastapi>=0.110.0
 uvicorn[standard]>=0.24.0
-tensorflow>=2.15.0
-h5py>=3.8.0
+torch>=2.2.0
 requests>=2.31.0
+numpy>=1.26.0
