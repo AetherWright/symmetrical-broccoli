@@ -1406,6 +1406,11 @@ const ACTIONS = [
   'build_above',
   'build_forward',
   'use_item',
+  'signal_resource',
+  'signal_danger',
+  'signal_assist',
+  'signal_gather',
+  'signal_status',
   ...Object.keys(CRAFTING_ACTIONS)
 ]
 
@@ -1419,7 +1424,51 @@ const SAVE_INTERVAL_TICKS = 40
 const SAVE_INTERVAL_MS = 60 * 1000
 const CHECKPOINT_DIR = DEFAULT_BRAIN_DIR
 const EMOTION_VECTOR_SIZE = 3
-const BASE_OBS_FEATURES = 48
+const COMMUNICATION_TYPES = ['resource', 'danger', 'assist', 'gather', 'status']
+const COMMUNICATION_TYPE_COUNT = COMMUNICATION_TYPES.length
+const COMMUNICATION_TYPE_INDEX = new Map(
+  COMMUNICATION_TYPES.map((type, index) => [type, index])
+)
+const COMMUNICATION_RANGE = readNumberEnv('BOT_COMMUNICATION_RANGE', 96, { min: 4, max: 512 })
+const COMMUNICATION_DECAY_MS = readNumberEnv('BOT_COMMUNICATION_DECAY_MS', 15000, {
+  min: 250,
+  max: 60000
+})
+const COMMUNICATION_COOLDOWN_MS = readNumberEnv('BOT_COMMUNICATION_COOLDOWN_MS', 1200, {
+  min: 100,
+  max: 60000
+})
+const COMMUNICATION_MESSAGE_LIMIT = Math.max(
+  COMMUNICATION_TYPE_COUNT * 8,
+  Math.floor(readNumberEnv('BOT_COMMUNICATION_MESSAGE_LIMIT', 320, { min: 32, max: 2000 }))
+)
+const COMMUNICATION_PRUNE_INTERVAL_MS = readNumberEnv('BOT_COMMUNICATION_PRUNE_INTERVAL', 500, {
+  min: 50,
+  max: 5000
+})
+const COMMUNICATION_INTENSITY_CLAMP = readNumberEnv('BOT_COMMUNICATION_INTENSITY_CLAMP', 3, {
+  min: 0.5,
+  max: 10
+})
+const COMMUNICATION_TIME_NORMALIZER = readNumberEnv('BOT_COMMUNICATION_TIME_NORMALIZER', 12000, {
+  min: 250,
+  max: 120000
+})
+const COMMUNICATION_DIRECTION_NORMALIZER = readNumberEnv(
+  'BOT_COMMUNICATION_DIRECTION_NORMALIZER',
+  COMMUNICATION_RANGE,
+  { min: 1, max: 512 }
+)
+const COMMUNICATION_REWARD = readNumberEnv('BOT_COMMUNICATION_REWARD', 0.15, {
+  min: 0,
+  max: 1
+})
+const COMMUNICATION_COOLDOWN_PENALTY = readNumberEnv('BOT_COMMUNICATION_COOLDOWN_PENALTY', 0.05, {
+  min: 0,
+  max: 1
+})
+
+const BASE_OBS_FEATURES = 70
 const MEMORY_REWARD_WINDOW = Math.max(
   4,
   Math.floor(readNumberEnv('BOT_MEMORY_REWARD_WINDOW', 16, { min: 4, max: 64 }))
@@ -1440,6 +1489,13 @@ const CONTEXT_REWARD_NORMALIZER = readNumberEnv('BOT_CONTEXT_REWARD_NORMALIZER',
 const NOVELTY_COUNT_NORMALIZER = readNumberEnv('BOT_NOVELTY_COUNT_NORMALIZER', NOVELTY_TARGET, { min: 50, max: 5000 })
 const MUTATION_QUEUE_CLAMP = readNumberEnv('BOT_MUTATION_QUEUE_CLAMP', 12, { min: 1, max: 128 })
 const EPSILON_BOOST_NORMALIZER = readNumberEnv('BOT_EPSILON_BOOST_NORMALIZER', 1, { min: 0.05, max: 10 })
+const EPSILON_NORMALIZER = readNumberEnv('BOT_EPSILON_NORMALIZER', 1, { min: 0.1, max: 2 })
+const FERAL_FURY_NORMALIZER = readNumberEnv('BOT_FERAL_FURY_NORMALIZER', 5, { min: 0.5, max: 20 })
+const COOPERATION_CLAMP = readNumberEnv('BOT_COOPERATION_CLAMP', 1.5, { min: 0.1, max: 10 })
+const STREAK_NORMALIZER = readNumberEnv('BOT_STREAK_NORMALIZER', 24, { min: 1, max: 200 })
+const REPETITION_NORMALIZER = readNumberEnv('BOT_REPETITION_NORMALIZER', 24, { min: 1, max: 200 })
+const MORALE_FRUSTRATION_CLAMP = readNumberEnv('BOT_MORALE_FRUSTRATION_CLAMP', 2, { min: 0.1, max: 10 })
+const MORALE_SHARPNESS_CLAMP = readNumberEnv('BOT_MORALE_SHARPNESS_CLAMP', 2, { min: 0.1, max: 10 })
 const STAGNATION_WINDOW = 40
 const STAGNATION_VARIANCE_THRESHOLD = 0.0025
 const STAGNATION_MUTATION_THRESHOLD = 3
@@ -1516,6 +1572,10 @@ const GLOBAL_RESOURCE_POOL = {
   totalContribution: 0,
   totalWithdrawal: 0,
   diversity: new Set()
+}
+const COMMUNICATION_BUS = {
+  messages: [],
+  lastPrune: 0
 }
 const rewardProfile = {
   novelty: 1,
@@ -2527,6 +2587,301 @@ function normalizePositive(value, limit) {
   return scaled
 }
 
+function sanitizeCommunicationPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null
+  const result = {}
+  for (const [key, value] of Object.entries(payload)) {
+    if (typeof value === 'number') {
+      if (Number.isFinite(value)) {
+        result[key] = value
+      }
+    } else if (typeof value === 'string') {
+      if (value) {
+        result[key] = value.slice(0, 64)
+      }
+    } else if (typeof value === 'boolean') {
+      result[key] = value
+    }
+  }
+  return Object.keys(result).length ? result : null
+}
+
+function createCommunicationState() {
+  return {
+    lastSentAt: 0,
+    lastHeardAt: 0,
+    nextAvailableAt: 0,
+    totalSent: 0,
+    sentCounts: Object.create(null),
+    summary: {
+      allies: new Float32Array(COMMUNICATION_TYPE_COUNT),
+      others: new Float32Array(COMMUNICATION_TYPE_COUNT),
+      alliesCount: new Uint16Array(COMMUNICATION_TYPE_COUNT),
+      othersCount: new Uint16Array(COMMUNICATION_TYPE_COUNT),
+      direction: { x: 0, z: 0 },
+      updatedAt: 0
+    }
+  }
+}
+
+function ensureCommunicationState(context) {
+  if (!context) return null
+  if (!context.communication) {
+    context.communication = createCommunicationState()
+  }
+  const summary = context.communication.summary
+  if (!(summary.allies instanceof Float32Array) || summary.allies.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.allies = new Float32Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!(summary.others instanceof Float32Array) || summary.others.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.others = new Float32Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!(summary.alliesCount instanceof Uint16Array) || summary.alliesCount.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.alliesCount = new Uint16Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!(summary.othersCount instanceof Uint16Array) || summary.othersCount.length !== COMMUNICATION_TYPE_COUNT) {
+    summary.othersCount = new Uint16Array(COMMUNICATION_TYPE_COUNT)
+  }
+  if (!summary.direction) {
+    summary.direction = { x: 0, z: 0 }
+  }
+  return context.communication
+}
+
+function pruneCommunicationBus(now = Date.now()) {
+  const bus = COMMUNICATION_BUS
+  if (!bus) return
+  if (now < bus.lastPrune + COMMUNICATION_PRUNE_INTERVAL_MS) {
+    return
+  }
+  bus.lastPrune = now
+  const cutoff = now - COMMUNICATION_DECAY_MS
+  if (!Number.isFinite(cutoff) || cutoff <= 0) {
+    return
+  }
+  if (!Array.isArray(bus.messages) || bus.messages.length === 0) {
+    bus.messages = []
+    return
+  }
+  const filtered = []
+  for (const message of bus.messages) {
+    const createdAt = Number(message?.createdAt)
+    if (!Number.isFinite(createdAt) || createdAt < cutoff) {
+      continue
+    }
+    filtered.push(message)
+  }
+  if (filtered.length > COMMUNICATION_MESSAGE_LIMIT) {
+    bus.messages = filtered.slice(filtered.length - COMMUNICATION_MESSAGE_LIMIT)
+  } else {
+    bus.messages = filtered
+  }
+}
+
+function broadcastCommunication(context, type, intensity = 1, payload = null) {
+  if (!context || !COMMUNICATION_TYPE_INDEX.has(type)) {
+    return null
+  }
+  const comm = ensureCommunicationState(context)
+  if (!comm) return null
+  const now = Date.now()
+  pruneCommunicationBus(now)
+  const sanitizedIntensity = limitPositive(Math.abs(Number(intensity)) || 0, COMMUNICATION_INTENSITY_CLAMP)
+  if (sanitizedIntensity <= 0) {
+    return null
+  }
+  const position = context.bot?.entity?.position
+  const record = {
+    senderId: context.id,
+    lineage: context.lineage ?? null,
+    mode: context.mode ?? null,
+    type,
+    intensity: sanitizedIntensity,
+    createdAt: now,
+    position: position
+      ? {
+          x: Number(position.x) || 0,
+          y: Number(position.y) || 0,
+          z: Number(position.z) || 0
+        }
+      : null,
+    payload: sanitizeCommunicationPayload(payload)
+  }
+  COMMUNICATION_BUS.messages.push(record)
+  if (COMMUNICATION_BUS.messages.length > COMMUNICATION_MESSAGE_LIMIT) {
+    COMMUNICATION_BUS.messages.splice(
+      0,
+      Math.max(0, COMMUNICATION_BUS.messages.length - COMMUNICATION_MESSAGE_LIMIT)
+    )
+  }
+  comm.lastSentAt = now
+  comm.nextAvailableAt = now + COMMUNICATION_COOLDOWN_MS
+  comm.totalSent += 1
+  comm.sentCounts[type] = (comm.sentCounts[type] ?? 0) + 1
+  return record
+}
+
+function computeCommunicationIntensity(context, type) {
+  switch (type) {
+    case 'resource': {
+      const inventory = Number.isFinite(context.lastInvTotal) ? context.lastInvTotal : 0
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + inventory / 32)
+    }
+    case 'danger': {
+      const health = Number(context?.bot?.health ?? 20)
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + Math.max(0, (20 - health) / 5))
+    }
+    case 'assist': {
+      const repetition = Number.isFinite(context.repetitionStreak) ? context.repetitionStreak : 0
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + repetition / 6)
+    }
+    case 'gather': {
+      const resources = context.resources ?? {}
+      const focus = Math.max(0, resources.ore ?? 0, resources.wood ?? 0, resources.stone ?? 0)
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + focus / 16)
+    }
+    case 'status': {
+      const morale = Number.isFinite(context?.morale?.value) ? context.morale.value : MORALE_BASELINE
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1 + Math.abs(morale - MORALE_BASELINE) * 2)
+    }
+    default:
+      return Math.min(COMMUNICATION_INTENSITY_CLAMP, 1)
+  }
+}
+
+function deriveCommunicationPayload(context, type) {
+  switch (type) {
+    case 'resource': {
+      const resources = context.resources ?? {}
+      const entries = Object.entries(resources)
+      entries.sort((a, b) => Number(b[1] ?? 0) - Number(a[1] ?? 0))
+      const top = entries[0]?.[0] ?? null
+      return {
+        focus: top,
+        total: Number.isFinite(context.lastInvTotal) ? context.lastInvTotal : 0
+      }
+    }
+    case 'danger':
+      return {
+        health: Number(context?.bot?.health ?? 20),
+        food: Number(context?.bot?.food ?? 20),
+        oxygen: Number(context?.bot?.oxygenLevel ?? context?.bot?.oxygen ?? 20)
+      }
+    case 'assist':
+      return {
+        mode: context.mode,
+        stagnation: context.stagnation?.active ?? false,
+        chain: context.currentChainScore ?? 0
+      }
+    case 'gather':
+      return {
+        novelty: context.noveltyFlag ?? false,
+        diversity: GLOBAL_RESOURCE_POOL.diversity.size
+      }
+    case 'status':
+      return {
+        morale: Number.isFinite(context?.morale?.value) ? context.morale.value : MORALE_BASELINE,
+        epsilon: Number.isFinite(context?.epsilon) ? context.epsilon : EPSILON_START
+      }
+    default:
+      return null
+  }
+}
+
+function updateCommunicationAwareness(context) {
+  const comm = ensureCommunicationState(context)
+  if (!comm) return
+  const summary = comm.summary
+  summary.allies.fill(0)
+  summary.others.fill(0)
+  summary.alliesCount.fill(0)
+  summary.othersCount.fill(0)
+  let directionX = 0
+  let directionZ = 0
+  let directionWeight = 0
+  const now = Date.now()
+  pruneCommunicationBus(now)
+  const position = context.bot?.entity?.position ?? null
+  let lastHeard = comm.lastHeardAt || 0
+
+  for (const message of COMMUNICATION_BUS.messages) {
+    if (!message || !COMMUNICATION_TYPE_INDEX.has(message.type)) continue
+    const dt = now - Number(message.createdAt)
+    if (!Number.isFinite(dt) || dt < 0 || dt > COMMUNICATION_DECAY_MS) continue
+    let intensity = limitPositive(Number(message.intensity) || 0, COMMUNICATION_INTENSITY_CLAMP)
+    if (intensity <= 0) continue
+    const decay = 1 - dt / COMMUNICATION_DECAY_MS
+    if (decay <= 0) continue
+    intensity *= decay
+    let withinRange = true
+    let dx = 0
+    let dz = 0
+    if (position && message.position) {
+      dx = Number(message.position.x) - Number(position.x)
+      const dy = Number(message.position.y) - Number(position.y)
+      dz = Number(message.position.z) - Number(position.z)
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
+      if (!Number.isFinite(dist) || dist > COMMUNICATION_RANGE) {
+        withinRange = false
+      } else {
+        const falloff = Math.max(0, 1 - dist / COMMUNICATION_RANGE)
+        intensity *= falloff
+      }
+    }
+    if (!withinRange || intensity <= 0) continue
+    const index = COMMUNICATION_TYPE_INDEX.get(message.type)
+    if (index == null) continue
+    if (message.lineage && context.lineage && message.lineage === context.lineage) {
+      summary.allies[index] += intensity
+      summary.alliesCount[index] += 1
+      if (position && message.position) {
+        directionX += dx * intensity
+        directionZ += dz * intensity
+        directionWeight += intensity
+      }
+    } else {
+      summary.others[index] += intensity
+      summary.othersCount[index] += 1
+    }
+    if (message.senderId !== context.id) {
+      lastHeard = Math.max(lastHeard, Number(message.createdAt))
+    }
+  }
+
+  summary.direction.x = directionWeight > 0 ? directionX / directionWeight : 0
+  summary.direction.z = directionWeight > 0 ? directionZ / directionWeight : 0
+  summary.updatedAt = now
+  comm.lastHeardAt = lastHeard
+}
+
+async function performCommunicationAction(context, signalType) {
+  const type = typeof signalType === 'string' ? signalType.toLowerCase() : ''
+  if (!COMMUNICATION_TYPE_INDEX.has(type)) {
+    addBlockReward(context, COMMUNICATION_COOLDOWN_PENALTY, REWARD_SIGN.NEGATIVE, 'communication-invalid')
+    return false
+  }
+  const comm = ensureCommunicationState(context)
+  if (!comm) {
+    return false
+  }
+  const now = Date.now()
+  if (now < comm.nextAvailableAt) {
+    addBlockReward(context, COMMUNICATION_COOLDOWN_PENALTY, REWARD_SIGN.NEGATIVE, `communication-cooldown-${type}`)
+    return false
+  }
+
+  const intensity = computeCommunicationIntensity(context, type)
+  const payload = deriveCommunicationPayload(context, type)
+  const record = broadcastCommunication(context, type, intensity, payload)
+  if (record) {
+    console.log(`[${label(context)}] Broadcast ${type} signal (intensity=${record.intensity.toFixed(2)}).`)
+    addBlockReward(context, COMMUNICATION_REWARD, REWARD_SIGN.POSITIVE, `communication-${type}`)
+    return true
+  }
+  addBlockReward(context, COMMUNICATION_COOLDOWN_PENALTY, REWARD_SIGN.NEGATIVE, `communication-failed-${type}`)
+  return false
+}
+
 function ensureTemporalMemoryState(context) {
   if (!context) return
   if (!Array.isArray(context.memoryRewards)) {
@@ -3034,6 +3389,53 @@ function gatherObservations(context) {
   obs[46] = normalizeMagnitude(cumulativeReward, CONTEXT_REWARD_NORMALIZER)
   const noveltyTotal = Number.isFinite(context.noveltyCount) ? context.noveltyCount : 0
   obs[47] = normalizePositive(noveltyTotal, NOVELTY_COUNT_NORMALIZER)
+
+  const feralFury = Number.isFinite(context.feralFury) ? Math.max(0, context.feralFury) : 0
+  obs[48] = normalizePositive(feralFury, FERAL_FURY_NORMALIZER)
+  const cooperationScore = Number.isFinite(context.cooperationScore) ? context.cooperationScore : 0
+  obs[49] = normalizeMagnitude(cooperationScore, COOPERATION_CLAMP)
+  const epsilon = Number.isFinite(context.epsilon) ? Math.max(0, context.epsilon) : EPSILON_START
+  obs[50] = normalizePositive(epsilon, EPSILON_NORMALIZER)
+  const epsilonBoost = Number.isFinite(context.epsilonBoost) ? Math.abs(context.epsilonBoost) : 0
+  obs[51] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
+  const morale = context.morale ?? { successStreak: 0, failureStreak: 0, frustration: 0, sharpness: 0.5 }
+  obs[52] = normalizePositive(Number(morale.successStreak) || 0, STREAK_NORMALIZER)
+  obs[53] = normalizePositive(Number(morale.failureStreak) || 0, STREAK_NORMALIZER)
+  obs[54] = normalizeMagnitude(Number(morale.frustration) || 0, MORALE_FRUSTRATION_CLAMP)
+  obs[55] = normalizeMagnitude(Number(morale.sharpness) || 0, MORALE_SHARPNESS_CLAMP)
+
+  const comm = ensureCommunicationState(context)
+  const commSummary = comm?.summary
+  if (commSummary) {
+    for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
+      const allyValue = Number.isFinite(commSummary.allies?.[i]) ? commSummary.allies[i] : 0
+      obs[56 + i] = normalizePositive(allyValue, COMMUNICATION_INTENSITY_CLAMP)
+    }
+    for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
+      const otherValue = Number.isFinite(commSummary.others?.[i]) ? commSummary.others[i] : 0
+      obs[56 + COMMUNICATION_TYPE_COUNT + i] = normalizePositive(otherValue, COMMUNICATION_INTENSITY_CLAMP)
+    }
+    const now = Date.now()
+    const lastSentAgo = comm?.lastSentAt ? Math.max(0, now - comm.lastSentAt) : Number.POSITIVE_INFINITY
+    const lastHeardAgo = comm?.lastHeardAt ? Math.max(0, now - comm.lastHeardAt) : Number.POSITIVE_INFINITY
+    const sentFreshness = 1 - normalizePositive(lastSentAgo, COMMUNICATION_TIME_NORMALIZER)
+    const heardFreshness = 1 - normalizePositive(lastHeardAgo, COMMUNICATION_TIME_NORMALIZER)
+    obs[56 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, sentFreshness))
+    obs[57 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, heardFreshness))
+    const direction = commSummary.direction ?? { x: 0, z: 0 }
+    obs[58 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+      Number(direction.x) || 0,
+      COMMUNICATION_DIRECTION_NORMALIZER
+    )
+    obs[59 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+      Number(direction.z) || 0,
+      COMMUNICATION_DIRECTION_NORMALIZER
+    )
+  } else {
+    for (let i = 0; i < COMMUNICATION_TYPE_COUNT * 2 + 4; i++) {
+      obs[56 + i] = 0
+    }
+  }
 
   populateMemoryObservation(context, obs, MEMORY_OBS_START)
 
@@ -3913,6 +4315,15 @@ async function executeAction(context, index) {
         }
         break
       }
+      case 'signal_resource':
+      case 'signal_danger':
+      case 'signal_assist':
+      case 'signal_gather':
+      case 'signal_status': {
+        const signalType = act.slice('signal_'.length)
+        await performCommunicationAction(context, signalType)
+        break
+      }
       default:
         break
     }
@@ -4331,6 +4742,7 @@ async function tickLoop(context) {
       return
     }
 
+    updateCommunicationAwareness(context)
     const observation = gatherObservations(context)
     sanitizeVector(observation)
     if (!vectorHasFiniteValues(observation)) {
@@ -5566,7 +5978,8 @@ function createContext(index, options = {}) {
       partner: partner?.username ?? null,
       partnerLineage: partner?.lineage ?? null
     },
-    nonFiniteTracker: null
+    nonFiniteTracker: null,
+    communication: createCommunicationState()
   }
 
   resetNonFiniteTracker(context)
