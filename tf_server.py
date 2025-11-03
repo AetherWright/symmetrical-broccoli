@@ -683,7 +683,8 @@ class RemoteBrain:
                             "exploration": bool(exploration),
                         },
                     }
-            return [result or {"error": "Observation could not be processed"} for result in results]
+            final_results = [result or {"error": "Observation could not be processed"} for result in results]
+        return final_results
 
     def choose_action(self, observation: Any, epsilon: float) -> Dict[str, Any]:
         batch = self.choose_actions_batch([observation], [epsilon])
@@ -868,7 +869,7 @@ class RemoteBrain:
                             },
                             "hebbian": hebbian_info,
                         }
-            return [
+            final_results = [
                 value
                 if value is not None
                 else {
@@ -892,6 +893,7 @@ class RemoteBrain:
                 }
                 for value in results
             ]
+        return final_results
 
     def train(self, observation: Any, action_index: Any, reward: Any, penalty: Any, next_observation: Any) -> Dict[str, Any]:
         batch = self.train_batch([observation], [action_index], [reward], [penalty], [next_observation])
