@@ -945,7 +945,11 @@ function noteRemoteBrainOnline(context) {
   tracker.offlineNotified = false
   tracker.lastMessage = null
   tracker.nextLogAt = 0
+  const wasWaiting = Boolean(context.waitingForBrain)
   context.waitingForBrain = false
+  if (wasWaiting) {
+    noteEnvironmentChange(context, 'remote-brain-online')
+  }
 }
 
 function ensureNonFiniteTracker(context) {
@@ -1053,6 +1057,7 @@ function markContextWeightsHealthy(context, reason = 'unknown') {
     const stats = ensureLineageRecord(context.lineage)
     stats.instability = Math.max(0, (stats.instability ?? 0) * 0.5)
   }
+  noteEnvironmentChange(context, 'weights-healthy')
 }
 
 function scheduleWeightRecovery(context, reason = 'unknown', details = {}) {
@@ -1415,7 +1420,6 @@ const ACTIONS = [
   ...Object.keys(CRAFTING_ACTIONS)
 ]
 
-const TICK_RATE = 50
 const EPSILON_START = 0.25
 const EPSILON_MIN = 0.05
 const EPSILON_DECAY = 0.999
@@ -5093,6 +5097,82 @@ function computeReward(context, obs) {
   return summary
 }
 
+function scheduleTick(context, reason = 'manual') {
+  if (!context) return
+  if (!globalRunning || !context.running) return
+
+  if (context.tickInFlight) {
+    if (reason !== 'action-complete' && !context.pendingEnvironmentTick) {
+      context.pendingEnvironmentTick = true
+      context.pendingEnvironmentReason = reason
+    }
+    return
+  }
+
+  if (context.tickTimer) {
+    return
+  }
+
+  context.tickTimer = setTimeout(() => {
+    context.tickTimer = null
+    if (!globalRunning || !context.running) {
+      return
+    }
+    tickLoop(context).catch(err =>
+      console.error(`[${label(context)}] Tick scheduling error:`, err)
+    )
+  }, 0)
+}
+
+function noteEnvironmentChange(context, reason = 'environment') {
+  if (!context) return
+  if (context.waitingForBrain && reason !== 'remote-brain-online') {
+    return
+  }
+  scheduleTick(context, reason)
+}
+
+function bindEnvironmentTriggers(context) {
+  if (!context?.bot) return
+
+  unbindEnvironmentTriggers(context)
+
+  const { bot } = context
+  const listeners = [
+    ['move', () => noteEnvironmentChange(context, 'self-move')],
+    ['blockUpdate', () => noteEnvironmentChange(context, 'block-update')],
+    ['chunkColumnLoad', () => noteEnvironmentChange(context, 'chunk-load')],
+    ['chunkColumnUnload', () => noteEnvironmentChange(context, 'chunk-unload')],
+    ['entitySpawn', () => noteEnvironmentChange(context, 'entity-spawn')],
+    ['entityGone', () => noteEnvironmentChange(context, 'entity-gone')],
+    ['entityHurt', () => noteEnvironmentChange(context, 'entity-hurt')],
+    ['death', () => noteEnvironmentChange(context, 'death')],
+    ['health', () => noteEnvironmentChange(context, 'health-change')],
+    ['experience', () => noteEnvironmentChange(context, 'experience-change')],
+    ['collect', () => noteEnvironmentChange(context, 'collect')],
+    ['forcedMove', () => noteEnvironmentChange(context, 'forced-move')]
+  ]
+
+  context.environmentListeners = listeners
+  for (const [event, handler] of listeners) {
+    bot.on(event, handler)
+  }
+}
+
+function unbindEnvironmentTriggers(context) {
+  if (!context?.bot) return
+
+  const listeners = Array.isArray(context.environmentListeners)
+    ? context.environmentListeners
+    : []
+
+  for (const [event, handler] of listeners) {
+    context.bot.off(event, handler)
+  }
+
+  context.environmentListeners = []
+}
+
 async function tickLoop(context) {
   if (!globalRunning || !context.running || context.tickInFlight) return
   context.tickInFlight = true
@@ -5100,6 +5180,7 @@ async function tickLoop(context) {
   const tickStart = monotonicNow()
   let remoteUnavailable = false
   let remoteIssue = null
+  let nextTickReason = null
   try {
     if (!context.bot?.entity?.position) {
       console.warn(`[${label(context)}] Entity not ready, skipping tick.`)
@@ -5332,6 +5413,7 @@ async function tickLoop(context) {
     context.prevAction = context.lastAction
     context.lastObs = observation
     context.lastAction = action
+    nextTickReason = 'action-complete'
     context.tickCount += 1
     context.generationTicks += 1
     context.cumulativeReward += reward.total
@@ -5386,11 +5468,15 @@ async function tickLoop(context) {
       }
     }
 
-    if (globalRunning && context.running) {
-      context.tickTimer = setTimeout(() => {
-        context.tickTimer = null
-        tickLoop(context).catch(err => console.error(`[${label(context)}] Tick scheduling error:`, err))
-      }, TICK_RATE)
+    const envReason = context.pendingEnvironmentTick
+      ? context.pendingEnvironmentReason || 'environment'
+      : null
+    context.pendingEnvironmentTick = false
+    context.pendingEnvironmentReason = null
+
+    const reason = nextTickReason ?? envReason
+    if (reason) {
+      scheduleTick(context, reason)
     }
   }
 }
@@ -6026,6 +6112,9 @@ function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
     clearTimeout(context.tickTimer)
     context.tickTimer = null
   }
+  context.pendingEnvironmentTick = false
+  context.pendingEnvironmentReason = null
+  unbindEnvironmentTriggers(context)
   context.reconnecting = true
   context.reconnectAttempts = (context.reconnectAttempts ?? 0) + 1
   const backoff = Math.min(30000, Math.floor(delay * context.reconnectAttempts))
@@ -6062,6 +6151,8 @@ function setupBot(context) {
 
   const { bot } = context
 
+  bindEnvironmentTriggers(context)
+
   bot.once('spawn', () => {
     console.log(`[${label(context)}] Spawned! Waiting for entity to initialize...`)
 
@@ -6077,7 +6168,7 @@ function setupBot(context) {
         clearInterval(waitForEntity)
         console.log(`[${label(context)}] Entity ready — starting tick loop!`)
 
-        tickLoop(context).catch(err => console.error(`[${label(context)}] Initial tick error:`, err))
+        scheduleTick(context, 'spawn-ready')
       }
     }, 500)
   })
@@ -6111,11 +6202,14 @@ async function retireContext(context, reason = 'retire') {
     clearTimeout(context.tickTimer)
     context.tickTimer = null
   }
+  context.pendingEnvironmentTick = false
+  context.pendingEnvironmentReason = null
   if (context.reconnectTimer) {
     clearTimeout(context.reconnectTimer)
     context.reconnectTimer = null
   }
   try {
+    unbindEnvironmentTriggers(context)
     context.bot?.removeAllListeners?.()
     context.bot?.quit?.(safeDisconnectReason(`Retire: ${reason}`))
   } catch (err) {
@@ -6322,6 +6416,8 @@ function createContext(index, options = {}) {
     running: true,
     tickTimer: null,
     tickInFlight: false,
+    pendingEnvironmentTick: false,
+    pendingEnvironmentReason: null,
     movementController: null,
     registry: null,
     lastObs: null,
@@ -6423,7 +6519,8 @@ function createContext(index, options = {}) {
     },
     nonFiniteTracker: null,
     communication: createCommunicationState(),
-    groupAffinity: createGroupAffinityState()
+    groupAffinity: createGroupAffinityState(),
+    environmentListeners: []
   }
 
   resetNonFiniteTracker(context)
@@ -6478,6 +6575,8 @@ process.stdin.on('data', async data => {
         clearTimeout(ctx.tickTimer)
         ctx.tickTimer = null
       }
+      ctx.pendingEnvironmentTick = false
+      ctx.pendingEnvironmentReason = null
     }
     console.log('[Brain] Paused. Current ticks will finish before stopping.')
   } else if (cmd === 'resume') {
@@ -6487,7 +6586,7 @@ process.stdin.on('data', async data => {
         if (!ctx.running) {
           ctx.running = true
           if (!ctx.tickInFlight && !ctx.tickTimer) {
-            tickLoop(ctx).catch(err => console.error(`[${label(ctx)}] Resume tick error:`, err))
+            scheduleTick(ctx, 'resume')
           }
         }
       }
@@ -6519,6 +6618,8 @@ process.stdin.on('data', async data => {
         clearTimeout(ctx.tickTimer)
         ctx.tickTimer = null
       }
+      ctx.pendingEnvironmentTick = false
+      ctx.pendingEnvironmentReason = null
     }
     await flushPendingSave()
     if (isRemoteBrainConnected()) {
@@ -6574,6 +6675,8 @@ async function gracefulShutdown(reason = 'signal') {
         clearTimeout(ctx.tickTimer)
         ctx.tickTimer = null
       }
+      ctx.pendingEnvironmentTick = false
+      ctx.pendingEnvironmentReason = null
     }
     await flushPendingSave()
     if (isRemoteBrainConnected()) {
