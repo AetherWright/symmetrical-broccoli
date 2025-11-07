@@ -1,4 +1,8 @@
+import asyncio
 import atexit
+import codecs
+import functools
+import gc
 import json
 import logging
 import math
@@ -11,8 +15,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 import uvicorn
+from contextlib import nullcontext
 
 ALLOWED_SEGMENT_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
 STORAGE_ROOT = os.environ.get("TF_SERVER_STORAGE_ROOT") or os.path.join(os.getcwd(), "tf_server_storage")
@@ -100,6 +106,37 @@ STATUS["float_policy"] = {
     "using_gpu": FLOAT_POLICY["using_gpu"],
     "device": str(FLOAT_POLICY["device"]),
 }
+
+
+class MemoryManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_collect = 0.0
+        self.interval = max(0.0, float(os.environ.get("TF_SERVER_GC_INTERVAL", 0.0)))
+
+    def maybe_collect(self, force: bool = False) -> Dict[str, Any]:
+        now = time.time()
+        if not force and self.interval > 0.0 and now - self._last_collect < self.interval:
+            return {"performed": False}
+        with self._lock:
+            now = time.time()
+            if not force and self.interval > 0.0 and now - self._last_collect < self.interval:
+                return {"performed": False}
+            collected = gc.collect()
+            gpu_reclaimed = False
+            if FLOAT_POLICY.get("using_gpu"):
+                try:
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+                    gpu_reclaimed = True
+                except Exception:  # pragma: no cover - defensive cleanup
+                    LOGGER.exception("Failed to release CUDA caches during GC")
+            self._last_collect = now
+            return {"performed": True, "objects_collected": int(collected), "gpu_caches_cleared": gpu_reclaimed}
+
+
+MEMORY_MANAGER = MemoryManager()
 
 
 class EndpointWorkerPool:
@@ -238,9 +275,13 @@ class LookaheadOptimizer:
             self._fast_params = [p for group in self.optimizer.param_groups for p in group["params"] if p.requires_grad]
             self._slow_params = [p.detach().clone().to(p.device) for p in self._fast_params]
 
-    def step(self) -> None:
+    def step(self, grad_scaler: Optional["torch.cuda.amp.GradScaler"] = None) -> None:
         self._maybe_refresh()
-        self.optimizer.step()
+        if grad_scaler is not None and getattr(grad_scaler, "is_enabled", lambda: False)():
+            grad_scaler.step(self.optimizer)
+            grad_scaler.update()
+        else:
+            self.optimizer.step()
         self._step += 1
         if self.sync_period and self._step % self.sync_period == 0:
             for fast, slow in zip(self._fast_params, self._slow_params):
@@ -654,6 +695,10 @@ class RemoteBrain:
             sync_period=BRAIN_CONFIG["lookahead_sync"],
             slow_step_size=BRAIN_CONFIG["lookahead_alpha"],
         )
+        if hasattr(torch.cuda, "amp"):
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=FLOAT_POLICY["using_gpu"])
+        else:  # pragma: no cover - fallback for older torch
+            self.grad_scaler = None
         self.ema = ParameterEMA(self.model, decay=BRAIN_CONFIG["ema_decay"])
         self._lock = threading.RLock()
         self.policy_strikes = 0
@@ -662,6 +707,11 @@ class RemoteBrain:
     @property
     def device(self) -> torch.device:
         return FLOAT_POLICY["device"]
+
+    def _autocast_context(self):
+        if FLOAT_POLICY["using_gpu"] and hasattr(torch.cuda, "amp"):
+            return torch.cuda.amp.autocast(dtype=torch.float16)
+        return nullcontext()
 
     def _prepare_observation(self, vector: Any, label: str) -> Tuple[np.ndarray, Dict[str, Any]]:
         if vector is None:
@@ -840,7 +890,10 @@ class RemoteBrain:
                             self.ema.apply_shadow(self.model)
                             ema_applied = True
                         tensor = torch.from_numpy(batch).to(self.device)
-                        policy_probs, reward_predictions = self.model(tensor)
+                        with self._autocast_context():
+                            policy_probs, reward_predictions = self.model(tensor)
+                        policy_probs = policy_probs.float()
+                        reward_predictions = reward_predictions.float()
                         probs = policy_probs.cpu().numpy().astype(NP_FLOAT, copy=False)
                         reward_predictions_np = reward_predictions.cpu().numpy().astype(NP_FLOAT, copy=False)
                         meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
@@ -1127,7 +1180,10 @@ class RemoteBrain:
                 reward_tensor = torch.tensor([entry["reward"] for entry in valid_entries], dtype=FLOAT_POLICY["dtype"], device=self.device)
                 obs_tensor = torch.from_numpy(obs_matrix).to(self.device)
                 self.optimizer.zero_grad()
-                policy_probs, reward_predictions = self.model(obs_tensor)
+                with self._autocast_context():
+                    policy_probs, reward_predictions = self.model(obs_tensor)
+                policy_probs = policy_probs.float()
+                reward_predictions = reward_predictions.float()
                 log_probs = torch.log(policy_probs + 1e-8)
                 selected_log_probs = log_probs.gather(1, action_tensor.view(-1, 1)).squeeze(1)
                 predicted_rewards = reward_predictions.gather(1, action_tensor.view(-1, 1)).squeeze(1)
@@ -1148,11 +1204,18 @@ class RemoteBrain:
                 meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
                 if not torch.isfinite(total_loss):
                     LOGGER.warning("Loss became non-finite; skipping update")
+                    if getattr(self, "grad_scaler", None) and self.grad_scaler.is_enabled():
+                        self.grad_scaler.update()
                 else:
-                    total_loss.backward()
+                    scaler = self.grad_scaler if getattr(self, "grad_scaler", None) and self.grad_scaler.is_enabled() else None
+                    if scaler is not None:
+                        scaler.scale(total_loss).backward()
+                        scaler.unscale_(self.optimizer.optimizer)
+                    else:
+                        total_loss.backward()
                     params, dropped, clipped_grads, gradient_norm = self._filter_gradients()
                     if params:
-                        self.optimizer.step()
+                        self.optimizer.step(scaler)
                         weights_ok = self._weights_are_finite()
                         if not weights_ok:
                             LOGGER.error("Model weights contain non-finite values after training step")
@@ -1165,6 +1228,8 @@ class RemoteBrain:
                             else:
                                 self.ema.update(self.model)
                     else:
+                        if scaler is not None:
+                            scaler.update()
                         dropped = max(dropped, 1)
                         gradient_norm = None
                         self.optimizer.zero_grad()
@@ -1331,6 +1396,197 @@ def _execute(endpoint: str, func, *args, **kwargs):
     except Exception as exc:  # pylint: disable=broad-except
         LOGGER.exception("Endpoint '%s' task failed", endpoint)
         raise RuntimeError(f"Failed to process {endpoint} request") from exc
+    finally:
+        MEMORY_MANAGER.maybe_collect()
+
+
+async def _async_execute(endpoint: str, func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(_execute, endpoint, func, *args, **kwargs)
+    return await loop.run_in_executor(None, bound)
+
+
+class StreamProtocolError(Exception):
+    """Raised when a streaming request is malformed."""
+
+
+def _encode_stream_response(payload: Dict[str, Any]) -> bytes:
+    return (json.dumps(payload, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+
+
+async def _stream_handle_ping(_: Dict[str, Any]) -> Dict[str, Any]:
+    return {"pong": True, "timestamp": time.time()}
+
+
+async def _stream_handle_act(message: Dict[str, Any]) -> Dict[str, Any]:
+    brain_id = message.get("brain_id")
+    if not brain_id:
+        raise StreamProtocolError("brain_id is required")
+    brain = require_brain(brain_id)
+    observation = message.get("observation")
+    if not isinstance(observation, (list, tuple)):
+        raise StreamProtocolError("observation must be a list")
+    epsilon = message.get("epsilon", 0.1)
+    try:
+        epsilon_value = float(epsilon)
+    except (TypeError, ValueError):
+        epsilon_value = 0.1
+    result = await _async_execute("act", brain.choose_action, observation, epsilon_value)
+    response_payload = {
+        "action": int(result.get("action", 0)),
+        "weights_ok": bool(result.get("weights_ok", True)),
+        "sanitized": result.get("sanitized") or {},
+    }
+    if "reward_prediction" in result:
+        response_payload["reward_prediction"] = result["reward_prediction"]
+    if "meta" in result:
+        response_payload["meta"] = result["meta"]
+    request_payload = {key: value for key, value in message.items() if key not in {"id", "type"}}
+    log_request(message.get("bot_id"), "act", {**request_payload, **response_payload})
+    return response_payload
+
+
+async def _stream_handle_train(message: Dict[str, Any]) -> Dict[str, Any]:
+    brain_id = message.get("brain_id")
+    if not brain_id:
+        raise StreamProtocolError("brain_id is required")
+    brain = require_brain(brain_id)
+    observation = message.get("observation")
+    if not isinstance(observation, (list, tuple)):
+        raise StreamProtocolError("observation must be a list")
+    next_observation = message.get("next_observation")
+    if not isinstance(next_observation, (list, tuple)):
+        next_observation = None
+    result = await _async_execute(
+        "train",
+        brain.train,
+        observation,
+        message.get("action"),
+        message.get("reward"),
+        message.get("penalty"),
+        next_observation,
+    )
+    response_payload = {
+        "trained": bool(result.get("trained")),
+        "weights_ok": bool(result.get("weights_ok", True)),
+        "dropped_gradients": int(result.get("dropped_gradients", 0)),
+        "sanitized": result.get("sanitized") or {},
+    }
+    if "clipped_gradients" in result:
+        response_payload["clipped_gradients"] = int(result.get("clipped_gradients", 0))
+    if "gradient_norm" in result:
+        response_payload["gradient_norm"] = result.get("gradient_norm")
+    if "reward_prediction" in result:
+        response_payload["reward_prediction"] = result["reward_prediction"]
+    if "meta" in result:
+        response_payload["meta"] = result["meta"]
+    if "hebbian" in result:
+        response_payload["hebbian"] = result["hebbian"]
+    if "learning_rate" in result:
+        response_payload["learning_rate"] = result["learning_rate"]
+    request_payload = {key: value for key, value in message.items() if key not in {"id", "type"}}
+    log_request(message.get("bot_id"), "train", {**request_payload, **response_payload})
+    return response_payload
+
+
+STREAM_HANDLERS = {
+    "ping": _stream_handle_ping,
+    "act": _stream_handle_act,
+    "train": _stream_handle_train,
+}
+
+
+async def _dispatch_stream_message(message: Dict[str, Any]) -> bytes:
+    message_id = message.get("id")
+    message_type = message.get("type")
+    handler = STREAM_HANDLERS.get(message_type)
+    if handler is None:
+        error_payload = {
+            "id": message_id,
+            "type": message_type,
+            "ok": False,
+            "error": {"message": f"Unknown message type: {message_type}"},
+        }
+        return _encode_stream_response(error_payload)
+    try:
+        result = await handler(message)
+        payload = {"id": message_id, "type": message_type, "ok": True, "result": result}
+    except StreamProtocolError as exc:
+        payload = {
+            "id": message_id,
+            "type": message_type,
+            "ok": False,
+            "error": {"message": str(exc)},
+        }
+    except HTTPException as exc:
+        payload = {
+            "id": message_id,
+            "type": message_type,
+            "ok": False,
+            "error": {"message": exc.detail, "status": exc.status_code},
+        }
+    except RuntimeError as exc:
+        payload = {
+            "id": message_id,
+            "type": message_type,
+            "ok": False,
+            "error": {"message": str(exc)},
+        }
+    except Exception:  # pragma: no cover - safety net
+        LOGGER.exception("Unhandled exception while processing stream message")
+        payload = {
+            "id": message_id,
+            "type": message_type,
+            "ok": False,
+            "error": {"message": "Internal server error"},
+        }
+    return _encode_stream_response(payload)
+
+
+async def _iter_stream_messages(request: Request):
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
+    try:
+        async for chunk in request.stream():
+            buffer += decoder.decode(chunk, final=False)
+            while True:
+                newline_index = buffer.find("\n")
+                if newline_index == -1:
+                    break
+                line = buffer[:newline_index].strip()
+                buffer = buffer[newline_index + 1 :]
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    error_payload = {
+                        "id": None,
+                        "type": None,
+                        "ok": False,
+                        "error": {"message": f"Invalid JSON payload: {exc}"},
+                    }
+                    yield _encode_stream_response(error_payload)
+                    continue
+                yield await _dispatch_stream_message(message)
+        tail = decoder.decode(b"", final=True)
+        buffer += tail
+        line = buffer.strip()
+        if line:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError as exc:
+                error_payload = {
+                    "id": None,
+                    "type": None,
+                    "ok": False,
+                    "error": {"message": f"Invalid JSON payload: {exc}"},
+                }
+                yield _encode_stream_response(error_payload)
+            else:
+                yield await _dispatch_stream_message(message)
+    finally:
+        MEMORY_MANAGER.maybe_collect(force=True)
 
 
 def log_request(bot_id: Any, endpoint: str, payload: Dict[str, Any]) -> None:
@@ -1369,6 +1625,11 @@ def log_request(bot_id: Any, endpoint: str, payload: Dict[str, Any]) -> None:
                     bot_state["policy_strikes"] = int(policy_meta["strikes"])
                     bot_state["policy_strike_threshold"] = ACT_SANITIZATION_FORCE_THRESHOLD
                     bot_state["policy_last_sanitized"] = entry["timestamp"]
+
+
+@app.post("/api/brains/stream")
+async def brain_stream_endpoint(request: Request):
+    return StreamingResponse(_iter_stream_messages(request), media_type="application/jsonl")
 
 
 @app.post("/api/brains")
