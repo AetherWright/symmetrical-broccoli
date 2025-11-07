@@ -1,6 +1,6 @@
-# Symmetrical Broccoli Bot Stack
+# Multi-Bot Minecraft Brain Stack
 
-Symmetrical Broccoli contains three cooperating services that power a multi-bot Minecraft experiment:
+This stack contains three cooperating services that power a multi-bot Minecraft experiment:
 
 - **`tf_server.py`** – a FastAPI service that hosts TensorFlow brains with custom optimizers, batching, sanitization, and storage helpers.
 - **`bot.js`** – the Mineflayer controller that spawns a generation of bots, handles lifecycle management, and delegates action selection/training to the remote brain service through `brainClient.js` and the worker pool helpers.
@@ -60,6 +60,20 @@ Key runtime knobs come from environment variables (`process.env`) read in `bot.j
 - `TF_SERVER_URL`, `OBSERVATION_CLAMP` – remote brain endpoint and client-side sanitization clamp.
 
 The worker pool in `brainWorkerPool.js` automatically batches inference/training calls, and bots tick at 20 Hz (50 ms interval) to stay in sync with the Minecraft server loop.
+
+## Reward pipeline
+
+### Client-side shaping
+
+`bot.js` constructs dense rewards by combining many context-sensitive components. Movement, survival, resource gain, social cues, and behavioural diversity each contribute through `applyRewardComponent`, which enforces sign expectations, caps magnitude, and tracks separate positive/negative tallies before combining them into a final scalar.【F:bot.js†L355-L372】【F:bot.js†L4842-L5078】 The accumulator is finalized just before transmission so both the total reward and its decomposed components remain bounded.【F:bot.js†L330-L352】
+
+### Server-side normalization
+
+The FastAPI brain server receives the shaped reward and accompanying penalty tally. `_transform_reward` log-scales both positive reward and penalty components after sanitizing non-finite or negative inputs, then converts them into the single scalar used for optimisation while preserving detailed metadata for debugging.【F:tf_server.py†L1010-L1039】 During training, each batch report echoes the sanitized observation metadata and the reward decomposition to make downstream monitoring consistent with the client-side shaping.【F:tf_server.py†L1180-L1239】
+
+### Learning approach
+
+Training follows an advantage actor-critic style update: the policy head outputs action logits, while a parallel reward head predicts the expected scaled return for each action. The server computes advantages by subtracting the detached reward prediction baseline from the received reward, centres them, and applies a policy-gradient loss alongside a smooth L1 regression loss for the critic head.【F:tf_server.py†L1184-L1195】 This pairing gives the closest analogue to actor-critic reinforcement learning within the system while still leveraging the custom reward shaping described above.
 
 ## Echo integration (optional)
 
