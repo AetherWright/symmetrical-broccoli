@@ -40,6 +40,7 @@ const MC_PORT = 25565
 const BOT_COUNT = Math.max(2, parseInt(process.env.BOT_COUNT ?? '10', 10))
 const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
 const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '200', 10))
+const USE_SHARED_BRAIN = process.env.BOT_SHARED_BRAIN !== 'false'
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
 const PREFIXES = ['', 'Mc', 'Von', 'De', "O'", 'El']
@@ -776,6 +777,7 @@ function deriveMutationStddev(preferred, { jitter = true } = {}) {
 }
 
 function enqueuePendingMutation(context, stddev) {
+  if (USE_SHARED_BRAIN) return
   if (!context) return
   if (!Number.isFinite(stddev) || stddev <= 0) {
     return
@@ -1014,22 +1016,26 @@ function registerNonFiniteStrike(context, reason) {
   tracker.escalations = (tracker.escalations ?? 0) + 1
   tracker.lastEscalationAt = now
 
-  const baseStddev = deriveMutationStddev(null, { jitter: false }) ?? NEW_BRAIN_MUTATION_STDDEV
-  const escalationFactor = Math.max(1, 1 + NON_FINITE_MUTATION_MULTIPLIER * tracker.escalations)
-  const escalatedStddev = Math.min(
-    NEW_BRAIN_MUTATION_MAX,
-    Math.max(NON_FINITE_MUTATION_MIN, baseStddev * escalationFactor)
-  )
-  if (Number.isFinite(escalatedStddev) && escalatedStddev > 0) {
-    if (!Array.isArray(pending.extraMutations)) {
-      pending.extraMutations = []
-    }
-    pending.extraMutations.push(escalatedStddev)
-    console.warn(
-      `[${label(context)}] Escalating ${reason} recovery after ${tracker.total} strike(s); adding mutation ${escalatedStddev.toFixed(
-        3
-      )}.`
+  if (!USE_SHARED_BRAIN) {
+    const baseStddev = deriveMutationStddev(null, { jitter: false }) ?? NEW_BRAIN_MUTATION_STDDEV
+    const escalationFactor = Math.max(1, 1 + NON_FINITE_MUTATION_MULTIPLIER * tracker.escalations)
+    const escalatedStddev = Math.min(
+      NEW_BRAIN_MUTATION_MAX,
+      Math.max(NON_FINITE_MUTATION_MIN, baseStddev * escalationFactor)
     )
+    if (Number.isFinite(escalatedStddev) && escalatedStddev > 0) {
+      if (!Array.isArray(pending.extraMutations)) {
+        pending.extraMutations = []
+      }
+      pending.extraMutations.push(escalatedStddev)
+      console.warn(
+        `[${label(context)}] Escalating ${reason} recovery after ${tracker.total} strike(s); adding mutation ${escalatedStddev.toFixed(
+          3
+        )}.`
+      )
+    }
+  } else {
+    pending.forceReinitialize = true
   }
 
   context.epsilonBoost = Math.max(context.epsilonBoost ?? 0, NON_FINITE_EPSILON_BOOST)
@@ -1084,6 +1090,9 @@ function scheduleWeightRecovery(context, reason = 'unknown', details = {}) {
         : [],
       forceReinitialize: Boolean(context.pendingWeightRecovery?.forceReinitialize)
     }
+    if (USE_SHARED_BRAIN) {
+      context.pendingWeightRecovery.extraMutations = []
+    }
   }
   if (reason === 'act-non-finite' || reason === 'train-non-finite') {
     registerNonFiniteStrike(context, reason)
@@ -1100,6 +1109,12 @@ function scheduleWeightRecovery(context, reason = 'unknown', details = {}) {
 }
 
 function gatherCleanBrainSources({ exclude = [] } = {}) {
+  if (USE_SHARED_BRAIN) {
+    if (baselineBrain && baselineBrain.id && !baselineWeightsSuspect) {
+      return [baselineBrain]
+    }
+    return []
+  }
   const excludeSet = new Set(
     Array.isArray(exclude) ? exclude.filter(Boolean) : [exclude].filter(Boolean)
   )
@@ -1129,6 +1144,19 @@ async function reinitializeContextBrain(context, reason = 'reinitialize', detail
     }
     console.error(`[${label(context)}] Failed to prepare baseline during ${reason}:`, err)
     return { success: false, sourceCount: 0, mode: 'reinitialize-failed' }
+  }
+
+  if (USE_SHARED_BRAIN) {
+    if (!baselineBrain) {
+      return { success: false, sourceCount: 0, mode: 'shared-unavailable' }
+    }
+    context.brain = baselineBrain
+    markContextWeightsHealthy(context, reason)
+    console.warn(
+      `[${label(context)}] Reusing shared baseline brain after ${reason}.`,
+      details
+    )
+    return { success: true, sourceCount: 1, mode: 'shared' }
   }
 
   let brain
@@ -1200,6 +1228,28 @@ async function reinitializeContextBrain(context, reason = 'reinitialize', detail
 async function rebuildContextWeights(context, reason = 'unknown', details = {}) {
   if (!context?.brain?.id) {
     return { success: false, sourceCount: 0, mode: 'none' }
+  }
+
+  if (USE_SHARED_BRAIN) {
+    try {
+      await ensureBaselineReady()
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        throw err
+      }
+      console.error(`[${label(context)}] Failed to refresh shared brain during ${reason}:`, err)
+      return { success: false, sourceCount: 0, mode: 'shared-failed' }
+    }
+    if (!baselineBrain) {
+      return { success: false, sourceCount: 0, mode: 'shared-unavailable' }
+    }
+    context.brain = baselineBrain
+    markContextWeightsHealthy(context, reason)
+    console.warn(
+      `[${label(context)}] Shared baseline brain refreshed for ${reason}.`,
+      details
+    )
+    return { success: true, sourceCount: 1, mode: 'shared' }
   }
 
   const exclude = new Set([context])
@@ -1327,29 +1377,31 @@ async function attemptWeightRecovery(context, trigger = 'tick') {
       return false
     }
 
-    if (outcome?.success) {
-      markContextWeightsHealthy(context, pending.reason)
-      if (Array.isArray(pending.extraMutations) && pending.extraMutations.length) {
-        const extras = pending.extraMutations.splice(0)
-        for (const stddev of extras) {
-          if (!Number.isFinite(stddev) || stddev <= 0) continue
-          try {
-            await mutateWeights(context.brain, Math.min(NEW_BRAIN_MUTATION_MAX, Math.max(0, stddev)))
-          } catch (err) {
-            if (isRemoteBrainUnavailableError(err)) {
-              pending.extraMutations.unshift(stddev)
-              throw err
+      if (outcome?.success) {
+        markContextWeightsHealthy(context, pending.reason)
+        if (!USE_SHARED_BRAIN && Array.isArray(pending.extraMutations) && pending.extraMutations.length) {
+          const extras = pending.extraMutations.splice(0)
+          for (const stddev of extras) {
+            if (!Number.isFinite(stddev) || stddev <= 0) continue
+            try {
+              await mutateWeights(context.brain, Math.min(NEW_BRAIN_MUTATION_MAX, Math.max(0, stddev)))
+            } catch (err) {
+              if (isRemoteBrainUnavailableError(err)) {
+                pending.extraMutations.unshift(stddev)
+                throw err
+              }
+              console.error(
+                `[${label(context)}] Failed to apply escalated mutation (${stddev}) after ${pending.reason}:`,
+                err
+              )
             }
-            console.error(
-              `[${label(context)}] Failed to apply escalated mutation (${stddev}) after ${pending.reason}:`,
-              err
-            )
           }
+        } else if (USE_SHARED_BRAIN && Array.isArray(pending.extraMutations)) {
+          pending.extraMutations.length = 0
         }
-      }
-      const sourceNote =
-        outcome.mode === 'copy' || outcome.mode === 'average'
-          ? ` from ${outcome.sourceCount} clean source${
+        const sourceNote =
+          outcome.mode === 'copy' || outcome.mode === 'average'
+            ? ` from ${outcome.sourceCount} clean source${
               outcome.sourceCount === 1 ? '' : 's'
             }`
           : ''
@@ -2538,6 +2590,14 @@ async function ensureContextBrain(context) {
     throw new Error('Baseline brain failed to initialize')
   }
 
+  if (USE_SHARED_BRAIN) {
+    context.brain = baselineBrain
+    baselineBrain.owner = 'hivemind'
+    context.waitingForBrain = null
+    markContextWeightsHealthy(context, 'shared-baseline')
+    return baselineBrain
+  }
+
   if (context.brain && context.brain.id) {
     context.brain.owner = label(context)
     return context.brain
@@ -3614,6 +3674,7 @@ async function ensureCrossoverBrain(slot) {
 }
 
 async function performPopulationCrossover(sortedContexts) {
+  if (USE_SHARED_BRAIN) return
   if (!baselineBrain) return
   if (!Array.isArray(sortedContexts) || !sortedContexts.length) return
 
@@ -5576,11 +5637,19 @@ async function synchronizeGeneration() {
     const dominancePlan = deriveLineageDominancePlan(lineageCounts, contexts.length)
     if (dominancePlan) {
       dominancePlan.stats.lastDominanceMitigation = dominancePlan.generation
-      console.warn(
-        `[Baseline] Lineage ${dominancePlan.lineage} controls ${(dominancePlan.share * 100).toFixed(
-          1
-        )}% of bots (gap ${(dominancePlan.gap * 100).toFixed(1)}%). Diversifying offspring with extra mutations.`
-      )
+      if (USE_SHARED_BRAIN) {
+        console.warn(
+          `[Baseline] Lineage ${dominancePlan.lineage} controls ${(dominancePlan.share * 100).toFixed(
+            1
+          )}% of bots (gap ${(dominancePlan.gap * 100).toFixed(1)}%). Shared brain mode active; diversification skipped.`
+        )
+      } else {
+        console.warn(
+          `[Baseline] Lineage ${dominancePlan.lineage} controls ${(dominancePlan.share * 100).toFixed(
+            1
+          )}% of bots (gap ${(dominancePlan.gap * 100).toFixed(1)}%). Diversifying offspring with extra mutations.`
+        )
+      }
     }
     await ensureBaselineReady()
 
@@ -5593,33 +5662,35 @@ async function synchronizeGeneration() {
     const topReward = sorted[0]?.generationReward ?? -Infinity
     const averageReward = contexts.reduce((sum, ctx) => sum + ctx.generationReward, 0) / contexts.length
 
-    const templateSources = []
-    for (const candidate of sorted) {
-      if (candidate?.brain?.id && !candidate.weightsSuspect) {
-        templateSources.push(candidate.brain)
-      }
-      if (templateSources.length >= TEMPLATE_TOP_BRAINS) {
-        break
-      }
-    }
-
-    if (templateSources.length) {
-      try {
-        await averageWeights(baselineBrain, templateSources)
-        markBaselineWeightsHealthy('template-average')
-        console.log(
-          `[Baseline] Updated template from top ${templateSources.length} brain${
-            templateSources.length === 1 ? '' : 's'
-          }.`
-        )
-      } catch (err) {
-        if (isRemoteBrainUnavailableError(err)) {
-          throw err
+    if (!USE_SHARED_BRAIN) {
+      const templateSources = []
+      for (const candidate of sorted) {
+        if (candidate?.brain?.id && !candidate.weightsSuspect) {
+          templateSources.push(candidate.brain)
         }
-        console.error('[Baseline] Failed to average top brains into template:', err)
+        if (templateSources.length >= TEMPLATE_TOP_BRAINS) {
+          break
+        }
       }
-    } else {
-      console.log('[Baseline] Skipped template averaging — no trained brains available.')
+
+      if (templateSources.length) {
+        try {
+          await averageWeights(baselineBrain, templateSources)
+          markBaselineWeightsHealthy('template-average')
+          console.log(
+            `[Baseline] Updated template from top ${templateSources.length} brain${
+              templateSources.length === 1 ? '' : 's'
+            }.`
+          )
+        } catch (err) {
+          if (isRemoteBrainUnavailableError(err)) {
+            throw err
+          }
+          console.error('[Baseline] Failed to average top brains into template:', err)
+        }
+      } else {
+        console.log('[Baseline] Skipped template averaging — no trained brains available.')
+      }
     }
 
     if (topReward > bestGenerationReward + 0.5) {
@@ -6381,8 +6452,10 @@ function createContext(index, options = {}) {
   const explicitMutation = Number.isFinite(options.mutationStddev) && options.mutationStddev >= 0
     ? options.mutationStddev
     : null
-  const primaryMutation = deriveMutationStddev(explicitMutation, { jitter: explicitMutation == null })
-  const extraMutations = Array.isArray(options.extraMutations)
+  const primaryMutation = USE_SHARED_BRAIN
+    ? null
+    : deriveMutationStddev(explicitMutation, { jitter: explicitMutation == null })
+  const extraMutations = !USE_SHARED_BRAIN && Array.isArray(options.extraMutations)
     ? options.extraMutations
         .map(value => deriveMutationStddev(value, { jitter: false }))
         .filter(value => Number.isFinite(value) && value > 0)
