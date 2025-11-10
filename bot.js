@@ -921,7 +921,48 @@ function ensureRemoteBrainTracker(context) {
   return context.remoteBrain
 }
 
-function noteRemoteBrainOffline(context, status, source) {
+function clearBackendRetry(context) {
+  if (!context) return
+  if (context.backendRetryTimer) {
+    clearTimeout(context.backendRetryTimer)
+    context.backendRetryTimer = null
+  }
+  context.backendRetryAt = 0
+}
+
+function scheduleBackendRetry(context, status) {
+  if (!context || !globalRunning || !context.running) return
+  const now = Date.now()
+  let delay = 0
+  if (status?.retryAt && status.retryAt > now) {
+    delay = status.retryAt - now
+  } else if (Number.isFinite(status?.retryDelay) && status.retryDelay > 0) {
+    delay = status.retryDelay
+  }
+  if (!Number.isFinite(delay) || delay <= 0) {
+    delay = 1000
+  }
+  const target = now + delay
+  if (context.backendRetryTimer && context.backendRetryAt && context.backendRetryAt <= target) {
+    return
+  }
+  if (context.backendRetryTimer) {
+    clearTimeout(context.backendRetryTimer)
+  }
+  context.backendRetryAt = target
+  context.backendRetryTimer = setTimeout(() => {
+    context.backendRetryTimer = null
+    context.backendRetryAt = 0
+    if (!globalRunning || !context.running) {
+      return
+    }
+    if (context.waitingForBrain) {
+      scheduleTick(context, 'backend-retry')
+    }
+  }, delay)
+}
+
+function noteRemoteBrainOffline(context, status, source, { fallbackReady = false } = {}) {
   const tracker = ensureRemoteBrainTracker(context)
   const now = Date.now()
   const message = source?.message ?? status?.lastError ?? 'Remote brain unavailable'
@@ -935,7 +976,17 @@ function noteRemoteBrainOffline(context, status, source) {
     tracker.lastMessage = message
     tracker.nextLogAt = now + 5000
   }
+  const wasWaiting = Boolean(context.waitingForBrain)
+  if (fallbackReady) {
+    clearBackendRetry(context)
+    context.waitingForBrain = false
+    if (wasWaiting) {
+      noteEnvironmentChange(context, 'fallback-backend-online')
+    }
+    return
+  }
   context.waitingForBrain = true
+  scheduleBackendRetry(context, status)
 }
 
 function noteRemoteBrainOnline(context) {
@@ -947,6 +998,7 @@ function noteRemoteBrainOnline(context) {
   tracker.offlineNotified = false
   tracker.lastMessage = null
   tracker.nextLogAt = 0
+  clearBackendRetry(context)
   const wasWaiting = Boolean(context.waitingForBrain)
   context.waitingForBrain = false
   if (wasWaiting) {
@@ -5519,7 +5571,9 @@ async function tickLoop(context) {
 
     if (remoteUnavailable) {
       const status = getRemoteBrainStatus()
-      noteRemoteBrainOffline(context, status, remoteIssue)
+      noteRemoteBrainOffline(context, status, remoteIssue, {
+        fallbackReady: Boolean(context.echoFallbackActive)
+      })
     } else {
       noteRemoteBrainOnline(context)
       if (deferredBaselineSaveReason && !saveInFlight && isRemoteBrainConnected()) {
@@ -6275,6 +6329,7 @@ async function retireContext(context, reason = 'retire') {
   }
   context.pendingEnvironmentTick = false
   context.pendingEnvironmentReason = null
+  clearBackendRetry(context)
   if (context.reconnectTimer) {
     clearTimeout(context.reconnectTimer)
     context.reconnectTimer = null
@@ -6475,6 +6530,8 @@ function createContext(index, options = {}) {
     feralFury: 0,
     bot,
     brain: null,
+    backendRetryTimer: null,
+    backendRetryAt: 0,
     weightsSuspect: false,
     pendingWeightRecovery: null,
     weightRecoveryInFlight: null,
