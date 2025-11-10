@@ -233,9 +233,8 @@ BRAIN_CONFIG = {
     "lookahead_sync": 6,
     "lookahead_alpha": 0.5,
     "ema_decay": 0.995,
-    "meta_hidden": 96,
-    "meta_state_momentum": 0.9,
     "reward_prediction_weight": 0.35,
+    "bot_heads": 4,
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
@@ -583,43 +582,21 @@ class BrainModel(torch.nn.Module):
         self.transformer_input_norm = torch.nn.LayerNorm(self.transformer_embed)
         self.transformer_output_norm = torch.nn.LayerNorm(self.transformer_embed)
         self.transformer_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.transformer_merge = torch.nn.Linear(total_transformer_dim, BRAIN_CONFIG["shared_units"])
-        self.context_gate = torch.nn.Linear(BRAIN_CONFIG["shared_units"] * 2, BRAIN_CONFIG["shared_units"])
-        self.policy_dense = torch.nn.Linear(BRAIN_CONFIG["shared_units"], BRAIN_CONFIG["shared_units"])
-        self.policy_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.reward_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
-        self.action_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
         self.action_count = action_count
-        meta_hidden = max(8, int(BRAIN_CONFIG.get("meta_hidden", 32)))
-        meta_input_dim = BRAIN_CONFIG["shared_units"] + action_count
-        self.meta_controller = torch.nn.GRU(meta_input_dim, meta_hidden, batch_first=True)
-        self.meta_to_scale = torch.nn.Linear(meta_hidden, BRAIN_CONFIG["shared_units"])
-        self.meta_to_shift = torch.nn.Linear(meta_hidden, BRAIN_CONFIG["shared_units"])
-        self.meta_state_momentum = float(min(max(BRAIN_CONFIG.get("meta_state_momentum", 0.9), 0.0), 0.999))
+        self.transformer_heads = max(1, int(BRAIN_CONFIG["transformer_heads"]))
+        configured_bot_heads = max(1, int(BRAIN_CONFIG.get("bot_heads", self.transformer_heads)))
+        self.bot_heads = math.gcd(configured_bot_heads, self.transformer_embed) or 1
+        self.head_dim = self.transformer_embed // self.bot_heads
+        self.actions_per_head = max(1, math.ceil(self.action_count / self.bot_heads))
         self.register_buffer(
-            "meta_state",
-            torch.zeros(1, meta_hidden, dtype=FLOAT_POLICY["dtype"]),
+            "_meta_stub",
+            torch.zeros(1, dtype=FLOAT_POLICY["dtype"]),
             persistent=False,
         )
 
     @staticmethod
     def _activate(tensor: torch.Tensor) -> torch.Tensor:
         return natural_log_relu(tensor)
-
-    def _update_meta_state(self, new_state: torch.Tensor) -> None:
-        if not isinstance(new_state, torch.Tensor):
-            return
-        with torch.no_grad():
-            mean_state = new_state.mean(dim=1)
-            if mean_state.dtype != self.meta_state.dtype or mean_state.device != self.meta_state.device:
-                mean_state = mean_state.to(device=self.meta_state.device, dtype=self.meta_state.dtype)
-            finite_mask = torch.isfinite(mean_state)
-            if not torch.all(finite_mask):
-                cleaned = torch.where(finite_mask, mean_state, torch.zeros_like(mean_state))
-            else:
-                cleaned = mean_state
-            momentum = self.meta_state_momentum
-            self.meta_state.mul_(momentum).add_(cleaned, alpha=1.0 - momentum)
 
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if inputs.dim() != 2:
@@ -654,30 +631,43 @@ class BrainModel(torch.nn.Module):
         transformer_state = self.transformer_encoder(transformer_state)
         transformer_state = self.transformer_output_norm(transformer_state)
         transformer_state = self.transformer_dropout(transformer_state)
-        transformer_state = transformer_state.reshape(shared.size(0), -1)
-        transformer_features = self.transformer_merge(transformer_state)
-        gate_input = torch.cat([shared, transformer_features], dim=-1)
-        context_weights = torch.sigmoid(self.context_gate(gate_input))
-        shared = shared + context_weights * transformer_features
-        policy_features = self._activate(self.policy_dense(shared))
-        policy_features = self.policy_dropout(policy_features)
-        reward_prediction = self.reward_head(policy_features)
-        meta_input = torch.cat([policy_features, reward_prediction], dim=-1).unsqueeze(1)
-        initial_state = self.meta_state.to(device=inputs.device, dtype=inputs.dtype)
-        initial_state = initial_state.expand(meta_input.size(0), -1).contiguous()
-        initial_state = initial_state.unsqueeze(0).detach()
-        meta_output, new_state = self.meta_controller(meta_input, initial_state)
-        meta_features = meta_output.squeeze(1)
-        scale = torch.sigmoid(self.meta_to_scale(meta_features))
-        shift = self.meta_to_shift(meta_features)
-        adapted_features = policy_features * scale + shift
-        logits = self.action_head(adapted_features)
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        self._update_meta_state(new_state.detach())
+        transformer_state = transformer_state.reshape(
+            shared.size(0), self.transformer_tokens, self.bot_heads, self.head_dim
+        )
+        head_features = transformer_state.permute(0, 2, 1, 3)
+        head_features = head_features.reshape(
+            shared.size(0), self.bot_heads, self.transformer_tokens * self.head_dim
+        )
+        if head_features.size(-1) < self.actions_per_head:
+            pad = torch.zeros(
+                head_features.size(0),
+                head_features.size(1),
+                self.actions_per_head - head_features.size(-1),
+                device=head_features.device,
+                dtype=head_features.dtype,
+            )
+            head_features = torch.cat([head_features, pad], dim=-1)
+        else:
+            head_features = head_features[:, :, : self.actions_per_head]
+        flat_features = head_features.reshape(head_features.size(0), -1)
+        if flat_features.size(-1) < self.action_count:
+            pad = torch.zeros(
+                flat_features.size(0),
+                self.action_count - flat_features.size(-1),
+                device=flat_features.device,
+                dtype=flat_features.dtype,
+            )
+            flat_features = torch.cat([flat_features, pad], dim=-1)
+        policy_logits = flat_features[:, : self.action_count]
+        probs = torch.nn.functional.softmax(policy_logits, dim=-1)
+        reward_prediction = policy_logits
         return probs, reward_prediction
 
     def hebbian_layers(self) -> List[HebbianLinear]:
         return [self.hebbian_dense_1, self.hebbian_dense_2]
+
+    def meta_state_norm(self) -> torch.Tensor:
+        return self._meta_stub
 
 
 class RemoteBrain:
@@ -853,6 +843,19 @@ class RemoteBrain:
         tensor = torch.from_numpy(array.astype(NP_FLOAT, copy=False)).to(self.device)
         return tensor
 
+    def _get_meta_state_norm(self) -> float:
+        meta_ref = getattr(self.model, "meta_state_norm", None)
+        if callable(meta_ref):
+            value = meta_ref()
+        else:
+            value = meta_ref
+        if isinstance(value, torch.Tensor):
+            try:
+                return float(value.detach().abs().max().item())
+            except Exception:  # pragma: no cover - defensive
+                return 0.0
+        return 0.0
+
     def choose_actions_batch(self, observations: List[Any], epsilons: List[float]) -> List[Dict[str, Any]]:
         with self._lock:
             self.model.eval()
@@ -896,7 +899,7 @@ class RemoteBrain:
                         reward_predictions = reward_predictions.float()
                         probs = policy_probs.cpu().numpy().astype(NP_FLOAT, copy=False)
                         reward_predictions_np = reward_predictions.cpu().numpy().astype(NP_FLOAT, copy=False)
-                        meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
+                        meta_state_norm = self._get_meta_state_norm()
                     finally:
                         if ema_applied:
                             self.ema.restore(self.model)
@@ -1088,7 +1091,7 @@ class RemoteBrain:
                             "advantage": 0.0,
                         },
                         "meta": {
-                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "state_norm": self._get_meta_state_norm(),
                             "policy_loss": 0.0,
                         },
                     }
@@ -1124,7 +1127,7 @@ class RemoteBrain:
                             "advantage": 0.0,
                         },
                         "meta": {
-                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "state_norm": self._get_meta_state_norm(),
                             "policy_loss": 0.0,
                         },
                     }
@@ -1157,7 +1160,7 @@ class RemoteBrain:
                             "advantage": 0.0,
                         },
                         "meta": {
-                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "state_norm": self._get_meta_state_norm(),
                             "policy_loss": 0.0,
                         },
                     }
@@ -1201,7 +1204,7 @@ class RemoteBrain:
                 weight_meta = {"sanitized": False, "replaced": 0, "clipped": 0}
                 policy_loss_value = float(policy_loss.detach().cpu().item())
                 prediction_loss_value = float(prediction_loss.detach().cpu().item())
-                meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
+                meta_state_norm = self._get_meta_state_norm()
                 if not torch.isfinite(total_loss):
                     LOGGER.warning("Loss became non-finite; skipping update")
                     if getattr(self, "grad_scaler", None) and self.grad_scaler.is_enabled():
@@ -1268,7 +1271,7 @@ class RemoteBrain:
                             "policy_loss": policy_loss_value,
                         },
                     }
-            idle_meta_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
+            idle_meta_norm = self._get_meta_state_norm()
             final_results = [
                 value
                 if value is not None
