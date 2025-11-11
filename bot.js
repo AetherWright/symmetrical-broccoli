@@ -1663,6 +1663,24 @@ const MEMORY_AGGREGATE_COUNT = 13
 const MEMORY_OBS_SIZE = MEMORY_REWARD_WINDOW + MEMORY_ACTION_WINDOW + MEMORY_AGGREGATE_COUNT
 const MEMORY_OBS_START = BASE_OBS_FEATURES
 const OBS_SIZE = BASE_OBS_FEATURES + MEMORY_OBS_SIZE
+
+const OBS_MOTION_PASSTHROUGH_INDICES = (() => {
+  const set = new Set([3, 4, 5])
+  const communicationDirectionBase = 58 + COMMUNICATION_TYPE_COUNT * 2
+  set.add(communicationDirectionBase)
+  set.add(communicationDirectionBase + 1)
+  return set
+})()
+
+const OBS_FILTERED_INDICES = new Set([
+  56 + COMMUNICATION_TYPE_COUNT * 2 + 5
+])
+
+const OBS_DIFFERENTIAL_WRAP = new Map([
+  [6, Math.PI * 2],
+  [7, Math.PI * 2],
+  [22, 1]
+])
 const NOVELTY_HASH_PRECISION = 2
 const NOVELTY_TARGET = 500
 const CONTEXT_TICK_NORMALIZER = readNumberEnv('BOT_CONTEXT_TICK_NORMALIZER', 2400, { min: 240, max: 48000 })
@@ -3626,6 +3644,55 @@ function ensureEmotionVector(context) {
   return context.emotion
 }
 
+function computeWrappedDelta(current, previous, period) {
+  if (!Number.isFinite(current) || !Number.isFinite(previous)) {
+    return 0
+  }
+  if (!Number.isFinite(period) || period <= 0) {
+    return current - previous
+  }
+  let delta = current - previous
+  const halfPeriod = period / 2
+  while (delta > halfPeriod) {
+    delta -= period
+  }
+  while (delta < -halfPeriod) {
+    delta += period
+  }
+  return delta
+}
+
+function computeObservationDifferential(current, previous) {
+  const diff = new Float32Array(current.length)
+  let filtered = 0
+  for (let i = 0; i < current.length; i++) {
+    const value = Number.isFinite(current[i]) ? current[i] : 0
+    if (OBS_FILTERED_INDICES.has(i)) {
+      diff[i] = 0
+      filtered += 1
+      continue
+    }
+    if (OBS_MOTION_PASSTHROUGH_INDICES.has(i)) {
+      diff[i] = value
+      continue
+    }
+    if (!previous || !Number.isFinite(previous[i])) {
+      diff[i] = 0
+      filtered += 1
+      continue
+    }
+    const period = OBS_DIFFERENTIAL_WRAP.get(i) ?? 0
+    const delta = period ? computeWrappedDelta(value, previous[i], period) : value - previous[i]
+    if (!Number.isFinite(delta)) {
+      diff[i] = 0
+      filtered += 1
+    } else {
+      diff[i] = delta
+    }
+  }
+  return { diff, filtered }
+}
+
 function adjustMorale(context, reward) {
   const accumulator = ensureRewardAccumulator(reward)
   if (!context.morale) {
@@ -3771,12 +3838,15 @@ async function performPopulationCrossover(sortedContexts) {
 
 function gatherObservations(context) {
   const { bot } = context
-  const obs = new Float32Array(OBS_SIZE)
+  const observation = new Float32Array(OBS_SIZE)
 
   if (!bot?.entity?.position) {
-    return obs
+    context.currentObservationFrame = null
+    context.observationFilteredCount = BASE_OBS_FEATURES
+    return observation
   }
 
+  const frame = new Float32Array(BASE_OBS_FEATURES)
   const pos = bot.entity.position
   const vel = bot.entity.velocity ?? { x: 0, y: 0, z: 0 }
   const yaw = bot.entity?.yaw ?? 0
@@ -3803,139 +3873,146 @@ function gatherObservations(context) {
 
   const invTotal = inv.reduce((sum, item) => sum + (item?.count ?? 0), 0)
 
-  obs[0] = Number(pos.x) || 0
-  obs[1] = Number(pos.y) || 0
-  obs[2] = Number(pos.z) || 0
-  obs[3] = Number(vel.x) || 0
-  obs[4] = Number(vel.y) || 0
-  obs[5] = Number(vel.z) || 0
-  obs[6] = Number(yaw) || 0
-  obs[7] = Number(pitch) || 0
-  obs[8] = Number(bot.health ?? 20) || 0
-  obs[9] = Number(bot.food ?? 20) || 0
-  obs[10] = Number(bot.oxygenLevel ?? bot.oxygen ?? 20) || 0
-  obs[11] = bot.entity?.onGround ? 1 : 0
-  obs[12] = bot.controlState?.sprint ? 1 : 0
-  obs[13] = bot.controlState?.sneak ? 1 : 0
-  obs[14] = Number(bot.time?.age ?? 0) || 0
-  obs[15] = entities.length
-  obs[16] = nearestEntityDist
-  obs[17] = inv.length
-  obs[18] = invTotal
-  obs[19] = Number(bot.quickBarSlot ?? 0)
-  obs[20] = Number(bot.experience?.level ?? 0)
-  obs[21] = Number(bot.experience?.progress ?? 0)
+  frame[0] = Number(pos.x) || 0
+  frame[1] = Number(pos.y) || 0
+  frame[2] = Number(pos.z) || 0
+  frame[3] = Number(vel.x) || 0
+  frame[4] = Number(vel.y) || 0
+  frame[5] = Number(vel.z) || 0
+  frame[6] = Number(yaw) || 0
+  frame[7] = Number(pitch) || 0
+  frame[8] = Number(bot.health ?? 20) || 0
+  frame[9] = Number(bot.food ?? 20) || 0
+  frame[10] = Number(bot.oxygenLevel ?? bot.oxygen ?? 20) || 0
+  frame[11] = bot.entity?.onGround ? 1 : 0
+  frame[12] = bot.controlState?.sprint ? 1 : 0
+  frame[13] = bot.controlState?.sneak ? 1 : 0
+  frame[14] = Number(bot.time?.age ?? 0) || 0
+  frame[15] = entities.length
+  frame[16] = nearestEntityDist
+  frame[17] = inv.length
+  frame[18] = invTotal
+  frame[19] = Number(bot.quickBarSlot ?? 0)
+  frame[20] = Number(bot.experience?.level ?? 0)
+  frame[21] = Number(bot.experience?.progress ?? 0)
   const timeOfDay = Number(bot.time?.timeOfDay ?? bot.time?.day ?? bot.time?.age ?? 0)
   const normalizedTime = Number.isFinite(timeOfDay) ? ((timeOfDay % 24000) / 24000) : 0
   const isDay = normalizedTime >= 0.25 && normalizedTime <= 0.75 ? 1 : 0
   const weatherState = bot.world?.weather ?? (bot.isRaining ? 'rain' : 'clear')
   const raining = bot.isRaining || weatherState === 'rain' || weatherState === 'thunder' ? 1 : 0
   const thundering = bot.isThundering || weatherState === 'thunder' ? 1 : 0
-  obs[22] = normalizedTime
-  obs[23] = isDay
-  obs[24] = raining ? 1 : 0
-  obs[25] = thundering ? 1 : 0
+  frame[22] = normalizedTime
+  frame[23] = isDay
+  frame[24] = raining ? 1 : 0
+  frame[25] = thundering ? 1 : 0
 
   trackEnvironmentAwareness(context)
-  trackNovelty(context, obs)
+  trackNovelty(context, frame)
 
   const uniqueStateRatio = Math.min(1, context.visitedStates.size / NOVELTY_TARGET)
   const uniqueBlocksRatio = Math.min(1, context.visitedBlocks.size / 200)
   const uniqueBiomesRatio = Math.min(1, context.visitedBiomes.size / 32)
-  obs[26] = uniqueStateRatio
-  obs[27] = uniqueBlocksRatio
-  obs[28] = uniqueBiomesRatio
+  frame[26] = uniqueStateRatio
+  frame[27] = uniqueBlocksRatio
+  frame[28] = uniqueBiomesRatio
 
-  obs[29] = Math.min(1, context.resources.wood / 64)
-  obs[30] = Math.min(1, context.resources.stone / 128)
-  obs[31] = Math.min(1, context.resources.ore / 64)
-  obs[32] = Math.min(1, context.resources.crafted / 32)
-  obs[33] = Math.min(1, context.resourceLedger.contributed / 128)
-  obs[34] = Math.min(1, context.resourceLedger.withdrawn / 128)
-  obs[35] = Math.min(1, context.behaviorEntropy)
-  obs[36] = Math.min(1, context.currentChainScore)
-  obs[37] = context.stagnation.active ? 1 : 0
+  frame[29] = Math.min(1, context.resources.wood / 64)
+  frame[30] = Math.min(1, context.resources.stone / 128)
+  frame[31] = Math.min(1, context.resources.ore / 64)
+  frame[32] = Math.min(1, context.resources.crafted / 32)
+  frame[33] = Math.min(1, context.resourceLedger.contributed / 128)
+  frame[34] = Math.min(1, context.resourceLedger.withdrawn / 128)
+  frame[35] = Math.min(1, context.behaviorEntropy)
+  frame[36] = Math.min(1, context.currentChainScore)
+  frame[37] = context.stagnation.active ? 1 : 0
   const emotion = ensureEmotionVector(context)
-  obs[38] = emotion[0] ?? MORALE_BASELINE
-  obs[39] = emotion[1] ?? 0
-  obs[40] = emotion[2] ?? 0.5
-  obs[41] = context.mode === 'feral' ? 1 : 0
+  frame[38] = emotion[0] ?? MORALE_BASELINE
+  frame[39] = emotion[1] ?? 0
+  frame[40] = emotion[2] ?? 0.5
+  frame[41] = context.mode === 'feral' ? 1 : 0
   const lineagePrestige = getLineagePrestige(context.lineage)
-  obs[42] = Math.max(0, Math.min(1, lineagePrestige))
+  frame[42] = Math.max(0, Math.min(1, lineagePrestige))
   const diversityRatio = Math.min(1, GLOBAL_RESOURCE_POOL.diversity.size / RESOURCE_TYPES.length)
-  obs[43] = diversityRatio
+  frame[43] = diversityRatio
 
   const tickCount = Number.isFinite(context.tickCount) ? context.tickCount : 0
-  obs[44] = normalizePositive(tickCount, CONTEXT_TICK_NORMALIZER)
+  frame[44] = normalizePositive(tickCount, CONTEXT_TICK_NORMALIZER)
   const trainingSteps = Number.isFinite(context.trainingSteps) ? context.trainingSteps : 0
-  obs[45] = normalizePositive(trainingSteps, CONTEXT_TRAINING_NORMALIZER)
+  frame[45] = normalizePositive(trainingSteps, CONTEXT_TRAINING_NORMALIZER)
   const cumulativeReward = Number.isFinite(context.cumulativeReward) ? context.cumulativeReward : 0
-  obs[46] = normalizeMagnitude(cumulativeReward, CONTEXT_REWARD_NORMALIZER)
+  frame[46] = normalizeMagnitude(cumulativeReward, CONTEXT_REWARD_NORMALIZER)
   const noveltyTotal = Number.isFinite(context.noveltyCount) ? context.noveltyCount : 0
-  obs[47] = normalizePositive(noveltyTotal, NOVELTY_COUNT_NORMALIZER)
+  frame[47] = normalizePositive(noveltyTotal, NOVELTY_COUNT_NORMALIZER)
 
   const feralFury = Number.isFinite(context.feralFury) ? Math.max(0, context.feralFury) : 0
-  obs[48] = normalizePositive(feralFury, FERAL_FURY_NORMALIZER)
+  frame[48] = normalizePositive(feralFury, FERAL_FURY_NORMALIZER)
   const cooperationScore = Number.isFinite(context.cooperationScore) ? context.cooperationScore : 0
-  obs[49] = normalizeMagnitude(cooperationScore, COOPERATION_CLAMP)
+  frame[49] = normalizeMagnitude(cooperationScore, COOPERATION_CLAMP)
   const epsilon = Number.isFinite(context.epsilon) ? Math.max(0, context.epsilon) : EPSILON_START
-  obs[50] = normalizePositive(epsilon, EPSILON_NORMALIZER)
+  frame[50] = normalizePositive(epsilon, EPSILON_NORMALIZER)
   const epsilonBoost = Number.isFinite(context.epsilonBoost) ? Math.abs(context.epsilonBoost) : 0
-  obs[51] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
+  frame[51] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
   const morale = context.morale ?? { successStreak: 0, failureStreak: 0, frustration: 0, sharpness: 0.5 }
-  obs[52] = normalizePositive(Number(morale.successStreak) || 0, STREAK_NORMALIZER)
-  obs[53] = normalizePositive(Number(morale.failureStreak) || 0, STREAK_NORMALIZER)
-  obs[54] = normalizeMagnitude(Number(morale.frustration) || 0, MORALE_FRUSTRATION_CLAMP)
-  obs[55] = normalizeMagnitude(Number(morale.sharpness) || 0, MORALE_SHARPNESS_CLAMP)
+  frame[52] = normalizePositive(Number(morale.successStreak) || 0, STREAK_NORMALIZER)
+  frame[53] = normalizePositive(Number(morale.failureStreak) || 0, STREAK_NORMALIZER)
+  frame[54] = normalizeMagnitude(Number(morale.frustration) || 0, MORALE_FRUSTRATION_CLAMP)
+  frame[55] = normalizeMagnitude(Number(morale.sharpness) || 0, MORALE_SHARPNESS_CLAMP)
 
   const comm = ensureCommunicationState(context)
   const commSummary = comm?.summary
   if (commSummary) {
     for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
       const allyValue = Number.isFinite(commSummary.allies?.[i]) ? commSummary.allies[i] : 0
-      obs[56 + i] = normalizePositive(allyValue, COMMUNICATION_INTENSITY_CLAMP)
+      frame[56 + i] = normalizePositive(allyValue, COMMUNICATION_INTENSITY_CLAMP)
     }
     for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
       const otherValue = Number.isFinite(commSummary.others?.[i]) ? commSummary.others[i] : 0
-      obs[56 + COMMUNICATION_TYPE_COUNT + i] = normalizePositive(otherValue, COMMUNICATION_INTENSITY_CLAMP)
+      frame[56 + COMMUNICATION_TYPE_COUNT + i] = normalizePositive(otherValue, COMMUNICATION_INTENSITY_CLAMP)
     }
     const now = Date.now()
     const lastSentAgo = comm?.lastSentAt ? Math.max(0, now - comm.lastSentAt) : Number.POSITIVE_INFINITY
     const lastHeardAgo = comm?.lastHeardAt ? Math.max(0, now - comm.lastHeardAt) : Number.POSITIVE_INFINITY
     const sentFreshness = 1 - normalizePositive(lastSentAgo, COMMUNICATION_TIME_NORMALIZER)
     const heardFreshness = 1 - normalizePositive(lastHeardAgo, COMMUNICATION_TIME_NORMALIZER)
-    obs[56 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, sentFreshness))
-    obs[57 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, heardFreshness))
+    frame[56 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, sentFreshness))
+    frame[57 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, heardFreshness))
     const direction = commSummary.direction ?? { x: 0, z: 0 }
-    obs[58 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+    frame[58 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
       Number(direction.x) || 0,
       COMMUNICATION_DIRECTION_NORMALIZER
     )
-    obs[59 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+    frame[59 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
       Number(direction.z) || 0,
       COMMUNICATION_DIRECTION_NORMALIZER
     )
   } else {
     for (let i = 0; i < COMMUNICATION_TYPE_COUNT * 2 + 4; i++) {
-      obs[56 + i] = 0
+      frame[56 + i] = 0
     }
   }
 
   const rewardSignalIndex = 56 + COMMUNICATION_TYPE_COUNT * 2 + 4
   const rewardSignal = updateRewardEventAwareness(context)
   const rewardSignalAmount = normalizePositive(rewardSignal?.amount ?? 0, REWARD_EVENT_VALUE_CLAMP)
-  obs[rewardSignalIndex] = rewardSignalAmount
-  obs[rewardSignalIndex + 1] = Math.max(0, Math.min(1, rewardSignal?.reason ?? 0))
-  obs[rewardSignalIndex + 2] = Math.max(0, Math.min(1, rewardSignal?.freshness ?? 0))
+  frame[rewardSignalIndex] = rewardSignalAmount
+  frame[rewardSignalIndex + 1] = 0
+  frame[rewardSignalIndex + 2] = Math.max(0, Math.min(1, rewardSignal?.freshness ?? 0))
   const affinityState = ensureGroupAffinityState(context)
   const affinitySame = normalizePositive(affinityState?.same ?? 0, GROUP_AFFINITY_CLAMP)
   const affinityOther = normalizePositive(affinityState?.other ?? 0, GROUP_AFFINITY_CLAMP)
-  obs[rewardSignalIndex + 3] = affinitySame
-  obs[rewardSignalIndex + 4] = affinityOther
+  frame[rewardSignalIndex + 3] = affinitySame
+  frame[rewardSignalIndex + 4] = affinityOther
 
-  populateMemoryObservation(context, obs, MEMORY_OBS_START)
+  const previousFrame = context.lastObservationFrame
+  const { diff, filtered } = computeObservationDifferential(frame, previousFrame)
+  observation.set(diff, 0)
+  populateMemoryObservation(context, observation, MEMORY_OBS_START)
 
-  return sanitizeVector(obs)
+  context.lastObservationFrame = frame
+  context.currentObservationFrame = frame
+  context.observationFilteredCount = filtered
+
+  return sanitizeVector(observation)
 }
 
 async function equipBestTool(context, preferredKeywords = []) {
@@ -4956,7 +5033,14 @@ function computeCrowdingPenalty(context, now = Date.now()) {
   return limitPositive(penalty, CROWDING_PENALTY_CLAMP)
 }
 
-function computeReward(context, obs) {
+function computeReward(context) {
+  const frame =
+    (context.currentObservationFrame instanceof Float32Array && context.currentObservationFrame.length >= BASE_OBS_FEATURES)
+      ? context.currentObservationFrame
+      : context.lastObservationFrame
+  if (!(frame instanceof Float32Array)) {
+    return createRewardAccumulator()
+  }
   let reward = createRewardAccumulator()
 
   ensureTemporalMemoryState(context)
@@ -4964,7 +5048,7 @@ function computeReward(context, obs) {
   context.damageDebt = limitPositive((context.damageDebt ?? 0) * DAMAGE_DEBT_DECAY, DAMAGE_MEMORY_CLAMP)
   context.recentDamage = limitPositive((context.recentDamage ?? 0) * DAMAGE_RECENT_DECAY, DAMAGE_MEMORY_CLAMP)
 
-  const pos = { x: obs[0], y: obs[1], z: obs[2] }
+  const pos = { x: frame[0], y: frame[1], z: frame[2] }
   if (context.lastPos) {
     const dx = pos.x - context.lastPos.x
     const dy = pos.y - context.lastPos.y
@@ -4994,7 +5078,7 @@ function computeReward(context, obs) {
     )
   }
 
-  const health = obs[8]
+  const health = frame[8]
   if (Number.isFinite(health)) {
     if (health < context.lastHealth) {
       const damage = Math.max(0, context.lastHealth - health)
@@ -5019,7 +5103,7 @@ function computeReward(context, obs) {
     context.lastHealth = health
   }
 
-  const food = obs[9]
+  const food = frame[9]
   if (Number.isFinite(food)) {
     if (food > context.lastFood) {
       reward = applyRewardComponent(
@@ -5041,7 +5125,7 @@ function computeReward(context, obs) {
     context.lastFood = food
   }
 
-  const invTotal = obs[18]
+  const invTotal = frame[18]
   if (Number.isFinite(invTotal)) {
     const delta = invTotal - context.lastInvTotal
     if (delta !== 0) {
@@ -5056,7 +5140,7 @@ function computeReward(context, obs) {
     context.lastInvTotal = invTotal
   }
 
-  const nearestDist = obs[16]
+  const nearestDist = frame[16]
   if (Number.isFinite(nearestDist) && nearestDist > 0 && nearestDist < 3) {
     reward = applyRewardComponent(
       reward,
@@ -5382,7 +5466,7 @@ async function tickLoop(context) {
       console.warn(`[${label(context)}] Observation contained invalid values; skipping tick.`)
       return
     }
-    const reward = computeReward(context, observation)
+    const reward = computeReward(context)
 
     updateTemporalMemory(context, reward.total)
 
@@ -6551,6 +6635,9 @@ function createContext(index, options = {}) {
     movementController: null,
     registry: null,
     lastObs: null,
+    lastObservationFrame: null,
+    currentObservationFrame: null,
+    observationFilteredCount: 0,
     lastAction: null,
     prevAction: null,
     lastActionAt: 0,
