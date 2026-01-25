@@ -64,6 +64,9 @@ export function createTickScheduler({ runTick, isGlobalRunning, isContextRunning
     if (!context) return
     if (!isGlobalRunning() || !isContextRunning(context)) return
 
+    const lowerReason = typeof reason === 'string' ? reason.toLowerCase() : ''
+    const delayCritical = lowerReason === 'death' || lowerReason === 'forced-move' || lowerReason === 'entity-hurt'
+
     if (context.tickInFlight) {
       if (reason !== 'action-complete' && !context.pendingEnvironmentTick) {
         context.pendingEnvironmentTick = true
@@ -81,7 +84,12 @@ export function createTickScheduler({ runTick, isGlobalRunning, isContextRunning
     }
 
     pendingSystemTicks.set(context, reason)
-    scheduleSystemTick()
+    if (delayCritical && reason !== 'action-complete') {
+      const delayMs = 50 + Math.floor(Math.random() * 51)
+      setTimeout(scheduleSystemTick, delayMs)
+    } else {
+      scheduleSystemTick()
+    }
   }
 
   function cancelPendingTick(context) {
