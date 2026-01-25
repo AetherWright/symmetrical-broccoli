@@ -4709,26 +4709,30 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
 async function executeAction(context, index) {
   const act = ACTIONS[index]
   if (!act) return
+  if (context.actionInFlight) {
+    console.warn(`[${label(context)}] Action skipped; previous action still in flight.`)
+    return
+  }
+  context.actionInFlight = true
   console.log(`[${label(context)}] Executing: ${act}`)
 
   const { bot } = context
 
-  if (CRAFTING_ACTIONS[act]) {
-    await executeCraftAction(context, act)
-    bot.clearControlStates()
-    return
-  }
-
-  const movePulse = (vector, duration = 350, options = {}) =>
-    smoothMovementPulse(context, vector, duration, options)
-
-  const lookBy = async (deltaYaw = 0, deltaPitch = 0) => {
-    await smoothLookBy(context, deltaYaw, deltaPitch)
-  }
-
-  const getTargetBlock = () => bot.blockAtCursor(5)
-
   try {
+    if (CRAFTING_ACTIONS[act]) {
+      await executeCraftAction(context, act)
+      return
+    }
+
+    const movePulse = (vector, duration = 350, options = {}) =>
+      smoothMovementPulse(context, vector, duration, options)
+
+    const lookBy = async (deltaYaw = 0, deltaPitch = 0) => {
+      await smoothLookBy(context, deltaYaw, deltaPitch)
+    }
+
+    const getTargetBlock = () => bot.blockAtCursor(5)
+
     switch (act) {
       case 'move_forward':
         await movePulse({ forward: 1 })
@@ -4917,6 +4921,7 @@ async function executeAction(context, index) {
   } finally {
     releaseMovement(context)
     bot.clearControlStates()
+    context.actionInFlight = false
   }
 }
 
@@ -6036,6 +6041,32 @@ function applyDeathPenalty(context, source = 'unknown') {
   console.warn(`[${label(context)}] Death detected via ${source} → -${penalty.toFixed(2)} reward penalty`)
 }
 
+function clearIncomingRewards(context, reason = 'death') {
+  if (!context) return
+  context.blockReward = 0
+  context.achievementReward = 0
+  context.rewardHighlight = null
+  context.rewardSignal = null
+  context.rewardKalman = createRewardKalmanFilterState()
+  context.repetitionStreak = 0
+  context.noveltyFlag = false
+  console.warn(`[${label(context)}] Cleared pending rewards after ${reason}.`)
+}
+
+function clearControlStateOnDeath(context) {
+  if (!context) return
+  try {
+    context.movementController?.reset()
+  } catch (err) {
+    console.warn(`[${label(context)}] Failed to reset movement controller after death:`, err?.message ?? err)
+  }
+  try {
+    context.bot?.clearControlStates?.()
+  } catch (err) {
+    console.warn(`[${label(context)}] Failed to clear control states after death:`, err?.message ?? err)
+  }
+}
+
 function setupRewardTracking(context) {
   const { bot } = context
 
@@ -6194,6 +6225,8 @@ function setupRewardTracking(context) {
 
   bot.on('death', () => {
     applyDeathPenalty(context, 'death-event')
+    clearIncomingRewards(context, 'death-event')
+    clearControlStateOnDeath(context)
   })
 }
 
@@ -6554,6 +6587,7 @@ function createContext(index, options = {}) {
     noveltyCount: 0,
     noveltyFlag: false,
     deathPenalty: 0,
+    actionInFlight: false,
     damageDebt: 0,
     recentDamage: 0,
     lastDeathAt: 0,
