@@ -214,6 +214,8 @@ atexit.register(WORKERS.shutdown)
 BRAIN_CONFIG = {
     "storsky_units": [128, 96],
     "dropout_rate": 0.2,
+    "memory_decay": 0.9,
+    "memory_scale": 0.15,
     "transformer_tokens": 4,
     "transformer_embed": 24,
     "transformer_heads": 3,
@@ -488,6 +490,11 @@ class BrainModel(torch.nn.Module):
             raise ValueError("storsky_units must define two layer sizes")
         self.storsky_1 = StorskyLayer(input_size, int(storsky_units[0]), BRAIN_CONFIG["dropout_rate"])
         self.storsky_2 = StorskyLayer(int(storsky_units[0]), int(storsky_units[1]), BRAIN_CONFIG["dropout_rate"])
+        self.memory_dim = int(storsky_units[1])
+        self.memory_decay = float(BRAIN_CONFIG.get("memory_decay", 0.9))
+        self.memory_scale = float(BRAIN_CONFIG.get("memory_scale", 0.15))
+        self.memory_norm = torch.nn.LayerNorm(self.memory_dim)
+        self.memory_project = torch.nn.Linear(self.memory_dim, self.memory_dim)
         self.transformer_tokens = int(BRAIN_CONFIG["transformer_tokens"])
         self.transformer_embed = int(BRAIN_CONFIG["transformer_embed"])
         total_transformer_dim = self.transformer_tokens * self.transformer_embed
@@ -520,7 +527,9 @@ class BrainModel(torch.nn.Module):
             persistent=False,
         )
 
-    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, inputs: torch.Tensor, memory_state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if inputs.dim() != 2:
             raise ValueError(f"Expected 2D inputs (batch, features); got shape {tuple(inputs.shape)}")
         use_batch_stats = self.training and inputs.size(0) > 1
@@ -538,6 +547,16 @@ class BrainModel(torch.nn.Module):
         )
         x = self.storsky_1(x)
         x = self.storsky_2(x)
+        if memory_state is None or memory_state.numel() != self.memory_dim:
+            memory_state = torch.zeros(self.memory_dim, device=x.device, dtype=x.dtype)
+        memory_state = memory_state.to(device=x.device, dtype=x.dtype)
+        batch_summary = x.mean(dim=0)
+        memory_decay = float(min(max(self.memory_decay, 0.0), 0.999))
+        new_memory = memory_decay * memory_state + (1.0 - memory_decay) * batch_summary
+        memory_features = self.memory_project(self.memory_norm(new_memory))
+        if self.memory_scale != 1.0:
+            memory_features = memory_features * self.memory_scale
+        x = x + memory_features.unsqueeze(0)
         transformer_state = self.transformer_project(x)
         transformer_state = transformer_state.view(x.size(0), self.transformer_tokens, self.transformer_embed)
         transformer_state = self.transformer_input_norm(transformer_state)
@@ -574,7 +593,7 @@ class BrainModel(torch.nn.Module):
         policy_logits = flat_features[:, : self.action_count]
         probs = torch.nn.functional.softmax(policy_logits, dim=-1)
         reward_prediction = policy_logits
-        return probs, reward_prediction
+        return probs, reward_prediction, new_memory
 
     def meta_state_norm(self) -> torch.Tensor:
         return self._meta_stub
@@ -585,6 +604,11 @@ class RemoteBrain:
         self.input_size = int(input_size)
         self.action_count = int(action_count)
         self.model = BrainModel(self.input_size, self.action_count).to(FLOAT_POLICY["device"])
+        self.memory_state = torch.zeros(
+            self.model.memory_dim,
+            device=FLOAT_POLICY["device"],
+            dtype=FLOAT_POLICY["dtype"],
+        )
         self.optimizer = LookaheadOptimizer(
             torch.optim.AdamW(
                 self.model.parameters(),
@@ -753,6 +777,13 @@ class RemoteBrain:
                 return float(value.detach().abs().max().item())
             except Exception:  # pragma: no cover - defensive
                 return 0.0
+        if isinstance(value, (float, int)):
+            return float(value)
+        if isinstance(self.memory_state, torch.Tensor):
+            try:
+                return float(self.memory_state.detach().abs().max().item())
+            except Exception:  # pragma: no cover - defensive
+                return 0.0
         return 0.0
 
     def choose_actions_batch(self, observations: List[Any], epsilons: List[float]) -> List[Dict[str, Any]]:
@@ -793,7 +824,8 @@ class RemoteBrain:
                             ema_applied = True
                         tensor = torch.from_numpy(batch).to(self.device)
                         with self._autocast_context():
-                            policy_probs, reward_predictions = self.model(tensor)
+                            policy_probs, reward_predictions, memory_state = self.model(tensor, self.memory_state)
+                        self.memory_state = memory_state.detach()
                         policy_probs = policy_probs.float()
                         reward_predictions = reward_predictions.float()
                         probs = policy_probs.cpu().numpy().astype(NP_FLOAT, copy=False)
@@ -1083,7 +1115,8 @@ class RemoteBrain:
                 obs_tensor = torch.from_numpy(obs_matrix).to(self.device)
                 self.optimizer.zero_grad()
                 with self._autocast_context():
-                    policy_probs, reward_predictions = self.model(obs_tensor)
+                    policy_probs, reward_predictions, memory_state = self.model(obs_tensor, self.memory_state)
+                self.memory_state = memory_state.detach()
                 policy_probs = policy_probs.float()
                 reward_predictions = reward_predictions.float()
                 log_probs = torch.log(policy_probs + 1e-8)
