@@ -25,8 +25,11 @@ export function createTickScheduler({ runTick, isGlobalRunning, isContextRunning
       while (isGlobalRunning()) {
         let nextContext = null
         for (const [candidate] of pendingSystemTicks) {
-          if (!isContextRunning(candidate) || candidate.tickInFlight) {
+          if (!isContextRunning(candidate)) {
             pendingSystemTicks.delete(candidate)
+            continue
+          }
+          if (candidate.tickInFlight) {
             continue
           }
           nextContext = candidate
