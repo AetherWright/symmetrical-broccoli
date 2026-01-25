@@ -212,19 +212,13 @@ WORKERS = EndpointWorkerPool(ENDPOINT_WORKER_LIMITS)
 atexit.register(WORKERS.shutdown)
 
 BRAIN_CONFIG = {
-    "hidden_units": 192,
-    "mid_units": 144,
-    "shared_units": 96,
-    "dropout_rate": 0.3,
-    "hebbian_units": [160, 112],
-    "hebbian_learning_rate": 0.01,
-    "hebbian_decay_multiplier": 1.5,
-    "hebbian_clip": 0.75,
-    "transformer_tokens": 6,
-    "transformer_embed": 32,
-    "transformer_heads": 4,
-    "transformer_layers": 2,
-    "transformer_ff": 256,
+    "storsky_units": [128, 96],
+    "dropout_rate": 0.2,
+    "transformer_tokens": 4,
+    "transformer_embed": 24,
+    "transformer_heads": 3,
+    "transformer_layers": 1,
+    "transformer_ff": 96,
     "transformer_rotary_base": 10000.0,
     "learning_rate": 2e-3,
     "lion_beta_1": 0.9,
@@ -299,73 +293,21 @@ class LookaheadOptimizer:
             self._slow_params[index].data.copy_(param.data)
 
 
-class HebbianLinear(torch.nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        activation=natural_log_relu,
-        hebbian_learning_rate: float = 0.01,
-        decay_multiplier: float = 1.5,
-        clip: float = 0.75,
-    ):
+class StorskyLayer(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int, dropout: float) -> None:
         super().__init__()
-        self.base = torch.nn.Linear(in_features, out_features)
-        self.activation = activation
-        self.hebbian_learning_rate = float(abs(hebbian_learning_rate))
-        self.decay_multiplier = float(abs(decay_multiplier))
-        self.clip = float(abs(clip))
-        self.register_buffer("hebbian_weight", torch.zeros(out_features, in_features))
-        self.register_buffer("hebbian_bias", torch.zeros(out_features))
-        self._last_input: Optional[torch.Tensor] = None
-        self._last_output: Optional[torch.Tensor] = None
+        self.linear = torch.nn.Linear(in_features, out_features)
+        self.norm = torch.nn.LayerNorm(out_features)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.activation = torch.nn.SiLU()
+        self.use_residual = in_features == out_features
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        weight = self.base.weight + self.hebbian_weight
-        bias = self.base.bias + self.hebbian_bias
-        outputs = torch.nn.functional.linear(inputs, weight, bias)
-        if self.activation is not None:
-            outputs = self.activation(outputs)
-        if self.training:
-            self._last_input = inputs.detach()
-            self._last_output = outputs.detach()
-        else:
-            self._last_input = None
-            self._last_output = None
+        outputs = self.activation(self.norm(self.linear(inputs)))
+        outputs = self.dropout(outputs)
+        if self.use_residual:
+            outputs = outputs + inputs
         return outputs
-
-    def _apply_decay(self) -> float:
-        if self.hebbian_learning_rate <= 0:
-            return 0.0
-        decay_rate = self.hebbian_learning_rate * self.decay_multiplier
-        decay_rate = min(0.95, max(0.0, decay_rate))
-        if decay_rate == 0:
-            return 0.0
-        keep_ratio = 1.0 - decay_rate
-        self.hebbian_weight.mul_(keep_ratio)
-        self.hebbian_bias.mul_(keep_ratio)
-        return float(decay_rate)
-
-    def update_hebbian(self, reinforcement: float) -> Dict[str, Any]:
-        decay_rate = self._apply_decay()
-        reinforcement = float(np.clip(reinforcement, -1.0, 1.0))
-        applied = False
-        if reinforcement != 0.0 and self._last_input is not None and self._last_output is not None:
-            lr = self.hebbian_learning_rate * reinforcement
-            pre = torch.nn.functional.normalize(self._last_input, dim=-1)
-            post = torch.nn.functional.normalize(self._last_output, dim=-1)
-            kernel_update = torch.einsum("bi,bj->ij", post, pre)
-            kernel_update /= max(1.0, float(pre.shape[0]))
-            bias_update = post.mean(dim=0)
-            self.hebbian_weight.add_(kernel_update * lr)
-            self.hebbian_bias.add_(bias_update * lr)
-            applied = True
-        if self.clip > 0:
-            self.hebbian_weight.clamp_(-self.clip, self.clip)
-            self.hebbian_bias.clamp_(-self.clip, self.clip)
-        self._last_input = None
-        self._last_output = None
-        return {"applied": applied, "decay_rate": decay_rate}
 
 
 class ParameterEMA:
@@ -541,27 +483,11 @@ class BrainModel(torch.nn.Module):
     def __init__(self, input_size: int, action_count: int):
         super().__init__()
         self.input_bn = torch.nn.BatchNorm1d(input_size)
-        self.hidden_dense_1 = torch.nn.Linear(input_size, BRAIN_CONFIG["hidden_units"])
-        self.hidden_dropout_1 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.hebbian_dense_1 = HebbianLinear(
-            BRAIN_CONFIG["hidden_units"],
-            BRAIN_CONFIG["hebbian_units"][0],
-            hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
-            decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
-            clip=BRAIN_CONFIG["hebbian_clip"],
-        )
-        self.hebbian_dropout_1 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.hidden_dense_2 = torch.nn.Linear(BRAIN_CONFIG["hebbian_units"][0], BRAIN_CONFIG["mid_units"])
-        self.hidden_dropout_2 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.hebbian_dense_2 = HebbianLinear(
-            BRAIN_CONFIG["mid_units"],
-            BRAIN_CONFIG["hebbian_units"][1],
-            hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
-            decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
-            clip=BRAIN_CONFIG["hebbian_clip"],
-        )
-        self.shared_dense = torch.nn.Linear(BRAIN_CONFIG["hebbian_units"][1], BRAIN_CONFIG["shared_units"])
-        self.shared_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        storsky_units = BRAIN_CONFIG.get("storsky_units", [128, 96])
+        if len(storsky_units) < 2:
+            raise ValueError("storsky_units must define two layer sizes")
+        self.storsky_1 = StorskyLayer(input_size, int(storsky_units[0]), BRAIN_CONFIG["dropout_rate"])
+        self.storsky_2 = StorskyLayer(int(storsky_units[0]), int(storsky_units[1]), BRAIN_CONFIG["dropout_rate"])
         self.transformer_tokens = int(BRAIN_CONFIG["transformer_tokens"])
         self.transformer_embed = int(BRAIN_CONFIG["transformer_embed"])
         total_transformer_dim = self.transformer_tokens * self.transformer_embed
@@ -569,7 +495,7 @@ class BrainModel(torch.nn.Module):
             raise ValueError("Transformer configuration must produce a positive feature size")
         if self.transformer_embed % max(1, int(BRAIN_CONFIG["transformer_heads"])) != 0:
             raise ValueError("Transformer embed dimension must be divisible by the number of heads")
-        self.transformer_project = torch.nn.Linear(BRAIN_CONFIG["shared_units"], total_transformer_dim)
+        self.transformer_project = torch.nn.Linear(int(storsky_units[1]), total_transformer_dim)
         self.transformer_encoder = RotaryTransformerEncoder(
             num_layers=int(BRAIN_CONFIG["transformer_layers"]),
             embed_dim=self.transformer_embed,
@@ -594,10 +520,6 @@ class BrainModel(torch.nn.Module):
             persistent=False,
         )
 
-    @staticmethod
-    def _activate(tensor: torch.Tensor) -> torch.Tensor:
-        return natural_log_relu(tensor)
-
     def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if inputs.dim() != 2:
             raise ValueError(f"Expected 2D inputs (batch, features); got shape {tuple(inputs.shape)}")
@@ -614,29 +536,20 @@ class BrainModel(torch.nn.Module):
             self.input_bn.momentum,
             self.input_bn.eps,
         )
-        x = self._activate(self.hidden_dense_1(x))
-        x = self.hidden_dropout_1(x)
-        x = self.hebbian_dense_1(x)
-        x = self.hebbian_dropout_1(x)
-        x = self._activate(self.hidden_dense_2(x))
-        x = self.hidden_dropout_2(x)
-        x = self.hebbian_dense_2(x)
-        shared = self._activate(self.shared_dense(x))
-        shared = self.shared_dropout(shared)
-        transformer_state = self.transformer_project(shared)
-        transformer_state = transformer_state.view(
-            shared.size(0), self.transformer_tokens, self.transformer_embed
-        )
+        x = self.storsky_1(x)
+        x = self.storsky_2(x)
+        transformer_state = self.transformer_project(x)
+        transformer_state = transformer_state.view(x.size(0), self.transformer_tokens, self.transformer_embed)
         transformer_state = self.transformer_input_norm(transformer_state)
         transformer_state = self.transformer_encoder(transformer_state)
         transformer_state = self.transformer_output_norm(transformer_state)
         transformer_state = self.transformer_dropout(transformer_state)
         transformer_state = transformer_state.reshape(
-            shared.size(0), self.transformer_tokens, self.bot_heads, self.head_dim
+            x.size(0), self.transformer_tokens, self.bot_heads, self.head_dim
         )
         head_features = transformer_state.permute(0, 2, 1, 3)
         head_features = head_features.reshape(
-            shared.size(0), self.bot_heads, self.transformer_tokens * self.head_dim
+            x.size(0), self.bot_heads, self.transformer_tokens * self.head_dim
         )
         if head_features.size(-1) < self.actions_per_head:
             pad = torch.zeros(
@@ -662,9 +575,6 @@ class BrainModel(torch.nn.Module):
         probs = torch.nn.functional.softmax(policy_logits, dim=-1)
         reward_prediction = policy_logits
         return probs, reward_prediction
-
-    def hebbian_layers(self) -> List[HebbianLinear]:
-        return [self.hebbian_dense_1, self.hebbian_dense_2]
 
     def meta_state_norm(self) -> torch.Tensor:
         return self._meta_stub
@@ -827,17 +737,6 @@ class RemoteBrain:
                     param.grad = None
                 return [], dropped, clipped, global_norm
         return params, dropped, clipped, global_norm
-
-    def _apply_hebbian_updates(self, reinforcement: float) -> Dict[str, Any]:
-        applied = 0
-        decay_rates: List[float] = []
-        for layer in self.model.hebbian_layers():
-            result = layer.update_hebbian(reinforcement)
-            if result.get("applied"):
-                applied += 1
-            if "decay_rate" in result:
-                decay_rates.append(float(result["decay_rate"]))
-        return {"layers": len(self.model.hebbian_layers()), "applied": applied, "decay_rates": decay_rates}
 
     def _tensor_from_array(self, array: np.ndarray) -> torch.Tensor:
         tensor = torch.from_numpy(array.astype(NP_FLOAT, copy=False)).to(self.device)
@@ -1237,8 +1136,6 @@ class RemoteBrain:
                         gradient_norm = None
                         self.optimizer.zero_grad()
                         weights_ok = self._weights_are_finite()
-                mean_reward = float(np.mean([entry["reward"] for entry in valid_entries])) if valid_entries else 0.0
-                hebbian_info = self._apply_hebbian_updates(mean_reward)
                 predicted_values_np = predicted_rewards.detach().cpu().numpy().astype(NP_FLOAT, copy=False)
                 advantages_np = advantages.detach().cpu().numpy().astype(NP_FLOAT, copy=False)
                 for offset, entry in enumerate(valid_entries):
@@ -1260,7 +1157,6 @@ class RemoteBrain:
                             },
                             "reward": entry["reward_meta"],
                         },
-                        "hebbian": hebbian_info,
                         "reward_prediction": {
                             "predicted": predicted_value,
                             "loss": prediction_loss_value,
@@ -1483,8 +1379,6 @@ async def _stream_handle_train(message: Dict[str, Any]) -> Dict[str, Any]:
         response_payload["reward_prediction"] = result["reward_prediction"]
     if "meta" in result:
         response_payload["meta"] = result["meta"]
-    if "hebbian" in result:
-        response_payload["hebbian"] = result["hebbian"]
     if "learning_rate" in result:
         response_payload["learning_rate"] = result["learning_rate"]
     request_payload = {key: value for key, value in message.items() if key not in {"id", "type"}}
