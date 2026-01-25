@@ -524,6 +524,16 @@ const ACHIEVEMENT_REWARD_BONUS = Math.max(
   5,
   readNumberEnv('ACHIEVEMENT_REWARD_BONUS', 25, { min: 5 })
 )
+const LOCAL_MINIMUM_MUTATION_PROB = readNumberEnv('LOCAL_MINIMUM_MUTATION_PROB', 0.35, {
+  min: 0,
+  max: 1
+})
+const LOCAL_MINIMUM_MUTATION_MIN = readNumberEnv('LOCAL_MINIMUM_MUTATION_MIN', 0.015, {
+  min: 0
+})
+const LOCAL_MINIMUM_MUTATION_MAX = readNumberEnv('LOCAL_MINIMUM_MUTATION_MAX', 0.06, {
+  min: 0
+})
 const GENERATION_SURVIVOR_COUNT = Math.max(
   MIN_BOTS,
   Math.floor(readNumberEnv('GENERATION_SURVIVOR_COUNT', 3, { min: 1 }))
@@ -5729,6 +5739,35 @@ async function synchronizeGeneration() {
       stagnantGenerations = 0
     } else {
       stagnantGenerations += 1
+    }
+
+    if (
+      stagnantGenerations >= Math.max(1, Math.floor(STAGNATION_MUTATION_THRESHOLD / 2)) &&
+      LOCAL_MINIMUM_MUTATION_PROB > 0 &&
+      Math.random() < LOCAL_MINIMUM_MUTATION_PROB
+    ) {
+      const minStddev = Math.max(0, LOCAL_MINIMUM_MUTATION_MIN)
+      const maxStddev = Math.max(minStddev, LOCAL_MINIMUM_MUTATION_MAX)
+      const stddev = minStddev + Math.random() * (maxStddev - minStddev)
+      console.log(
+        `[Baseline] Potential local minimum detected — applying random mutation stddev ${stddev.toFixed(3)}.`
+      )
+      try {
+        await mutateWeights(baselineBrain, stddev)
+        markBaselineWeightsHealthy('local-minimum-mutate')
+        for (const ctx of contexts) {
+          ctx.stagnation.lastMutation = baselineState.generation
+        }
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err)) {
+          const status = getRemoteBrainStatus()
+          console.warn(
+            `[Baseline] Local-minimum mutation skipped: remote brain unavailable (${describeRemoteRetry(status)}).`
+          )
+        } else {
+          console.error('[Baseline] Local-minimum mutation failed:', err)
+        }
+      }
     }
 
     if (stagnantGenerations >= STAGNATION_MUTATION_THRESHOLD) {
