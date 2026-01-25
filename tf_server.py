@@ -515,6 +515,7 @@ class BrainModel(torch.nn.Module):
         self.transformer_input_norm = torch.nn.LayerNorm(self.transformer_embed)
         self.transformer_output_norm = torch.nn.LayerNorm(self.transformer_embed)
         self.transformer_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        self.transformer_dense = torch.nn.Linear(self.transformer_embed, self.transformer_embed)
         self.action_count = action_count
         self.transformer_heads = max(1, int(BRAIN_CONFIG["transformer_heads"]))
         configured_bot_heads = max(1, int(BRAIN_CONFIG.get("bot_heads", self.transformer_heads)))
@@ -562,6 +563,7 @@ class BrainModel(torch.nn.Module):
         transformer_state = self.transformer_input_norm(transformer_state)
         transformer_state = self.transformer_encoder(transformer_state)
         transformer_state = self.transformer_output_norm(transformer_state)
+        transformer_state = self.transformer_dense(transformer_state)
         transformer_state = self.transformer_dropout(transformer_state)
         transformer_state = transformer_state.reshape(
             x.size(0), self.transformer_tokens, self.bot_heads, self.head_dim
