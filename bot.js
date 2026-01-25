@@ -5,7 +5,6 @@ import path from 'node:path'
 import { pipeline } from 'node:stream'
 import { promisify } from 'node:util'
 import zlib from 'node:zlib'
-import { performance } from 'node:perf_hooks'
 import {
   createBrain,
   saveBrain,
@@ -26,11 +25,10 @@ import {
   shutdownBrainWorkerPool,
   warmBrainWorkerPool
 } from './brainWorkerPool.js'
-import {
-  isEchoFallbackEnabled,
-  chooseEchoAction,
-  reportEchoLearning
-} from './echoTool.js'
+import { readNumberEnv } from './configUtils.js'
+import { monotonicNow } from './timing.js'
+import { createRewardKalmanHelpers } from './rewardKalman.js'
+import { createTickScheduler } from './tickScheduler.js'
 
 // ----------------------------
 // CONFIG
@@ -275,14 +273,6 @@ const REWARD_SIGN = Object.freeze({
   EITHER: 'either'
 })
 
-function readNumberEnv(name, fallback, { min = -Infinity, max = Infinity } = {}) {
-  const raw = Number.parseFloat(process.env[name] ?? '')
-  if (!Number.isFinite(raw)) {
-    return fallback
-  }
-  return Math.min(max, Math.max(min, raw))
-}
-
 function recordRewardSignCorrection(context, expectation, original, corrected, reason, channel) {
   if (!context || corrected === original) return
   if (!context.rewardSignStats) {
@@ -331,153 +321,6 @@ function ensureRewardSign(amount, expectation = REWARD_SIGN.EITHER, context = nu
   return corrected
 }
 
-function createRewardKalmanFilterState() {
-  const variance = Math.min(
-    REWARD_KALMAN_MAX_VARIANCE,
-    Math.max(REWARD_KALMAN_MIN_VARIANCE, REWARD_KALMAN_INITIAL_VARIANCE)
-  )
-  return {
-    state: new Float64Array([0, 0]),
-    covariance: new Float64Array([variance, 0, 0, variance]),
-    lastUpdate: monotonicNow(),
-    lastOutput: { reward: 0, penalty: 0, total: 0 }
-  }
-}
-
-function ensureRewardKalmanFilter(context) {
-  if (!context) {
-    return createRewardKalmanFilterState()
-  }
-  const filter = context.rewardKalman
-  if (
-    !filter ||
-    !(filter.state instanceof Float64Array) ||
-    filter.state.length !== 2 ||
-    !(filter.covariance instanceof Float64Array) ||
-    filter.covariance.length !== 4
-  ) {
-    context.rewardKalman = createRewardKalmanFilterState()
-  }
-  return context.rewardKalman
-}
-
-function clampKalmanVariance(value) {
-  if (!Number.isFinite(value)) {
-    return REWARD_KALMAN_MAX_VARIANCE
-  }
-  if (value < REWARD_KALMAN_MIN_VARIANCE) {
-    return REWARD_KALMAN_MIN_VARIANCE
-  }
-  if (value > REWARD_KALMAN_MAX_VARIANCE) {
-    return REWARD_KALMAN_MAX_VARIANCE
-  }
-  return value
-}
-
-function applyRewardKalmanFilter(context, rewardValue, penaltyValue) {
-  const rewardMeasurement = Number.isFinite(Number(rewardValue)) && Number(rewardValue) > 0
-    ? Number(rewardValue)
-    : 0
-  const penaltyMeasurement = Number.isFinite(Number(penaltyValue)) && Number(penaltyValue) > 0
-    ? Number(penaltyValue)
-    : 0
-  const filter = ensureRewardKalmanFilter(context)
-  if (!filter || !(filter.state instanceof Float64Array) || filter.state.length !== 2) {
-    return {
-      reward: rewardMeasurement,
-      penalty: penaltyMeasurement,
-      total: rewardMeasurement - penaltyMeasurement
-    }
-  }
-
-  const state = filter.state
-  const covariance = filter.covariance
-  const now = monotonicNow()
-  const last = Number.isFinite(filter.lastUpdate) ? filter.lastUpdate : now
-  const elapsedSeconds = Math.max(1, (now - last) / 1000)
-  filter.lastUpdate = now
-
-  const processNoise = Math.max(REWARD_KALMAN_MIN_VARIANCE, REWARD_KALMAN_PROCESS_NOISE * elapsedSeconds)
-  const measurementBase = Math.max(REWARD_KALMAN_MIN_VARIANCE, REWARD_KALMAN_MEASUREMENT_NOISE)
-  const measurementGrowth = Math.max(0, REWARD_KALMAN_MEASUREMENT_GROWTH)
-  const rewardNoise = measurementBase + measurementGrowth * rewardMeasurement
-  const penaltyNoise = measurementBase + measurementGrowth * penaltyMeasurement
-
-  let p00 = covariance[0] + processNoise
-  let p01 = covariance[1]
-  let p10 = covariance[2]
-  let p11 = covariance[3] + processNoise
-
-  let s00 = p00 + rewardNoise
-  let s01 = p01
-  let s10 = p10
-  let s11 = p11 + penaltyNoise
-  let det = s00 * s11 - s01 * s10
-
-  if (!Number.isFinite(det) || Math.abs(det) < REWARD_KALMAN_MIN_DETERMINANT) {
-    p01 = 0
-    p10 = 0
-    s01 = 0
-    s10 = 0
-    s00 = Math.max(REWARD_KALMAN_MIN_VARIANCE, s00)
-    s11 = Math.max(REWARD_KALMAN_MIN_VARIANCE, s11)
-    det = s00 * s11
-  }
-
-  const invDet = det !== 0 ? 1 / det : 0
-  const inv00 = s11 * invDet
-  const inv01 = -s01 * invDet
-  const inv10 = -s10 * invDet
-  const inv11 = s00 * invDet
-
-  const k00 = p00 * inv00 + p01 * inv10
-  const k01 = p00 * inv01 + p01 * inv11
-  const k10 = p10 * inv00 + p11 * inv10
-  const k11 = p10 * inv01 + p11 * inv11
-
-  const residual0 = rewardMeasurement - state[0]
-  const residual1 = penaltyMeasurement - state[1]
-
-  const adjustment0 = k00 * residual0 + k01 * residual1
-  const adjustment1 = k10 * residual0 + k11 * residual1
-
-  const updatedReward = state[0] + adjustment0
-  const updatedPenalty = state[1] + adjustment1
-
-  state[0] = Number.isFinite(updatedReward) ? updatedReward : rewardMeasurement
-  state[1] = Number.isFinite(updatedPenalty) ? updatedPenalty : penaltyMeasurement
-
-  const i00 = 1 - k00
-  const i01 = -k01
-  const i10 = -k10
-  const i11 = 1 - k11
-
-  let newP00 = i00 * p00 + i01 * p10
-  let newP01 = i00 * p01 + i01 * p11
-  let newP10 = i10 * p00 + i11 * p10
-  let newP11 = i10 * p01 + i11 * p11
-
-  const symOffDiag = (Number.isFinite(newP01) && Number.isFinite(newP10))
-    ? (newP01 + newP10) / 2
-    : 0
-  covariance[0] = clampKalmanVariance(Number.isFinite(newP00) ? newP00 : REWARD_KALMAN_INITIAL_VARIANCE)
-  covariance[3] = clampKalmanVariance(Number.isFinite(newP11) ? newP11 : REWARD_KALMAN_INITIAL_VARIANCE)
-  const offDiag = clampKalmanVariance(symOffDiag)
-  covariance[1] = offDiag
-  covariance[2] = offDiag
-
-  const filteredReward = limitPositive(state[0], MAX_REWARD_MAGNITUDE)
-  const filteredPenalty = limitPositive(state[1], MAX_REWARD_MAGNITUDE)
-  const filteredTotal = clampReward(filteredReward - filteredPenalty)
-
-  filter.lastOutput = {
-    reward: filteredReward,
-    penalty: filteredPenalty,
-    total: filteredTotal
-  }
-
-  return filter.lastOutput
-}
 
 function createRewardAccumulator() {
   return { total: 0, reward: 0, penalty: 0 }
@@ -691,13 +534,6 @@ if (brainWorkerPoolStatus.enabled) {
   )
 } else {
   console.log('[Brain] Remote worker pool disabled; remote calls will run inline.')
-}
-
-function monotonicNow() {
-  if (typeof performance?.now === 'function') {
-    return performance.now()
-  }
-  return Date.now()
 }
 
 function createRollingStats(windowMs = HEALTH_METRIC_WINDOW_MS) {
@@ -1130,7 +966,7 @@ function scheduleBackendRetry(context, status) {
   }, delay)
 }
 
-function noteRemoteBrainOffline(context, status, source, { fallbackReady = false } = {}) {
+function noteRemoteBrainOffline(context, status, source) {
   const tracker = ensureRemoteBrainTracker(context)
   const now = Date.now()
   const message = source?.message ?? status?.lastError ?? 'Remote brain unavailable'
@@ -1145,14 +981,6 @@ function noteRemoteBrainOffline(context, status, source, { fallbackReady = false
     tracker.nextLogAt = now + 5000
   }
   const wasWaiting = Boolean(context.waitingForBrain)
-  if (fallbackReady) {
-    clearBackendRetry(context)
-    context.waitingForBrain = false
-    if (wasWaiting) {
-      noteEnvironmentChange(context, 'fallback-backend-online')
-    }
-    return
-  }
   context.waitingForBrain = true
   scheduleBackendRetry(context, status)
 }
@@ -1926,10 +1754,6 @@ const RESOURCE_TYPES = ['wood', 'stone', 'ore', 'crafted']
 // GLOBAL STATE
 // ----------------------------
 const contexts = []
-
-const pendingSystemTicks = new Map()
-let systemTickHandle = null
-let systemTickInFlight = false
 const usedNames = new Set()
 const lineageStats = new Map()
 const lineageCounters = new Map([[LINEAGE_ROOT_NAME, 0]])
@@ -2975,6 +2799,24 @@ function normalizePositive(value, limit) {
   if (scaled < 0) return 0
   return scaled
 }
+
+const {
+  createRewardKalmanFilterState,
+  ensureRewardKalmanFilter,
+  applyRewardKalmanFilter
+} = createRewardKalmanHelpers({
+  processNoise: REWARD_KALMAN_PROCESS_NOISE,
+  measurementNoise: REWARD_KALMAN_MEASUREMENT_NOISE,
+  measurementGrowth: REWARD_KALMAN_MEASUREMENT_GROWTH,
+  initialVariance: REWARD_KALMAN_INITIAL_VARIANCE,
+  minVariance: REWARD_KALMAN_MIN_VARIANCE,
+  maxVariance: REWARD_KALMAN_MAX_VARIANCE,
+  minDeterminant: REWARD_KALMAN_MIN_DETERMINANT,
+  maxRewardMagnitude: MAX_REWARD_MAGNITUDE,
+  clampReward,
+  limitPositive,
+  monotonicNow
+})
 
 function createGroupAffinityState() {
   return {
@@ -5466,154 +5308,6 @@ function computeReward(context) {
   return summary
 }
 
-function scheduleTick(context, reason = 'manual') {
-  if (!context) return
-  if (!globalRunning || !context.running) return
-
-  if (context.tickInFlight) {
-    if (reason !== 'action-complete' && !context.pendingEnvironmentTick) {
-      context.pendingEnvironmentTick = true
-      context.pendingEnvironmentReason = reason
-    }
-    return
-  }
-
-  const existingReason = pendingSystemTicks.get(context)
-  if (existingReason) {
-    if (existingReason !== 'action-complete' && reason === 'action-complete') {
-      pendingSystemTicks.set(context, reason)
-    }
-    return
-  }
-
-  pendingSystemTicks.set(context, reason)
-  scheduleSystemTick()
-}
-
-function scheduleSystemTick() {
-  if (!globalRunning) return
-  if (systemTickHandle || systemTickInFlight) {
-    return
-  }
-
-  systemTickHandle = setTimeout(() => {
-    systemTickHandle = null
-    runSystemTickQueue().catch(err => {
-      console.error('[Brain] System tick error:', err)
-    })
-  }, 0)
-}
-
-async function runSystemTickQueue() {
-  if (systemTickInFlight) return
-  systemTickInFlight = true
-
-  try {
-    while (globalRunning) {
-      let nextContext = null
-      for (const [candidate] of pendingSystemTicks) {
-        if (!candidate?.running || candidate.tickInFlight) {
-          pendingSystemTicks.delete(candidate)
-          continue
-        }
-        nextContext = candidate
-        break
-      }
-
-      if (!nextContext) {
-        break
-      }
-
-      pendingSystemTicks.delete(nextContext)
-
-      try {
-        await tickLoop(nextContext)
-      } catch (err) {
-        console.error(`[${label(nextContext)}] Tick scheduling error:`, err)
-      }
-
-      if (!globalRunning) {
-        break
-      }
-    }
-  } finally {
-    systemTickInFlight = false
-    if (pendingSystemTicks.size > 0 && globalRunning) {
-      scheduleSystemTick()
-    }
-  }
-}
-
-function cancelPendingTick(context) {
-  if (!context) return
-  const removed = pendingSystemTicks.delete(context)
-  if (removed && pendingSystemTicks.size === 0 && systemTickHandle && !systemTickInFlight) {
-    clearTimeout(systemTickHandle)
-    systemTickHandle = null
-  }
-}
-
-function isTickPending(context) {
-  if (!context) return false
-  return pendingSystemTicks.has(context)
-}
-
-function clearAllPendingTicks() {
-  pendingSystemTicks.clear()
-  if (systemTickHandle && !systemTickInFlight) {
-    clearTimeout(systemTickHandle)
-    systemTickHandle = null
-  }
-}
-
-function noteEnvironmentChange(context, reason = 'environment') {
-  if (!context) return
-  if (context.waitingForBrain && reason !== 'remote-brain-online') {
-    return
-  }
-  scheduleTick(context, reason)
-}
-
-function bindEnvironmentTriggers(context) {
-  if (!context?.bot) return
-
-  unbindEnvironmentTriggers(context)
-
-  const { bot } = context
-  const listeners = [
-    ['move', () => noteEnvironmentChange(context, 'self-move')],
-    ['blockUpdate', () => noteEnvironmentChange(context, 'block-update')],
-    ['chunkColumnLoad', () => noteEnvironmentChange(context, 'chunk-load')],
-    ['chunkColumnUnload', () => noteEnvironmentChange(context, 'chunk-unload')],
-    ['entitySpawn', () => noteEnvironmentChange(context, 'entity-spawn')],
-    ['entityGone', () => noteEnvironmentChange(context, 'entity-gone')],
-    ['entityHurt', () => noteEnvironmentChange(context, 'entity-hurt')],
-    ['death', () => noteEnvironmentChange(context, 'death')],
-    ['health', () => noteEnvironmentChange(context, 'health-change')],
-    ['experience', () => noteEnvironmentChange(context, 'experience-change')],
-    ['collect', () => noteEnvironmentChange(context, 'collect')],
-    ['forcedMove', () => noteEnvironmentChange(context, 'forced-move')]
-  ]
-
-  context.environmentListeners = listeners
-  for (const [event, handler] of listeners) {
-    bot.on(event, handler)
-  }
-}
-
-function unbindEnvironmentTriggers(context) {
-  if (!context?.bot) return
-
-  const listeners = Array.isArray(context.environmentListeners)
-    ? context.environmentListeners
-    : []
-
-  for (const [event, handler] of listeners) {
-    context.bot.off(event, handler)
-  }
-
-  context.environmentListeners = []
-}
 
 async function tickLoop(context) {
   if (!globalRunning || !context.running || context.tickInFlight) return
@@ -5635,40 +5329,11 @@ async function tickLoop(context) {
 
     await runMaintenanceRoutines(context)
 
-    let fallbackActive = Boolean(context.echoFallbackActive)
-    const updateFallbackState = active => {
-      const previous = Boolean(context.echoFallbackActive)
-      if (active === previous) {
-        return
-      }
-      context.echoFallbackActive = active
-      if (active) {
-        console.warn(
-          `[${label(context)}] TensorFlow brain unavailable; switching to Echo fallback.`
-        )
-      } else {
-        console.log(
-          `[${label(context)}] TensorFlow brain reachable; exiting Echo fallback.`
-        )
-      }
-    }
-
     const status = getRemoteBrainStatus()
     if (!status.connected) {
       remoteUnavailable = true
       remoteIssue = status
-      if (isEchoFallbackEnabled()) {
-        fallbackActive = true
-        updateFallbackState(true)
-      } else {
-        updateFallbackState(false)
-        return
-      }
-    } else if (fallbackActive) {
-      fallbackActive = false
-      updateFallbackState(false)
-    } else {
-      updateFallbackState(false)
+      return
     }
 
     if (context.weightsSuspect || context.pendingWeightRecovery) {
@@ -5685,21 +5350,17 @@ async function tickLoop(context) {
     }
 
     let brain = null
-    if (!fallbackActive) {
-      try {
-        brain = await ensureContextBrain(context)
-      } catch (err) {
-        if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
-          remoteUnavailable = true
-          remoteIssue = err
-          fallbackActive = true
-          updateFallbackState(true)
-        } else {
-          throw err
-        }
+    try {
+      brain = await ensureContextBrain(context)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        remoteUnavailable = true
+        remoteIssue = err
+        return
       }
+      throw err
     }
-    if (!fallbackActive && !brain) {
+    if (!brain) {
       console.warn(`[${label(context)}] Brain not ready, skipping tick.`)
       return
     }
@@ -5736,39 +5397,22 @@ async function tickLoop(context) {
       const lastObsValid = vectorHasFiniteValues(context.lastObs)
       if (lastObsValid) {
         let trainOutcome = null
-        let trainUsedFallback = fallbackActive
-        if (!fallbackActive) {
-          try {
-            trainOutcome = await trainBrainConcurrent(
-              brain,
-              context.lastObs,
-              context.lastAction,
-              serverReward.reward,
-              serverReward.penalty,
-              observation
-            )
-          } catch (err) {
-            if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
-              remoteUnavailable = true
-              remoteIssue = err
-              fallbackActive = true
-              trainUsedFallback = true
-              updateFallbackState(true)
-            } else {
-              throw err
-            }
+        try {
+          trainOutcome = await trainBrainConcurrent(
+            brain,
+            context.lastObs,
+            context.lastAction,
+            serverReward.reward,
+            serverReward.penalty,
+            observation
+          )
+        } catch (err) {
+          if (isRemoteBrainUnavailableError(err)) {
+            remoteUnavailable = true
+            remoteIssue = err
+            return
           }
-        }
-        if (fallbackActive) {
-          trainUsedFallback = true
-          trainOutcome = await reportEchoLearning({
-            observation: context.lastObs,
-            nextObservation: observation,
-            actionIndex: context.lastAction,
-            actions: ACTIONS,
-            reward: serverReward.total,
-            botId: label(context)
-          })
+          throw err
         }
         if (trainOutcome) {
           recordTrainingSanitization(trainOutcome.sanitization)
@@ -5776,7 +5420,7 @@ async function tickLoop(context) {
           recordClippedGradients(trainOutcome.clippedGradients)
           recordGradientNorm(trainOutcome.gradientNorm)
           trained = Boolean(trainOutcome.trained)
-          if (!trainUsedFallback && trainOutcome.weightsOk === false) {
+          if (trainOutcome.weightsOk === false) {
             const trainDetails = {
               ...(trainOutcome.sanitization ?? {}),
               trigger: 'train'
@@ -5794,30 +5438,15 @@ async function tickLoop(context) {
     }
 
     let actionResult = null
-    let actionUsedFallback = fallbackActive
-    if (!fallbackActive) {
-      try {
-        actionResult = await chooseActionConcurrent(brain, observation, effectiveEpsilon)
-      } catch (err) {
-        if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
-          remoteUnavailable = true
-          remoteIssue = err
-          fallbackActive = true
-          actionUsedFallback = true
-          updateFallbackState(true)
-        } else {
-          throw err
-        }
+    try {
+      actionResult = await chooseActionConcurrent(brain, observation, effectiveEpsilon)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        remoteUnavailable = true
+        remoteIssue = err
+        return
       }
-    }
-    if (fallbackActive) {
-      actionResult = await chooseEchoAction({
-        observation,
-        epsilon: effectiveEpsilon,
-        actions: ACTIONS,
-        botId: label(context)
-      })
-      actionUsedFallback = true
+      throw err
     }
     if (!actionResult) {
       throw new Error('Failed to select action for current tick')
@@ -5828,9 +5457,8 @@ async function tickLoop(context) {
       10
     )
     if (
-      !actionUsedFallback &&
-      (actionResult?.weightsOk === false ||
-        (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0))
+      actionResult?.weightsOk === false ||
+      (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0)
     ) {
       const actionDetails = {
         observation: actionResult?.sanitization?.observation ?? {},
@@ -5901,9 +5529,7 @@ async function tickLoop(context) {
 
     if (remoteUnavailable) {
       const status = getRemoteBrainStatus()
-      noteRemoteBrainOffline(context, status, remoteIssue, {
-        fallbackReady: Boolean(context.echoFallbackActive)
-      })
+      noteRemoteBrainOffline(context, status, remoteIssue)
     } else {
       noteRemoteBrainOnline(context)
       if (deferredBaselineSaveReason && !saveInFlight && isRemoteBrainConnected()) {
@@ -5925,6 +5551,20 @@ async function tickLoop(context) {
     }
   }
 }
+
+const {
+  scheduleTick,
+  cancelPendingTick,
+  isTickPending,
+  clearAllPendingTicks,
+  noteEnvironmentChange,
+  bindEnvironmentTriggers,
+  unbindEnvironmentTriggers
+} = createTickScheduler({
+  runTick: tickLoop,
+  isGlobalRunning: () => globalRunning,
+  isContextRunning: context => Boolean(context?.running)
+})
 
 async function maybeCompleteGeneration(context) {
   if (context.generationTicks < GENERATION_TICKS) {
@@ -5990,12 +5630,10 @@ async function synchronizeGeneration() {
   if (!contexts.every(ctx => ctx.readyForSync)) return
 
   if (!isRemoteBrainConnected()) {
-    if (isEchoFallbackEnabled()) {
-      const status = getRemoteBrainStatus()
-      console.warn(
-        `[Baseline] Skipping generation sync while TensorFlow brain unavailable (${describeRemoteRetry(status)}).`
-      )
-    }
+    const status = getRemoteBrainStatus()
+    console.warn(
+      `[Baseline] Skipping generation sync while TensorFlow brain unavailable (${describeRemoteRetry(status)}).`
+    )
     return
   }
 
@@ -6863,7 +6501,6 @@ function createContext(index, options = {}) {
     lastWeightRecovery: Date.now(),
     lastWeightRecoveryReason: 'init',
     weightSkipNotified: false,
-    echoFallbackActive: false,
     pendingMutations: [],
     epsilon: EPSILON_START,
     epsilonBoost: 0,
