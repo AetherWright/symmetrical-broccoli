@@ -1926,6 +1926,10 @@ const RESOURCE_TYPES = ['wood', 'stone', 'ore', 'crafted']
 // GLOBAL STATE
 // ----------------------------
 const contexts = []
+
+const pendingSystemTicks = new Map()
+let systemTickHandle = null
+let systemTickInFlight = false
 const usedNames = new Set()
 const lineageStats = new Map()
 const lineageCounters = new Map([[LINEAGE_ROOT_NAME, 0]])
@@ -5474,19 +5478,92 @@ function scheduleTick(context, reason = 'manual') {
     return
   }
 
-  if (context.tickTimer) {
+  const existingReason = pendingSystemTicks.get(context)
+  if (existingReason) {
+    if (existingReason !== 'action-complete' && reason === 'action-complete') {
+      pendingSystemTicks.set(context, reason)
+    }
     return
   }
 
-  context.tickTimer = setTimeout(() => {
-    context.tickTimer = null
-    if (!globalRunning || !context.running) {
-      return
-    }
-    tickLoop(context).catch(err =>
-      console.error(`[${label(context)}] Tick scheduling error:`, err)
-    )
+  pendingSystemTicks.set(context, reason)
+  scheduleSystemTick()
+}
+
+function scheduleSystemTick() {
+  if (!globalRunning) return
+  if (systemTickHandle || systemTickInFlight) {
+    return
+  }
+
+  systemTickHandle = setTimeout(() => {
+    systemTickHandle = null
+    runSystemTickQueue().catch(err => {
+      console.error('[Brain] System tick error:', err)
+    })
   }, 0)
+}
+
+async function runSystemTickQueue() {
+  if (systemTickInFlight) return
+  systemTickInFlight = true
+
+  try {
+    while (globalRunning) {
+      let nextContext = null
+      for (const [candidate] of pendingSystemTicks) {
+        if (!candidate?.running || candidate.tickInFlight) {
+          pendingSystemTicks.delete(candidate)
+          continue
+        }
+        nextContext = candidate
+        break
+      }
+
+      if (!nextContext) {
+        break
+      }
+
+      pendingSystemTicks.delete(nextContext)
+
+      try {
+        await tickLoop(nextContext)
+      } catch (err) {
+        console.error(`[${label(nextContext)}] Tick scheduling error:`, err)
+      }
+
+      if (!globalRunning) {
+        break
+      }
+    }
+  } finally {
+    systemTickInFlight = false
+    if (pendingSystemTicks.size > 0 && globalRunning) {
+      scheduleSystemTick()
+    }
+  }
+}
+
+function cancelPendingTick(context) {
+  if (!context) return
+  const removed = pendingSystemTicks.delete(context)
+  if (removed && pendingSystemTicks.size === 0 && systemTickHandle && !systemTickInFlight) {
+    clearTimeout(systemTickHandle)
+    systemTickHandle = null
+  }
+}
+
+function isTickPending(context) {
+  if (!context) return false
+  return pendingSystemTicks.has(context)
+}
+
+function clearAllPendingTicks() {
+  pendingSystemTicks.clear()
+  if (systemTickHandle && !systemTickInFlight) {
+    clearTimeout(systemTickHandle)
+    systemTickHandle = null
+  }
 }
 
 function noteEnvironmentChange(context, reason = 'environment') {
@@ -6486,10 +6563,7 @@ function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
   if (!context || context.shuttingDown) return
   if (context.reconnectTimer) return
   context.running = false
-  if (context.tickTimer) {
-    clearTimeout(context.tickTimer)
-    context.tickTimer = null
-  }
+  cancelPendingTick(context)
   context.pendingEnvironmentTick = false
   context.pendingEnvironmentReason = null
   unbindEnvironmentTriggers(context)
@@ -6576,10 +6650,7 @@ async function retireContext(context, reason = 'retire') {
   if (!context) return
   context.running = false
   context.shuttingDown = true
-  if (context.tickTimer) {
-    clearTimeout(context.tickTimer)
-    context.tickTimer = null
-  }
+  cancelPendingTick(context)
   context.pendingEnvironmentTick = false
   context.pendingEnvironmentReason = null
   clearBackendRetry(context)
@@ -6797,7 +6868,6 @@ function createContext(index, options = {}) {
     epsilon: EPSILON_START,
     epsilonBoost: 0,
     running: true,
-    tickTimer: null,
     tickInFlight: false,
     pendingEnvironmentTick: false,
     pendingEnvironmentReason: null,
@@ -6958,13 +7028,11 @@ process.stdin.on('data', async data => {
     globalRunning = false
     for (const ctx of contexts) {
       ctx.running = false
-      if (ctx.tickTimer) {
-        clearTimeout(ctx.tickTimer)
-        ctx.tickTimer = null
-      }
+      cancelPendingTick(ctx)
       ctx.pendingEnvironmentTick = false
       ctx.pendingEnvironmentReason = null
     }
+    clearAllPendingTicks()
     console.log('[Brain] Paused. Current ticks will finish before stopping.')
   } else if (cmd === 'resume') {
     if (!globalRunning) {
@@ -6972,7 +7040,7 @@ process.stdin.on('data', async data => {
       for (const ctx of contexts) {
         if (!ctx.running) {
           ctx.running = true
-          if (!ctx.tickInFlight && !ctx.tickTimer) {
+          if (!ctx.tickInFlight && !isTickPending(ctx)) {
             scheduleTick(ctx, 'resume')
           }
         }
@@ -7001,13 +7069,11 @@ process.stdin.on('data', async data => {
     for (const ctx of contexts) {
       ctx.running = false
       ctx.shuttingDown = true
-      if (ctx.tickTimer) {
-        clearTimeout(ctx.tickTimer)
-        ctx.tickTimer = null
-      }
+      cancelPendingTick(ctx)
       ctx.pendingEnvironmentTick = false
       ctx.pendingEnvironmentReason = null
     }
+    clearAllPendingTicks()
     await flushPendingSave()
     if (isRemoteBrainConnected()) {
       try {
@@ -7058,13 +7124,11 @@ async function gracefulShutdown(reason = 'signal') {
     for (const ctx of contexts) {
       ctx.running = false
       ctx.shuttingDown = true
-      if (ctx.tickTimer) {
-        clearTimeout(ctx.tickTimer)
-        ctx.tickTimer = null
-      }
+      cancelPendingTick(ctx)
       ctx.pendingEnvironmentTick = false
       ctx.pendingEnvironmentReason = null
     }
+    clearAllPendingTicks()
     await flushPendingSave()
     if (isRemoteBrainConnected()) {
       try {
