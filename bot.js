@@ -516,6 +516,10 @@ const MIN_CLEAN_BRAIN_SOURCES = Math.max(
 const MUTATION_REWARD_FACTOR = readNumberEnv('REWARD_MUTATION_FACTOR', 0.002, { min: 0 })
 const OBS_VALUE_CLAMP = readNumberEnv('OBS_VALUE_CLAMP', 1000, { min: 1 })
 const MAX_REWARD_MAGNITUDE = readNumberEnv('MAX_REWARD_MAGNITUDE', 50, { min: 1 })
+const BOT_MAX_PACKET_SIZE = readNumberEnv('BOT_MAX_PACKET_SIZE', 2_000_000, {
+  min: 65536,
+  max: 16_000_000
+})
 const ACHIEVEMENT_REWARD_BONUS = Math.max(
   5,
   readNumberEnv('ACHIEVEMENT_REWARD_BONUS', 25, { min: 5 })
@@ -6253,7 +6257,8 @@ function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
       const newBot = mineflayer.createBot({
         host: NETWORK_HOST,
         port: NETWORK_PORT,
-        username: context.username
+        username: context.username,
+        maxPacketSize: BOT_MAX_PACKET_SIZE
       })
       context.bot = newBot
       context.movementController?.reset()
@@ -6491,7 +6496,8 @@ function createContext(index, options = {}) {
   const bot = mineflayer.createBot({
     host: NETWORK_HOST,
     port: NETWORK_PORT,
-    username
+    username,
+    maxPacketSize: BOT_MAX_PACKET_SIZE
   })
 
   const emotion = new Float32Array(EMOTION_VECTOR_SIZE)
