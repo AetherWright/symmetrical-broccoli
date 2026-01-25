@@ -612,7 +612,7 @@ class RemoteBrain:
             dtype=FLOAT_POLICY["dtype"],
         )
         self.optimizer = LookaheadOptimizer(
-            torch.optim.AdamW(
+            torch.optim.Adam(
                 self.model.parameters(),
                 lr=BRAIN_CONFIG["learning_rate"],
                 betas=(BRAIN_CONFIG["lion_beta_1"], BRAIN_CONFIG["lion_beta_2"]),
