@@ -1,4 +1,5 @@
 import mineflayer from 'mineflayer'
+import { pathfinder, Movements, goals } from 'mineflayer-pathfinder'
 import { Vec3 } from 'vec3'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -1463,15 +1464,26 @@ const CRAFTING_ACTIONS = {
   craft_furnace: { item: 'furnace', amount: 1, requireTable: true, allowPartial: false, reward: 1.1 }
 }
 
+const RELATIVE_MOVE_DISTANCE = readNumberEnv('BOT_MOVE_RELATIVE_DISTANCE', 4, {
+  min: 1,
+  max: 16
+})
+
+const RELATIVE_MOVE_ACTIONS = [
+  { name: 'move_rel_forward', forward: 1, right: 0 },
+  { name: 'move_rel_backward', forward: -1, right: 0 },
+  { name: 'move_rel_left', forward: 0, right: -1 },
+  { name: 'move_rel_right', forward: 0, right: 1 },
+  { name: 'move_rel_forward_left', forward: 1, right: -1 },
+  { name: 'move_rel_forward_right', forward: 1, right: 1 },
+  { name: 'move_rel_backward_left', forward: -1, right: -1 },
+  { name: 'move_rel_backward_right', forward: -1, right: 1 }
+]
+
+const RELATIVE_MOVE_LOOKUP = new Map(RELATIVE_MOVE_ACTIONS.map(action => [action.name, action]))
+
 const ACTIONS = [
-  'move_forward',
-  'move_backward',
-  'strafe_left',
-  'strafe_right',
-  'jump',
-  'jump_forward',
-  'sprint_forward',
-  'sneak_forward',
+  ...RELATIVE_MOVE_ACTIONS.map(action => action.name),
   'turn_left',
   'turn_right',
   'look_up',
@@ -2048,6 +2060,47 @@ function releaseMovement(context, options = {}) {
   const controller = ensureMovementController(context)
   if (controller) {
     controller.release(options)
+  }
+}
+
+function ensurePathfinderMovements(context) {
+  const bot = context?.bot
+  if (!bot?.pathfinder) return null
+  const registry = context?.registry ?? bot.registry
+  if (!context.pathfinderMoves || context.pathfinderMoves.registry !== registry) {
+    context.pathfinderMoves = new Movements(bot, registry)
+  }
+  return context.pathfinderMoves
+}
+
+async function moveRelativeTo(context, forward, right, distance = RELATIVE_MOVE_DISTANCE) {
+  const bot = context?.bot
+  if (!bot?.entity?.position || !bot.pathfinder) {
+    console.warn(`[${label(context)}] Pathfinder unavailable; skipping relative move.`)
+    return
+  }
+  const movement = ensurePathfinderMovements(context)
+  if (movement) {
+    bot.pathfinder.setMovements(movement)
+  }
+  const yaw = Number(bot.entity.yaw ?? 0)
+  const forwardScale = Number(forward) || 0
+  const rightScale = Number(right) || 0
+  const forwardX = -Math.sin(yaw)
+  const forwardZ = -Math.cos(yaw)
+  const rightX = Math.cos(yaw)
+  const rightZ = -Math.sin(yaw)
+  const dx = (forwardScale * forwardX + rightScale * rightX) * distance
+  const dz = (forwardScale * forwardZ + rightScale * rightZ) * distance
+  const origin = bot.entity.position
+  const targetX = Math.round(origin.x + dx)
+  const targetY = Math.round(origin.y)
+  const targetZ = Math.round(origin.z + dz)
+  const goal = new goals.GoalNear(targetX, targetY, targetZ, 1)
+  try {
+    await bot.pathfinder.goto(goal)
+  } catch (err) {
+    console.warn(`[${label(context)}] Relative move failed:`, err?.message ?? err)
   }
 }
 
@@ -4701,31 +4754,14 @@ async function executeAction(context, index) {
 
     const getTargetBlock = () => bot.blockAtCursor(5)
 
+    const relativeAction = RELATIVE_MOVE_LOOKUP.get(act)
+    if (relativeAction) {
+      context.movementController?.reset()
+      await moveRelativeTo(context, relativeAction.forward, relativeAction.right)
+      return
+    }
+
     switch (act) {
-      case 'move_forward':
-        await movePulse({ forward: 1 })
-        break
-      case 'move_backward':
-        await movePulse({ forward: -1 })
-        break
-      case 'strafe_left':
-        await movePulse({ strafe: -1 })
-        break
-      case 'strafe_right':
-        await movePulse({ strafe: 1 })
-        break
-      case 'jump':
-        await movePulse({}, 350, { jump: true })
-        break
-      case 'jump_forward':
-        await movePulse({ forward: 1 }, 500, { jump: true })
-        break
-      case 'sprint_forward':
-        await movePulse({ forward: 1 }, 500, { sprint: true })
-        break
-      case 'sneak_forward':
-        await movePulse({ forward: 1 }, 500, { sneak: true })
-        break
       case 'turn_left':
         await lookBy(-Math.PI / 4, 0)
         break
@@ -6244,6 +6280,7 @@ function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
         username: context.username,
         maxPacketSize: BOT_MAX_PACKET_SIZE
       })
+      newBot.loadPlugin(pathfinder)
       context.bot = newBot
       context.movementController?.reset()
       context.running = true
@@ -6273,6 +6310,8 @@ function setupBot(context) {
     context.registry = context.bot.registry ?? context.registry
     if (!context.registry) {
       console.warn(`[${label(context)}] Failed to load registry — crafting actions will be limited.`)
+    } else {
+      context.pathfinderMoves = new Movements(context.bot, context.registry)
     }
 
     const waitForEntity = setInterval(() => {
@@ -6505,6 +6544,7 @@ function createContext(index, options = {}) {
     username,
     maxPacketSize: BOT_MAX_PACKET_SIZE
   })
+  bot.loadPlugin(pathfinder)
 
   const emotion = new Float32Array(EMOTION_VECTOR_SIZE)
   for (let i = 0; i < EMOTION_VECTOR_SIZE; i++) {
@@ -6552,6 +6592,7 @@ function createContext(index, options = {}) {
     pendingEnvironmentTick: false,
     pendingEnvironmentReason: null,
     movementController: null,
+    pathfinderMoves: null,
     registry: null,
     lastObs: null,
     lastObservationFrame: null,
