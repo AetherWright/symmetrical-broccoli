@@ -216,6 +216,7 @@ BRAIN_CONFIG = {
     "dropout_rate": 0.2,
     "memory_decay": 0.9,
     "memory_scale": 0.15,
+    "action_branches": [8, 4, 4, 1, 3, 1, 5, 8],
     "transformer_tokens": 4,
     "transformer_embed": 24,
     "transformer_heads": 3,
@@ -517,6 +518,13 @@ class BrainModel(torch.nn.Module):
         self.transformer_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
         self.transformer_dense = torch.nn.Linear(self.transformer_embed, self.transformer_embed)
         self.action_count = action_count
+        branch_sizes = BRAIN_CONFIG.get("action_branches", [])
+        if not isinstance(branch_sizes, (list, tuple)):
+            branch_sizes = []
+        self.action_branches = [int(size) for size in branch_sizes if int(size) > 0]
+        self.branch_layers = torch.nn.ModuleList(
+            [torch.nn.Linear(self.transformer_embed, size) for size in self.action_branches]
+        )
         self.transformer_heads = max(1, int(BRAIN_CONFIG["transformer_heads"]))
         configured_bot_heads = max(1, int(BRAIN_CONFIG.get("bot_heads", self.transformer_heads)))
         self.bot_heads = math.gcd(configured_bot_heads, self.transformer_embed) or 1
@@ -565,34 +573,48 @@ class BrainModel(torch.nn.Module):
         transformer_state = self.transformer_output_norm(transformer_state)
         transformer_state = self.transformer_dense(transformer_state)
         transformer_state = self.transformer_dropout(transformer_state)
-        transformer_state = transformer_state.reshape(
-            x.size(0), self.transformer_tokens, self.bot_heads, self.head_dim
-        )
-        head_features = transformer_state.permute(0, 2, 1, 3)
-        head_features = head_features.reshape(
-            x.size(0), self.bot_heads, self.transformer_tokens * self.head_dim
-        )
-        if head_features.size(-1) < self.actions_per_head:
-            pad = torch.zeros(
-                head_features.size(0),
-                head_features.size(1),
-                self.actions_per_head - head_features.size(-1),
-                device=head_features.device,
-                dtype=head_features.dtype,
-            )
-            head_features = torch.cat([head_features, pad], dim=-1)
+        if self.branch_layers:
+            pooled = transformer_state.mean(dim=1)
+            branch_logits = [layer(pooled) for layer in self.branch_layers]
+            combined_logits = torch.cat(branch_logits, dim=-1)
+            if combined_logits.size(-1) < self.action_count:
+                pad = torch.zeros(
+                    combined_logits.size(0),
+                    self.action_count - combined_logits.size(-1),
+                    device=combined_logits.device,
+                    dtype=combined_logits.dtype,
+                )
+                combined_logits = torch.cat([combined_logits, pad], dim=-1)
+            policy_logits = combined_logits[:, : self.action_count]
         else:
-            head_features = head_features[:, :, : self.actions_per_head]
-        flat_features = head_features.reshape(head_features.size(0), -1)
-        if flat_features.size(-1) < self.action_count:
-            pad = torch.zeros(
-                flat_features.size(0),
-                self.action_count - flat_features.size(-1),
-                device=flat_features.device,
-                dtype=flat_features.dtype,
+            transformer_state = transformer_state.reshape(
+                x.size(0), self.transformer_tokens, self.bot_heads, self.head_dim
             )
-            flat_features = torch.cat([flat_features, pad], dim=-1)
-        policy_logits = flat_features[:, : self.action_count]
+            head_features = transformer_state.permute(0, 2, 1, 3)
+            head_features = head_features.reshape(
+                x.size(0), self.bot_heads, self.transformer_tokens * self.head_dim
+            )
+            if head_features.size(-1) < self.actions_per_head:
+                pad = torch.zeros(
+                    head_features.size(0),
+                    head_features.size(1),
+                    self.actions_per_head - head_features.size(-1),
+                    device=head_features.device,
+                    dtype=head_features.dtype,
+                )
+                head_features = torch.cat([head_features, pad], dim=-1)
+            else:
+                head_features = head_features[:, :, : self.actions_per_head]
+            flat_features = head_features.reshape(head_features.size(0), -1)
+            if flat_features.size(-1) < self.action_count:
+                pad = torch.zeros(
+                    flat_features.size(0),
+                    self.action_count - flat_features.size(-1),
+                    device=flat_features.device,
+                    dtype=flat_features.dtype,
+                )
+                flat_features = torch.cat([flat_features, pad], dim=-1)
+            policy_logits = flat_features[:, : self.action_count]
         probs = torch.nn.functional.softmax(policy_logits, dim=-1)
         reward_prediction = policy_logits
         return probs, reward_prediction, new_memory
