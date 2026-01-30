@@ -1505,6 +1505,24 @@ const ACTIONS = [
   ...Object.keys(CRAFTING_ACTIONS)
 ]
 
+const ACTION_GROUPS = {
+  movement: RELATIVE_MOVE_ACTIONS.map(action => action.name),
+  perception: ['turn_left', 'turn_right', 'look_up', 'look_down'],
+  mining: ['mine', 'mine_forward', 'strafe_mine_left', 'strafe_mine_right'],
+  combat: ['attack'],
+  building: ['build', 'build_above', 'build_forward'],
+  interaction: ['use_item'],
+  communication: ['signal_resource', 'signal_danger', 'signal_assist', 'signal_gather', 'signal_status'],
+  crafting: Object.keys(CRAFTING_ACTIONS)
+}
+
+const ACTION_GROUP_BY_NAME = Object.entries(ACTION_GROUPS).reduce((map, [group, names]) => {
+  for (const name of names) {
+    map.set(name, group)
+  }
+  return map
+}, new Map())
+
 const EPSILON_START = 0.25
 const EPSILON_MIN = 0.05
 const EPSILON_DECAY = 0.999
