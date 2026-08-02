@@ -1,11 +1,11 @@
 import mineflayer from 'mineflayer'
+import { pathfinder, Movements, goals } from 'mineflayer-pathfinder'
 import { Vec3 } from 'vec3'
 import fs from 'node:fs'
 import path from 'node:path'
 import { pipeline } from 'node:stream'
 import { promisify } from 'node:util'
 import zlib from 'node:zlib'
-import { performance } from 'node:perf_hooks'
 import {
   createBrain,
   saveBrain,
@@ -26,11 +26,11 @@ import {
   shutdownBrainWorkerPool,
   warmBrainWorkerPool
 } from './brainWorkerPool.js'
-import {
-  isEchoFallbackEnabled,
-  chooseEchoAction,
-  reportEchoLearning
-} from './echoTool.js'
+import { readNumberEnv } from './configUtils.js'
+import { monotonicNow } from './timing.js'
+import { createRewardKalmanHelpers } from './rewardKalman.js'
+import { createRewardHandling, REWARD_SIGN } from './rewardHandling.js'
+import { createTickScheduler } from './tickScheduler.js'
 
 // ----------------------------
 // CONFIG
@@ -40,6 +40,7 @@ const MC_PORT = 25565
 const BOT_COUNT = Math.max(2, parseInt(process.env.BOT_COUNT ?? '10', 10))
 const MIN_BOTS = Math.max(2, parseInt(process.env.BOT_MIN ?? '2', 10))
 const GENERATION_TICKS = Math.max(50, parseInt(process.env.GENERATION_TICKS ?? '200', 10))
+const USE_SHARED_BRAIN = process.env.BOT_SHARED_BRAIN !== 'false'
 const ROCK_PARTS = ['Rock', 'Stone', 'Grav', 'Ore', 'Pebble', 'Granite', 'Basalt', 'Iron', 'Coal', 'Quartz']
 const SUFFIXES = ['son', 'grip', 'deep', 'delver', 'breaker', 'forge', 'drill', 'hammer', 'core', 'blast']
 const PREFIXES = ['', 'Mc', 'Von', 'De', "O'", 'El']
@@ -108,6 +109,26 @@ const NON_FINITE_EPSILON_BOOST = readNumberEnv('BOT_NON_FINITE_EPSILON_BOOST', 0
   min: 0,
   max: 0.95
 })
+
+const REWARD_KALMAN_PROCESS_NOISE = readNumberEnv('BOT_REWARD_EKF_PROCESS_NOISE', 0.12, {
+  min: 1e-6,
+  max: 10
+})
+const REWARD_KALMAN_MEASUREMENT_NOISE = readNumberEnv('BOT_REWARD_EKF_MEASUREMENT_NOISE', 0.5, {
+  min: 1e-6,
+  max: 10
+})
+const REWARD_KALMAN_MEASUREMENT_GROWTH = readNumberEnv('BOT_REWARD_EKF_MEASUREMENT_GROWTH', 0.05, {
+  min: 0,
+  max: 5
+})
+const REWARD_KALMAN_INITIAL_VARIANCE = readNumberEnv('BOT_REWARD_EKF_INITIAL_VARIANCE', 1, {
+  min: 1e-6,
+  max: 100
+})
+const REWARD_KALMAN_MIN_VARIANCE = 1e-6
+const REWARD_KALMAN_MAX_VARIANCE = 1e4
+const REWARD_KALMAN_MIN_DETERMINANT = 1e-9
 
 const DEFAULT_MINING_TOOL_PREFERENCES = ['pickaxe', 'axe', 'shovel']
 const TOOL_TIER_WEIGHTS = [
@@ -248,159 +269,6 @@ const ARMOR_SLOT_BONUS = {
   feet: 20
 }
 
-const REWARD_SIGN = Object.freeze({
-  POSITIVE: 'positive',
-  NEGATIVE: 'negative',
-  EITHER: 'either'
-})
-
-function readNumberEnv(name, fallback, { min = -Infinity, max = Infinity } = {}) {
-  const raw = Number.parseFloat(process.env[name] ?? '')
-  if (!Number.isFinite(raw)) {
-    return fallback
-  }
-  return Math.min(max, Math.max(min, raw))
-}
-
-function recordRewardSignCorrection(context, expectation, original, corrected, reason, channel) {
-  if (!context || corrected === original) return
-  if (!context.rewardSignStats) {
-    context.rewardSignStats = { corrections: 0, history: [] }
-  }
-  context.rewardSignStats.corrections += 1
-  const entry = {
-    expectation,
-    original,
-    corrected,
-    reason,
-    channel,
-    tick: context.tickCount ?? 0
-  }
-  context.rewardSignStats.history.push(entry)
-  if (context.rewardSignStats.history.length > 8) {
-    context.rewardSignStats.history.shift()
-  }
-  const shouldLog =
-    context.rewardSignStats.corrections <= 5 || context.rewardSignStats.corrections % 20 === 0
-  if (shouldLog) {
-    try {
-      console.warn(
-        `[${label(context)}] Reward sign correction for ${reason} (${channel}) → ${original.toFixed(3)} adjusted to ${corrected.toFixed(3)} (expected ${expectation}).`
-      )
-    } catch (err) {
-      console.warn('Reward sign correction logged without context label:', err)
-    }
-  }
-}
-
-function ensureRewardSign(amount, expectation = REWARD_SIGN.EITHER, context = null, reason = 'unspecified', channel = 'reward') {
-  const numeric = Number(amount)
-  if (!Number.isFinite(numeric) || numeric === 0) {
-    return 0
-  }
-  let corrected = numeric
-  if (expectation === REWARD_SIGN.POSITIVE && numeric < 0) {
-    corrected = Math.abs(numeric)
-  } else if (expectation === REWARD_SIGN.NEGATIVE && numeric > 0) {
-    corrected = -Math.abs(numeric)
-  }
-  if (corrected !== numeric) {
-    recordRewardSignCorrection(context, expectation, numeric, corrected, reason, channel)
-  }
-  return corrected
-}
-
-function createRewardAccumulator() {
-  return { total: 0, reward: 0, penalty: 0 }
-}
-
-function ensureRewardAccumulator(value) {
-  if (
-    value &&
-    typeof value === 'object' &&
-    Object.prototype.hasOwnProperty.call(value, 'total') &&
-    Object.prototype.hasOwnProperty.call(value, 'reward') &&
-    Object.prototype.hasOwnProperty.call(value, 'penalty')
-  ) {
-    const accumulator = value
-    accumulator.total = Number.isFinite(accumulator.total) ? accumulator.total : 0
-    accumulator.reward = Number.isFinite(accumulator.reward) && accumulator.reward > 0
-      ? accumulator.reward
-      : 0
-    accumulator.penalty = Number.isFinite(accumulator.penalty) && accumulator.penalty > 0
-      ? accumulator.penalty
-      : 0
-    return accumulator
-  }
-  const numeric = Number(value)
-  if (!Number.isFinite(numeric) || numeric === 0) {
-    return createRewardAccumulator()
-  }
-  if (numeric > 0) {
-    return { total: numeric, reward: numeric, penalty: 0 }
-  }
-  const magnitude = Math.abs(numeric)
-  return { total: numeric, reward: 0, penalty: magnitude }
-}
-
-function finalizeRewardAccumulator(value) {
-  const accumulator = ensureRewardAccumulator(value)
-  return {
-    total: clampReward(accumulator.total),
-    reward: limitPositive(accumulator.reward, MAX_REWARD_MAGNITUDE),
-    penalty: limitPositive(accumulator.penalty, MAX_REWARD_MAGNITUDE)
-  }
-}
-
-function applyRewardComponent(total, amount, expectation = REWARD_SIGN.EITHER, context = null, reason = 'unspecified') {
-  const accumulator = ensureRewardAccumulator(total)
-  const corrected = ensureRewardSign(amount, expectation, context, reason, 'reward')
-  const adjusted = applyCosinePenaltyScaling(context, reason, corrected)
-  if (!Number.isFinite(adjusted) || adjusted === 0) {
-    return accumulator
-  }
-  accumulator.total += adjusted
-  if (adjusted > 0) {
-    accumulator.reward += adjusted
-    noteRewardHighlight(context, reason, adjusted)
-  } else if (adjusted < 0) {
-    accumulator.penalty += Math.abs(adjusted)
-  }
-  accumulator.reward = Math.max(0, accumulator.reward)
-  accumulator.penalty = Math.max(0, accumulator.penalty)
-  return accumulator
-}
-
-function addBlockReward(context, amount, expectation = REWARD_SIGN.EITHER, reason = 'block') {
-  if (!context) return 0
-  const base = Number.isFinite(context.blockReward) ? context.blockReward : 0
-  const corrected = ensureRewardSign(amount, expectation, context, reason, 'block')
-  const adjusted = applyCosinePenaltyScaling(context, reason, corrected)
-  if (adjusted === 0) {
-    context.blockReward = base
-    return context.blockReward
-  }
-  const next = base + adjusted
-  context.blockReward = Number.isFinite(next) ? next : 0
-  return context.blockReward
-}
-
-function drainPositiveBlockReward(context, amount) {
-  if (!context) return 0
-  const deduction = Math.abs(Number(amount) || 0)
-  if (!Number.isFinite(deduction) || deduction === 0) {
-    return Number.isFinite(context.blockReward) ? context.blockReward : 0
-  }
-  const base = Number.isFinite(context.blockReward) ? context.blockReward : 0
-  if (base <= 0) {
-    context.blockReward = base
-    return base
-  }
-  const next = Math.max(0, base - deduction)
-  context.blockReward = next
-  return next
-}
-
 function ensureCosinePenaltyState(context) {
   if (!context) return null
   if (!context.cosinePenaltyScaling) {
@@ -504,10 +372,34 @@ const MIN_CLEAN_BRAIN_SOURCES = Math.max(
 const MUTATION_REWARD_FACTOR = readNumberEnv('REWARD_MUTATION_FACTOR', 0.002, { min: 0 })
 const OBS_VALUE_CLAMP = readNumberEnv('OBS_VALUE_CLAMP', 1000, { min: 1 })
 const MAX_REWARD_MAGNITUDE = readNumberEnv('MAX_REWARD_MAGNITUDE', 50, { min: 1 })
+const BOT_MAX_PACKET_SIZE = readNumberEnv('BOT_MAX_PACKET_SIZE', 2_000_000, {
+  min: 65536,
+  max: 16_000_000
+})
 const ACHIEVEMENT_REWARD_BONUS = Math.max(
   5,
   readNumberEnv('ACHIEVEMENT_REWARD_BONUS', 25, { min: 5 })
 )
+const BOT_REINIT_INTERVAL_MS = Math.floor(readNumberEnv(
+  'BOT_REINIT_INTERVAL_MS',
+  20 * 60 * 1000,
+  { min: 60000, max: 6 * 60 * 60 * 1000 }
+))
+const BOT_REINIT_SAVE_DELAY_MS = Math.floor(readNumberEnv(
+  'BOT_REINIT_SAVE_DELAY_MS',
+  5000,
+  { min: 500, max: 60000 }
+))
+const LOCAL_MINIMUM_MUTATION_PROB = readNumberEnv('LOCAL_MINIMUM_MUTATION_PROB', 0.35, {
+  min: 0,
+  max: 1
+})
+const LOCAL_MINIMUM_MUTATION_MIN = readNumberEnv('LOCAL_MINIMUM_MUTATION_MIN', 0.015, {
+  min: 0
+})
+const LOCAL_MINIMUM_MUTATION_MAX = readNumberEnv('LOCAL_MINIMUM_MUTATION_MAX', 0.06, {
+  min: 0
+})
 const GENERATION_SURVIVOR_COUNT = Math.max(
   MIN_BOTS,
   Math.floor(readNumberEnv('GENERATION_SURVIVOR_COUNT', 3, { min: 1 }))
@@ -522,13 +414,6 @@ if (brainWorkerPoolStatus.enabled) {
   )
 } else {
   console.log('[Brain] Remote worker pool disabled; remote calls will run inline.')
-}
-
-function monotonicNow() {
-  if (typeof performance?.now === 'function') {
-    return performance.now()
-  }
-  return Date.now()
 }
 
 function createRollingStats(windowMs = HEALTH_METRIC_WINDOW_MS) {
@@ -747,16 +632,6 @@ function vectorHasFiniteValues(vector) {
   return true
 }
 
-function clampReward(value) {
-  if (!Number.isFinite(value)) {
-    return 0
-  }
-  const limit = MAX_REWARD_MAGNITUDE
-  if (value > limit) return limit
-  if (value < -limit) return -limit
-  return value
-}
-
 function deriveMutationStddev(preferred, { jitter = true } = {}) {
   let base = Number.isFinite(preferred) && preferred >= 0 ? preferred : NEW_BRAIN_MUTATION_STDDEV
   if (!Number.isFinite(base) || base < 0) {
@@ -919,6 +794,47 @@ function ensureRemoteBrainTracker(context) {
   return context.remoteBrain
 }
 
+function clearBackendRetry(context) {
+  if (!context) return
+  if (context.backendRetryTimer) {
+    clearTimeout(context.backendRetryTimer)
+    context.backendRetryTimer = null
+  }
+  context.backendRetryAt = 0
+}
+
+function scheduleBackendRetry(context, status) {
+  if (!context || !globalRunning || !context.running) return
+  const now = Date.now()
+  let delay = 0
+  if (status?.retryAt && status.retryAt > now) {
+    delay = status.retryAt - now
+  } else if (Number.isFinite(status?.retryDelay) && status.retryDelay > 0) {
+    delay = status.retryDelay
+  }
+  if (!Number.isFinite(delay) || delay <= 0) {
+    delay = 1000
+  }
+  const target = now + delay
+  if (context.backendRetryTimer && context.backendRetryAt && context.backendRetryAt <= target) {
+    return
+  }
+  if (context.backendRetryTimer) {
+    clearTimeout(context.backendRetryTimer)
+  }
+  context.backendRetryAt = target
+  context.backendRetryTimer = setTimeout(() => {
+    context.backendRetryTimer = null
+    context.backendRetryAt = 0
+    if (!globalRunning || !context.running) {
+      return
+    }
+    if (context.waitingForBrain) {
+      scheduleTick(context, 'backend-retry')
+    }
+  }, delay)
+}
+
 function noteRemoteBrainOffline(context, status, source) {
   const tracker = ensureRemoteBrainTracker(context)
   const now = Date.now()
@@ -933,7 +849,9 @@ function noteRemoteBrainOffline(context, status, source) {
     tracker.lastMessage = message
     tracker.nextLogAt = now + 5000
   }
+  const wasWaiting = Boolean(context.waitingForBrain)
   context.waitingForBrain = true
+  scheduleBackendRetry(context, status)
 }
 
 function noteRemoteBrainOnline(context) {
@@ -945,7 +863,12 @@ function noteRemoteBrainOnline(context) {
   tracker.offlineNotified = false
   tracker.lastMessage = null
   tracker.nextLogAt = 0
+  clearBackendRetry(context)
+  const wasWaiting = Boolean(context.waitingForBrain)
   context.waitingForBrain = false
+  if (wasWaiting) {
+    noteEnvironmentChange(context, 'remote-brain-online')
+  }
 }
 
 function ensureNonFiniteTracker(context) {
@@ -1053,6 +976,7 @@ function markContextWeightsHealthy(context, reason = 'unknown') {
     const stats = ensureLineageRecord(context.lineage)
     stats.instability = Math.max(0, (stats.instability ?? 0) * 0.5)
   }
+  noteEnvironmentChange(context, 'weights-healthy')
 }
 
 function scheduleWeightRecovery(context, reason = 'unknown', details = {}) {
@@ -1322,29 +1246,29 @@ async function attemptWeightRecovery(context, trigger = 'tick') {
       return false
     }
 
-    if (outcome?.success) {
-      markContextWeightsHealthy(context, pending.reason)
-      if (Array.isArray(pending.extraMutations) && pending.extraMutations.length) {
-        const extras = pending.extraMutations.splice(0)
-        for (const stddev of extras) {
-          if (!Number.isFinite(stddev) || stddev <= 0) continue
-          try {
-            await mutateWeights(context.brain, Math.min(NEW_BRAIN_MUTATION_MAX, Math.max(0, stddev)))
-          } catch (err) {
-            if (isRemoteBrainUnavailableError(err)) {
-              pending.extraMutations.unshift(stddev)
-              throw err
+      if (outcome?.success) {
+        markContextWeightsHealthy(context, pending.reason)
+        if (Array.isArray(pending.extraMutations) && pending.extraMutations.length) {
+          const extras = pending.extraMutations.splice(0)
+          for (const stddev of extras) {
+            if (!Number.isFinite(stddev) || stddev <= 0) continue
+            try {
+              await mutateWeights(context.brain, Math.min(NEW_BRAIN_MUTATION_MAX, Math.max(0, stddev)))
+            } catch (err) {
+              if (isRemoteBrainUnavailableError(err)) {
+                pending.extraMutations.unshift(stddev)
+                throw err
+              }
+              console.error(
+                `[${label(context)}] Failed to apply escalated mutation (${stddev}) after ${pending.reason}:`,
+                err
+              )
             }
-            console.error(
-              `[${label(context)}] Failed to apply escalated mutation (${stddev}) after ${pending.reason}:`,
-              err
-            )
           }
         }
-      }
-      const sourceNote =
-        outcome.mode === 'copy' || outcome.mode === 'average'
-          ? ` from ${outcome.sourceCount} clean source${
+        const sourceNote =
+          outcome.mode === 'copy' || outcome.mode === 'average'
+            ? ` from ${outcome.sourceCount} clean source${
               outcome.sourceCount === 1 ? '' : 's'
             }`
           : ''
@@ -1385,15 +1309,26 @@ const CRAFTING_ACTIONS = {
   craft_furnace: { item: 'furnace', amount: 1, requireTable: true, allowPartial: false, reward: 1.1 }
 }
 
+const RELATIVE_MOVE_DISTANCE = readNumberEnv('BOT_MOVE_RELATIVE_DISTANCE', 4, {
+  min: 1,
+  max: 16
+})
+
+const RELATIVE_MOVE_ACTIONS = [
+  { name: 'move_rel_forward', forward: 1, right: 0 },
+  { name: 'move_rel_backward', forward: -1, right: 0 },
+  { name: 'move_rel_left', forward: 0, right: -1 },
+  { name: 'move_rel_right', forward: 0, right: 1 },
+  { name: 'move_rel_forward_left', forward: 1, right: -1 },
+  { name: 'move_rel_forward_right', forward: 1, right: 1 },
+  { name: 'move_rel_backward_left', forward: -1, right: -1 },
+  { name: 'move_rel_backward_right', forward: -1, right: 1 }
+]
+
+const RELATIVE_MOVE_LOOKUP = new Map(RELATIVE_MOVE_ACTIONS.map(action => [action.name, action]))
+
 const ACTIONS = [
-  'move_forward',
-  'move_backward',
-  'strafe_left',
-  'strafe_right',
-  'jump',
-  'jump_forward',
-  'sprint_forward',
-  'sneak_forward',
+  ...RELATIVE_MOVE_ACTIONS.map(action => action.name),
   'turn_left',
   'turn_right',
   'look_up',
@@ -1415,7 +1350,24 @@ const ACTIONS = [
   ...Object.keys(CRAFTING_ACTIONS)
 ]
 
-const TICK_RATE = 50
+const ACTION_GROUPS = {
+  movement: RELATIVE_MOVE_ACTIONS.map(action => action.name),
+  perception: ['turn_left', 'turn_right', 'look_up', 'look_down'],
+  mining: ['mine', 'mine_forward', 'strafe_mine_left', 'strafe_mine_right'],
+  combat: ['attack'],
+  building: ['build', 'build_above', 'build_forward'],
+  interaction: ['use_item'],
+  communication: ['signal_resource', 'signal_danger', 'signal_assist', 'signal_gather', 'signal_status'],
+  crafting: Object.keys(CRAFTING_ACTIONS)
+}
+
+const ACTION_GROUP_BY_NAME = Object.entries(ACTION_GROUPS).reduce((map, [group, names]) => {
+  for (const name of names) {
+    map.set(name, group)
+  }
+  return map
+}, new Map())
+
 const EPSILON_START = 0.25
 const EPSILON_MIN = 0.05
 const EPSILON_DECAY = 0.999
@@ -1555,6 +1507,24 @@ const MEMORY_AGGREGATE_COUNT = 13
 const MEMORY_OBS_SIZE = MEMORY_REWARD_WINDOW + MEMORY_ACTION_WINDOW + MEMORY_AGGREGATE_COUNT
 const MEMORY_OBS_START = BASE_OBS_FEATURES
 const OBS_SIZE = BASE_OBS_FEATURES + MEMORY_OBS_SIZE
+
+const OBS_MOTION_PASSTHROUGH_INDICES = (() => {
+  const set = new Set([3, 4, 5])
+  const communicationDirectionBase = 58 + COMMUNICATION_TYPE_COUNT * 2
+  set.add(communicationDirectionBase)
+  set.add(communicationDirectionBase + 1)
+  return set
+})()
+
+const OBS_FILTERED_INDICES = new Set([
+  56 + COMMUNICATION_TYPE_COUNT * 2 + 5
+])
+
+const OBS_DIFFERENTIAL_WRAP = new Map([
+  [6, Math.PI * 2],
+  [7, Math.PI * 2],
+  [22, 1]
+])
 const NOVELTY_HASH_PRECISION = 2
 const NOVELTY_TARGET = 500
 const CONTEXT_TICK_NORMALIZER = readNumberEnv('BOT_CONTEXT_TICK_NORMALIZER', 2400, { min: 240, max: 48000 })
@@ -1689,6 +1659,8 @@ let bestGenerationReward = -Infinity
 let fatalRecoveryInProgress = false
 let fatalRecoveryAttempts = 0
 let lastFatalRecoveryAt = 0
+let periodicReinitTimer = null
+let periodicReinitInFlight = false
 
 // ----------------------------
 // HELPERS
@@ -1951,6 +1923,47 @@ function releaseMovement(context, options = {}) {
   const controller = ensureMovementController(context)
   if (controller) {
     controller.release(options)
+  }
+}
+
+function ensurePathfinderMovements(context) {
+  const bot = context?.bot
+  if (!bot?.pathfinder) return null
+  const registry = context?.registry ?? bot.registry
+  if (!context.pathfinderMoves || context.pathfinderMoves.registry !== registry) {
+    context.pathfinderMoves = new Movements(bot, registry)
+  }
+  return context.pathfinderMoves
+}
+
+async function moveRelativeTo(context, forward, right, distance = RELATIVE_MOVE_DISTANCE) {
+  const bot = context?.bot
+  if (!bot?.entity?.position || !bot.pathfinder) {
+    console.warn(`[${label(context)}] Pathfinder unavailable; skipping relative move.`)
+    return
+  }
+  const movement = ensurePathfinderMovements(context)
+  if (movement) {
+    bot.pathfinder.setMovements(movement)
+  }
+  const yaw = Number(bot.entity.yaw ?? 0)
+  const forwardScale = Number(forward) || 0
+  const rightScale = Number(right) || 0
+  const forwardX = -Math.sin(yaw)
+  const forwardZ = -Math.cos(yaw)
+  const rightX = Math.cos(yaw)
+  const rightZ = -Math.sin(yaw)
+  const dx = (forwardScale * forwardX + rightScale * rightX) * distance
+  const dz = (forwardScale * forwardZ + rightScale * rightZ) * distance
+  const origin = bot.entity.position
+  const targetX = Math.round(origin.x + dx)
+  const targetY = Math.round(origin.y)
+  const targetZ = Math.round(origin.z + dz)
+  const goal = new goals.GoalNear(targetX, targetY, targetZ, 1)
+  try {
+    await bot.pathfinder.goto(goal)
+  } catch (err) {
+    console.warn(`[${label(context)}] Relative move failed:`, err?.message ?? err)
   }
 }
 
@@ -2533,6 +2546,7 @@ async function ensureContextBrain(context) {
   if (!baselineBrain) {
     throw new Error('Baseline brain failed to initialize')
   }
+  baselineBrain.owner = 'hivemind'
 
   if (context.brain && context.brain.id) {
     context.brain.owner = label(context)
@@ -2669,6 +2683,67 @@ function normalizePositive(value, limit) {
   if (scaled < 0) return 0
   return scaled
 }
+
+let createRewardKalmanFilterState = null
+let ensureRewardKalmanFilter = null
+let applyRewardKalmanFilter = null
+
+const rewardHandling = createRewardHandling({
+  maxRewardMagnitude: MAX_REWARD_MAGNITUDE,
+  baseObsFeatures: BASE_OBS_FEATURES,
+  rewardEventBus: REWARD_EVENT_BUS,
+  rewardEventDecayMs: REWARD_EVENT_DECAY_MS,
+  rewardEventValueClamp: REWARD_EVENT_VALUE_CLAMP,
+  rewardEventThreshold: REWARD_EVENT_THRESHOLD,
+  rewardEventRefreshMs: REWARD_EVENT_REFRESH_MS,
+  rewardEventBusLimit: REWARD_EVENT_BUS_LIMIT,
+  rewardEventRange: REWARD_EVENT_RANGE,
+  deathRewardPenalty: DEATH_REWARD_PENALTY,
+  applyCosinePenaltyScaling,
+  limitPositive,
+  label,
+  noteGroupInteraction,
+  ensureTemporalMemoryState,
+  decayGroupAffinity,
+  updateCooperationScore,
+  computeGroupAffinityBonus,
+  computeCrowdingPenalty,
+  updateStagnation,
+  updateSkillChains,
+  adjustMorale,
+  getLineagePrestige,
+  rewardProfile,
+  damageDebtDecay: DAMAGE_DEBT_DECAY,
+  damageRecentDecay: DAMAGE_RECENT_DECAY,
+  damageMemoryClamp: DAMAGE_MEMORY_CLAMP,
+  damageDebtWeight: DAMAGE_DEBT_WEIGHT,
+  damageDebtPenalty: DAMAGE_DEBT_PENALTY,
+  getRewardKalmanFilterState: () => createRewardKalmanFilterState
+})
+
+const {
+  clampReward,
+  ensureRewardAccumulator,
+  addBlockReward,
+  updateRewardEventAwareness,
+  computeReward,
+  applyDeathPenalty,
+  clearIncomingRewards
+} = rewardHandling
+
+({ createRewardKalmanFilterState, ensureRewardKalmanFilter, applyRewardKalmanFilter } = createRewardKalmanHelpers({
+  processNoise: REWARD_KALMAN_PROCESS_NOISE,
+  measurementNoise: REWARD_KALMAN_MEASUREMENT_NOISE,
+  measurementGrowth: REWARD_KALMAN_MEASUREMENT_GROWTH,
+  initialVariance: REWARD_KALMAN_INITIAL_VARIANCE,
+  minVariance: REWARD_KALMAN_MIN_VARIANCE,
+  maxVariance: REWARD_KALMAN_MAX_VARIANCE,
+  minDeterminant: REWARD_KALMAN_MIN_DETERMINANT,
+  maxRewardMagnitude: MAX_REWARD_MAGNITUDE,
+  clampReward,
+  limitPositive,
+  monotonicNow
+}))
 
 function createGroupAffinityState() {
   return {
@@ -2892,177 +2967,6 @@ function broadcastCommunication(context, type, intensity = 1, payload = null) {
   comm.totalSent += 1
   comm.sentCounts[type] = (comm.sentCounts[type] ?? 0) + 1
   return record
-}
-
-function pruneRewardEventBus(now = Date.now()) {
-  const bus = REWARD_EVENT_BUS
-  if (!bus) return
-  if (now < bus.lastPrune + 200) {
-    return
-  }
-  bus.lastPrune = now
-  const cutoff = now - REWARD_EVENT_DECAY_MS
-  if (!Number.isFinite(cutoff) || cutoff <= 0) {
-    return
-  }
-  if (!Array.isArray(bus.events) || bus.events.length === 0) {
-    bus.events = []
-    return
-  }
-  const filtered = []
-  for (const event of bus.events) {
-    const createdAt = Number(event?.createdAt)
-    if (!Number.isFinite(createdAt) || createdAt < cutoff) {
-      continue
-    }
-    filtered.push(event)
-  }
-  if (filtered.length > REWARD_EVENT_BUS_LIMIT) {
-    bus.events = filtered.slice(filtered.length - REWARD_EVENT_BUS_LIMIT)
-  } else {
-    bus.events = filtered
-  }
-}
-
-function refreshRewardHighlight(context, now = Date.now()) {
-  if (!context?.rewardHighlight) {
-    return
-  }
-  const createdAt = Number(context.rewardHighlight.createdAt)
-  if (!Number.isFinite(createdAt) || now - createdAt > REWARD_EVENT_DECAY_MS) {
-    context.rewardHighlight = null
-  }
-}
-
-function broadcastRewardHighlight(context, now = Date.now()) {
-  if (!context?.rewardHighlight) return
-  const highlight = context.rewardHighlight
-  const amount = limitPositive(Number(highlight.amount) || 0, REWARD_EVENT_VALUE_CLAMP)
-  if (amount <= 0) return
-  const position = context.bot?.entity?.position
-  if (!position) return
-  const record = {
-    senderId: context.id,
-    lineage: context.lineage ?? null,
-    mode: context.mode ?? null,
-    reason: highlight.reason ?? 'unspecified',
-    amount,
-    createdAt: Number(highlight.createdAt) || now,
-    position: {
-      x: Number(position.x) || 0,
-      y: Number(position.y) || 0,
-      z: Number(position.z) || 0
-    }
-  }
-  pruneRewardEventBus(now)
-  REWARD_EVENT_BUS.events.push(record)
-  if (REWARD_EVENT_BUS.events.length > REWARD_EVENT_BUS_LIMIT) {
-    REWARD_EVENT_BUS.events.splice(
-      0,
-      Math.max(0, REWARD_EVENT_BUS.events.length - REWARD_EVENT_BUS_LIMIT)
-    )
-  }
-}
-
-function noteRewardHighlight(context, reason, amount, now = Date.now()) {
-  if (!context || !Number.isFinite(amount) || amount <= 0) {
-    return
-  }
-  if (amount < REWARD_EVENT_THRESHOLD) {
-    return
-  }
-  const normalizedReason = typeof reason === 'string' && reason ? reason : 'unspecified'
-  const clampedAmount = limitPositive(amount, REWARD_EVENT_VALUE_CLAMP)
-  const highlight = context.rewardHighlight
-  const shouldReplace =
-    !highlight ||
-    !Number.isFinite(highlight.amount) ||
-    clampedAmount > highlight.amount * 1.05 ||
-    now - (Number(highlight.createdAt) || 0) >= REWARD_EVENT_REFRESH_MS
-  if (!shouldReplace) {
-    return
-  }
-  context.rewardHighlight = {
-    amount: clampedAmount,
-    reason: normalizedReason,
-    createdAt: now
-  }
-  broadcastRewardHighlight(context, now)
-}
-
-function hashRewardReason(reason) {
-  if (!reason) return 0
-  const text = String(reason)
-  let hash = 0
-  for (let i = 0; i < text.length; i++) {
-    hash = (hash * 33 + text.charCodeAt(i)) >>> 0
-  }
-  const bucket = hash % 997
-  return bucket / 996
-}
-
-function ensureRewardSignalState(context) {
-  if (!context) return null
-  if (!context.rewardSignal) {
-    context.rewardSignal = { amount: 0, reason: 0, freshness: 0, updatedAt: 0 }
-  }
-  return context.rewardSignal
-}
-
-function updateRewardEventAwareness(context) {
-  const signal = ensureRewardSignalState(context)
-  if (!signal || !context?.bot?.entity?.position) {
-    if (signal) {
-      signal.amount = 0
-      signal.reason = 0
-      signal.freshness = 0
-      signal.updatedAt = Date.now()
-    }
-    return signal
-  }
-  const now = Date.now()
-  pruneRewardEventBus(now)
-  const position = context.bot.entity.position
-  let topIntensity = 0
-  let topReason = 0
-  let topFreshness = 0
-  for (const event of REWARD_EVENT_BUS.events) {
-    if (!event) continue
-    const dt = now - Number(event.createdAt)
-    if (!Number.isFinite(dt) || dt < 0 || dt > REWARD_EVENT_DECAY_MS) continue
-    let intensity = limitPositive(Number(event.amount) || 0, REWARD_EVENT_VALUE_CLAMP)
-    if (intensity <= 0) continue
-    const timeDecay = Math.max(0, 1 - dt / REWARD_EVENT_DECAY_MS)
-    intensity *= timeDecay
-    const eventPos = event.position
-    if (eventPos && position) {
-      const dx = Number(eventPos.x) - Number(position.x)
-      const dy = Number(eventPos.y) - Number(position.y)
-      const dz = Number(eventPos.z) - Number(position.z)
-      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
-      if (!Number.isFinite(dist) || dist > REWARD_EVENT_RANGE) {
-        continue
-      }
-      const spatialDecay = Math.max(0, 1 - dist / REWARD_EVENT_RANGE)
-      intensity *= spatialDecay
-    } else if (event.senderId !== context.id) {
-      continue
-    }
-    if (event.senderId !== context.id && context.mode && event.mode) {
-      const sameMode = event.mode === context.mode
-      noteGroupInteraction(context, sameMode, intensity, 'reward-highlight')
-    }
-    if (intensity <= topIntensity) continue
-    topIntensity = intensity
-    topReason = hashRewardReason(event.reason)
-    topFreshness = timeDecay
-  }
-  signal.amount = topIntensity
-  signal.reason = Math.max(0, Math.min(1, topReason))
-  signal.freshness = Math.max(0, Math.min(1, topFreshness))
-  signal.updatedAt = now
-  refreshRewardHighlight(context, now)
-  return signal
 }
 
 function computeCommunicationIntensity(context, type) {
@@ -3510,6 +3414,55 @@ function ensureEmotionVector(context) {
   return context.emotion
 }
 
+function computeWrappedDelta(current, previous, period) {
+  if (!Number.isFinite(current) || !Number.isFinite(previous)) {
+    return 0
+  }
+  if (!Number.isFinite(period) || period <= 0) {
+    return current - previous
+  }
+  let delta = current - previous
+  const halfPeriod = period / 2
+  while (delta > halfPeriod) {
+    delta -= period
+  }
+  while (delta < -halfPeriod) {
+    delta += period
+  }
+  return delta
+}
+
+function computeObservationDifferential(current, previous) {
+  const diff = new Float32Array(current.length)
+  let filtered = 0
+  for (let i = 0; i < current.length; i++) {
+    const value = Number.isFinite(current[i]) ? current[i] : 0
+    if (OBS_FILTERED_INDICES.has(i)) {
+      diff[i] = 0
+      filtered += 1
+      continue
+    }
+    if (OBS_MOTION_PASSTHROUGH_INDICES.has(i)) {
+      diff[i] = value
+      continue
+    }
+    if (!previous || !Number.isFinite(previous[i])) {
+      diff[i] = 0
+      filtered += 1
+      continue
+    }
+    const period = OBS_DIFFERENTIAL_WRAP.get(i) ?? 0
+    const delta = period ? computeWrappedDelta(value, previous[i], period) : value - previous[i]
+    if (!Number.isFinite(delta)) {
+      diff[i] = 0
+      filtered += 1
+    } else {
+      diff[i] = delta
+    }
+  }
+  return { diff, filtered }
+}
+
 function adjustMorale(context, reward) {
   const accumulator = ensureRewardAccumulator(reward)
   if (!context.morale) {
@@ -3610,6 +3563,7 @@ async function ensureCrossoverBrain(slot) {
 }
 
 async function performPopulationCrossover(sortedContexts) {
+  if (USE_SHARED_BRAIN) return
   if (!baselineBrain) return
   if (!Array.isArray(sortedContexts) || !sortedContexts.length) return
 
@@ -3654,12 +3608,15 @@ async function performPopulationCrossover(sortedContexts) {
 
 function gatherObservations(context) {
   const { bot } = context
-  const obs = new Float32Array(OBS_SIZE)
+  const observation = new Float32Array(OBS_SIZE)
 
   if (!bot?.entity?.position) {
-    return obs
+    context.currentObservationFrame = null
+    context.observationFilteredCount = BASE_OBS_FEATURES
+    return observation
   }
 
+  const frame = new Float32Array(BASE_OBS_FEATURES)
   const pos = bot.entity.position
   const vel = bot.entity.velocity ?? { x: 0, y: 0, z: 0 }
   const yaw = bot.entity?.yaw ?? 0
@@ -3686,139 +3643,146 @@ function gatherObservations(context) {
 
   const invTotal = inv.reduce((sum, item) => sum + (item?.count ?? 0), 0)
 
-  obs[0] = Number(pos.x) || 0
-  obs[1] = Number(pos.y) || 0
-  obs[2] = Number(pos.z) || 0
-  obs[3] = Number(vel.x) || 0
-  obs[4] = Number(vel.y) || 0
-  obs[5] = Number(vel.z) || 0
-  obs[6] = Number(yaw) || 0
-  obs[7] = Number(pitch) || 0
-  obs[8] = Number(bot.health ?? 20) || 0
-  obs[9] = Number(bot.food ?? 20) || 0
-  obs[10] = Number(bot.oxygenLevel ?? bot.oxygen ?? 20) || 0
-  obs[11] = bot.entity?.onGround ? 1 : 0
-  obs[12] = bot.controlState?.sprint ? 1 : 0
-  obs[13] = bot.controlState?.sneak ? 1 : 0
-  obs[14] = Number(bot.time?.age ?? 0) || 0
-  obs[15] = entities.length
-  obs[16] = nearestEntityDist
-  obs[17] = inv.length
-  obs[18] = invTotal
-  obs[19] = Number(bot.quickBarSlot ?? 0)
-  obs[20] = Number(bot.experience?.level ?? 0)
-  obs[21] = Number(bot.experience?.progress ?? 0)
+  frame[0] = Number(pos.x) || 0
+  frame[1] = Number(pos.y) || 0
+  frame[2] = Number(pos.z) || 0
+  frame[3] = Number(vel.x) || 0
+  frame[4] = Number(vel.y) || 0
+  frame[5] = Number(vel.z) || 0
+  frame[6] = Number(yaw) || 0
+  frame[7] = Number(pitch) || 0
+  frame[8] = Number(bot.health ?? 20) || 0
+  frame[9] = Number(bot.food ?? 20) || 0
+  frame[10] = Number(bot.oxygenLevel ?? bot.oxygen ?? 20) || 0
+  frame[11] = bot.entity?.onGround ? 1 : 0
+  frame[12] = bot.controlState?.sprint ? 1 : 0
+  frame[13] = bot.controlState?.sneak ? 1 : 0
+  frame[14] = Number(bot.time?.age ?? 0) || 0
+  frame[15] = entities.length
+  frame[16] = nearestEntityDist
+  frame[17] = inv.length
+  frame[18] = invTotal
+  frame[19] = Number(bot.quickBarSlot ?? 0)
+  frame[20] = Number(bot.experience?.level ?? 0)
+  frame[21] = Number(bot.experience?.progress ?? 0)
   const timeOfDay = Number(bot.time?.timeOfDay ?? bot.time?.day ?? bot.time?.age ?? 0)
   const normalizedTime = Number.isFinite(timeOfDay) ? ((timeOfDay % 24000) / 24000) : 0
   const isDay = normalizedTime >= 0.25 && normalizedTime <= 0.75 ? 1 : 0
   const weatherState = bot.world?.weather ?? (bot.isRaining ? 'rain' : 'clear')
   const raining = bot.isRaining || weatherState === 'rain' || weatherState === 'thunder' ? 1 : 0
   const thundering = bot.isThundering || weatherState === 'thunder' ? 1 : 0
-  obs[22] = normalizedTime
-  obs[23] = isDay
-  obs[24] = raining ? 1 : 0
-  obs[25] = thundering ? 1 : 0
+  frame[22] = normalizedTime
+  frame[23] = isDay
+  frame[24] = raining ? 1 : 0
+  frame[25] = thundering ? 1 : 0
 
   trackEnvironmentAwareness(context)
-  trackNovelty(context, obs)
+  trackNovelty(context, frame)
 
   const uniqueStateRatio = Math.min(1, context.visitedStates.size / NOVELTY_TARGET)
   const uniqueBlocksRatio = Math.min(1, context.visitedBlocks.size / 200)
   const uniqueBiomesRatio = Math.min(1, context.visitedBiomes.size / 32)
-  obs[26] = uniqueStateRatio
-  obs[27] = uniqueBlocksRatio
-  obs[28] = uniqueBiomesRatio
+  frame[26] = uniqueStateRatio
+  frame[27] = uniqueBlocksRatio
+  frame[28] = uniqueBiomesRatio
 
-  obs[29] = Math.min(1, context.resources.wood / 64)
-  obs[30] = Math.min(1, context.resources.stone / 128)
-  obs[31] = Math.min(1, context.resources.ore / 64)
-  obs[32] = Math.min(1, context.resources.crafted / 32)
-  obs[33] = Math.min(1, context.resourceLedger.contributed / 128)
-  obs[34] = Math.min(1, context.resourceLedger.withdrawn / 128)
-  obs[35] = Math.min(1, context.behaviorEntropy)
-  obs[36] = Math.min(1, context.currentChainScore)
-  obs[37] = context.stagnation.active ? 1 : 0
+  frame[29] = Math.min(1, context.resources.wood / 64)
+  frame[30] = Math.min(1, context.resources.stone / 128)
+  frame[31] = Math.min(1, context.resources.ore / 64)
+  frame[32] = Math.min(1, context.resources.crafted / 32)
+  frame[33] = Math.min(1, context.resourceLedger.contributed / 128)
+  frame[34] = Math.min(1, context.resourceLedger.withdrawn / 128)
+  frame[35] = Math.min(1, context.behaviorEntropy)
+  frame[36] = Math.min(1, context.currentChainScore)
+  frame[37] = context.stagnation.active ? 1 : 0
   const emotion = ensureEmotionVector(context)
-  obs[38] = emotion[0] ?? MORALE_BASELINE
-  obs[39] = emotion[1] ?? 0
-  obs[40] = emotion[2] ?? 0.5
-  obs[41] = context.mode === 'feral' ? 1 : 0
+  frame[38] = emotion[0] ?? MORALE_BASELINE
+  frame[39] = emotion[1] ?? 0
+  frame[40] = emotion[2] ?? 0.5
+  frame[41] = context.mode === 'feral' ? 1 : 0
   const lineagePrestige = getLineagePrestige(context.lineage)
-  obs[42] = Math.max(0, Math.min(1, lineagePrestige))
+  frame[42] = Math.max(0, Math.min(1, lineagePrestige))
   const diversityRatio = Math.min(1, GLOBAL_RESOURCE_POOL.diversity.size / RESOURCE_TYPES.length)
-  obs[43] = diversityRatio
+  frame[43] = diversityRatio
 
   const tickCount = Number.isFinite(context.tickCount) ? context.tickCount : 0
-  obs[44] = normalizePositive(tickCount, CONTEXT_TICK_NORMALIZER)
+  frame[44] = normalizePositive(tickCount, CONTEXT_TICK_NORMALIZER)
   const trainingSteps = Number.isFinite(context.trainingSteps) ? context.trainingSteps : 0
-  obs[45] = normalizePositive(trainingSteps, CONTEXT_TRAINING_NORMALIZER)
+  frame[45] = normalizePositive(trainingSteps, CONTEXT_TRAINING_NORMALIZER)
   const cumulativeReward = Number.isFinite(context.cumulativeReward) ? context.cumulativeReward : 0
-  obs[46] = normalizeMagnitude(cumulativeReward, CONTEXT_REWARD_NORMALIZER)
+  frame[46] = normalizeMagnitude(cumulativeReward, CONTEXT_REWARD_NORMALIZER)
   const noveltyTotal = Number.isFinite(context.noveltyCount) ? context.noveltyCount : 0
-  obs[47] = normalizePositive(noveltyTotal, NOVELTY_COUNT_NORMALIZER)
+  frame[47] = normalizePositive(noveltyTotal, NOVELTY_COUNT_NORMALIZER)
 
   const feralFury = Number.isFinite(context.feralFury) ? Math.max(0, context.feralFury) : 0
-  obs[48] = normalizePositive(feralFury, FERAL_FURY_NORMALIZER)
+  frame[48] = normalizePositive(feralFury, FERAL_FURY_NORMALIZER)
   const cooperationScore = Number.isFinite(context.cooperationScore) ? context.cooperationScore : 0
-  obs[49] = normalizeMagnitude(cooperationScore, COOPERATION_CLAMP)
+  frame[49] = normalizeMagnitude(cooperationScore, COOPERATION_CLAMP)
   const epsilon = Number.isFinite(context.epsilon) ? Math.max(0, context.epsilon) : EPSILON_START
-  obs[50] = normalizePositive(epsilon, EPSILON_NORMALIZER)
+  frame[50] = normalizePositive(epsilon, EPSILON_NORMALIZER)
   const epsilonBoost = Number.isFinite(context.epsilonBoost) ? Math.abs(context.epsilonBoost) : 0
-  obs[51] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
+  frame[51] = normalizePositive(epsilonBoost, EPSILON_BOOST_NORMALIZER)
   const morale = context.morale ?? { successStreak: 0, failureStreak: 0, frustration: 0, sharpness: 0.5 }
-  obs[52] = normalizePositive(Number(morale.successStreak) || 0, STREAK_NORMALIZER)
-  obs[53] = normalizePositive(Number(morale.failureStreak) || 0, STREAK_NORMALIZER)
-  obs[54] = normalizeMagnitude(Number(morale.frustration) || 0, MORALE_FRUSTRATION_CLAMP)
-  obs[55] = normalizeMagnitude(Number(morale.sharpness) || 0, MORALE_SHARPNESS_CLAMP)
+  frame[52] = normalizePositive(Number(morale.successStreak) || 0, STREAK_NORMALIZER)
+  frame[53] = normalizePositive(Number(morale.failureStreak) || 0, STREAK_NORMALIZER)
+  frame[54] = normalizeMagnitude(Number(morale.frustration) || 0, MORALE_FRUSTRATION_CLAMP)
+  frame[55] = normalizeMagnitude(Number(morale.sharpness) || 0, MORALE_SHARPNESS_CLAMP)
 
   const comm = ensureCommunicationState(context)
   const commSummary = comm?.summary
   if (commSummary) {
     for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
       const allyValue = Number.isFinite(commSummary.allies?.[i]) ? commSummary.allies[i] : 0
-      obs[56 + i] = normalizePositive(allyValue, COMMUNICATION_INTENSITY_CLAMP)
+      frame[56 + i] = normalizePositive(allyValue, COMMUNICATION_INTENSITY_CLAMP)
     }
     for (let i = 0; i < COMMUNICATION_TYPE_COUNT; i++) {
       const otherValue = Number.isFinite(commSummary.others?.[i]) ? commSummary.others[i] : 0
-      obs[56 + COMMUNICATION_TYPE_COUNT + i] = normalizePositive(otherValue, COMMUNICATION_INTENSITY_CLAMP)
+      frame[56 + COMMUNICATION_TYPE_COUNT + i] = normalizePositive(otherValue, COMMUNICATION_INTENSITY_CLAMP)
     }
     const now = Date.now()
     const lastSentAgo = comm?.lastSentAt ? Math.max(0, now - comm.lastSentAt) : Number.POSITIVE_INFINITY
     const lastHeardAgo = comm?.lastHeardAt ? Math.max(0, now - comm.lastHeardAt) : Number.POSITIVE_INFINITY
     const sentFreshness = 1 - normalizePositive(lastSentAgo, COMMUNICATION_TIME_NORMALIZER)
     const heardFreshness = 1 - normalizePositive(lastHeardAgo, COMMUNICATION_TIME_NORMALIZER)
-    obs[56 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, sentFreshness))
-    obs[57 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, heardFreshness))
+    frame[56 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, sentFreshness))
+    frame[57 + COMMUNICATION_TYPE_COUNT * 2] = Math.max(0, Math.min(1, heardFreshness))
     const direction = commSummary.direction ?? { x: 0, z: 0 }
-    obs[58 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+    frame[58 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
       Number(direction.x) || 0,
       COMMUNICATION_DIRECTION_NORMALIZER
     )
-    obs[59 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
+    frame[59 + COMMUNICATION_TYPE_COUNT * 2] = normalizeMagnitude(
       Number(direction.z) || 0,
       COMMUNICATION_DIRECTION_NORMALIZER
     )
   } else {
     for (let i = 0; i < COMMUNICATION_TYPE_COUNT * 2 + 4; i++) {
-      obs[56 + i] = 0
+      frame[56 + i] = 0
     }
   }
 
   const rewardSignalIndex = 56 + COMMUNICATION_TYPE_COUNT * 2 + 4
   const rewardSignal = updateRewardEventAwareness(context)
   const rewardSignalAmount = normalizePositive(rewardSignal?.amount ?? 0, REWARD_EVENT_VALUE_CLAMP)
-  obs[rewardSignalIndex] = rewardSignalAmount
-  obs[rewardSignalIndex + 1] = Math.max(0, Math.min(1, rewardSignal?.reason ?? 0))
-  obs[rewardSignalIndex + 2] = Math.max(0, Math.min(1, rewardSignal?.freshness ?? 0))
+  frame[rewardSignalIndex] = rewardSignalAmount
+  frame[rewardSignalIndex + 1] = 0
+  frame[rewardSignalIndex + 2] = Math.max(0, Math.min(1, rewardSignal?.freshness ?? 0))
   const affinityState = ensureGroupAffinityState(context)
   const affinitySame = normalizePositive(affinityState?.same ?? 0, GROUP_AFFINITY_CLAMP)
   const affinityOther = normalizePositive(affinityState?.other ?? 0, GROUP_AFFINITY_CLAMP)
-  obs[rewardSignalIndex + 3] = affinitySame
-  obs[rewardSignalIndex + 4] = affinityOther
+  frame[rewardSignalIndex + 3] = affinitySame
+  frame[rewardSignalIndex + 4] = affinityOther
 
-  populateMemoryObservation(context, obs, MEMORY_OBS_START)
+  const previousFrame = context.lastObservationFrame
+  const { diff, filtered } = computeObservationDifferential(frame, previousFrame)
+  observation.set(diff, 0)
+  populateMemoryObservation(context, observation, MEMORY_OBS_START)
 
-  return sanitizeVector(obs)
+  context.lastObservationFrame = frame
+  context.currentObservationFrame = frame
+  context.observationFilteredCount = filtered
+
+  return sanitizeVector(observation)
 }
 
 async function equipBestTool(context, preferredKeywords = []) {
@@ -4501,51 +4465,38 @@ async function performMining(context, { forward = false, strafe = 0 } = {}) {
 async function executeAction(context, index) {
   const act = ACTIONS[index]
   if (!act) return
+  if (context.actionInFlight) {
+    console.warn(`[${label(context)}] Action skipped; previous action still in flight.`)
+    return
+  }
+  context.actionInFlight = true
   console.log(`[${label(context)}] Executing: ${act}`)
 
   const { bot } = context
 
-  if (CRAFTING_ACTIONS[act]) {
-    await executeCraftAction(context, act)
-    bot.clearControlStates()
-    return
-  }
-
-  const movePulse = (vector, duration = 350, options = {}) =>
-    smoothMovementPulse(context, vector, duration, options)
-
-  const lookBy = async (deltaYaw = 0, deltaPitch = 0) => {
-    await smoothLookBy(context, deltaYaw, deltaPitch)
-  }
-
-  const getTargetBlock = () => bot.blockAtCursor(5)
-
   try {
+    if (CRAFTING_ACTIONS[act]) {
+      await executeCraftAction(context, act)
+      return
+    }
+
+    const movePulse = (vector, duration = 350, options = {}) =>
+      smoothMovementPulse(context, vector, duration, options)
+
+    const lookBy = async (deltaYaw = 0, deltaPitch = 0) => {
+      await smoothLookBy(context, deltaYaw, deltaPitch)
+    }
+
+    const getTargetBlock = () => bot.blockAtCursor(5)
+
+    const relativeAction = RELATIVE_MOVE_LOOKUP.get(act)
+    if (relativeAction) {
+      context.movementController?.reset()
+      await moveRelativeTo(context, relativeAction.forward, relativeAction.right)
+      return
+    }
+
     switch (act) {
-      case 'move_forward':
-        await movePulse({ forward: 1 })
-        break
-      case 'move_backward':
-        await movePulse({ forward: -1 })
-        break
-      case 'strafe_left':
-        await movePulse({ strafe: -1 })
-        break
-      case 'strafe_right':
-        await movePulse({ strafe: 1 })
-        break
-      case 'jump':
-        await movePulse({}, 350, { jump: true })
-        break
-      case 'jump_forward':
-        await movePulse({ forward: 1 }, 500, { jump: true })
-        break
-      case 'sprint_forward':
-        await movePulse({ forward: 1 }, 500, { sprint: true })
-        break
-      case 'sneak_forward':
-        await movePulse({ forward: 1 }, 500, { sneak: true })
-        break
       case 'turn_left':
         await lookBy(-Math.PI / 4, 0)
         break
@@ -4709,6 +4660,7 @@ async function executeAction(context, index) {
   } finally {
     releaseMovement(context)
     bot.clearControlStates()
+    context.actionInFlight = false
   }
 }
 
@@ -4839,260 +4791,6 @@ function computeCrowdingPenalty(context, now = Date.now()) {
   return limitPositive(penalty, CROWDING_PENALTY_CLAMP)
 }
 
-function computeReward(context, obs) {
-  let reward = createRewardAccumulator()
-
-  ensureTemporalMemoryState(context)
-  decayGroupAffinity(context)
-  context.damageDebt = limitPositive((context.damageDebt ?? 0) * DAMAGE_DEBT_DECAY, DAMAGE_MEMORY_CLAMP)
-  context.recentDamage = limitPositive((context.recentDamage ?? 0) * DAMAGE_RECENT_DECAY, DAMAGE_MEMORY_CLAMP)
-
-  const pos = { x: obs[0], y: obs[1], z: obs[2] }
-  if (context.lastPos) {
-    const dx = pos.x - context.lastPos.x
-    const dy = pos.y - context.lastPos.y
-    const dz = pos.z - context.lastPos.z
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
-    const horizontal = Math.sqrt(dx * dx + dz * dz)
-    reward = applyRewardComponent(
-      reward,
-      Math.min(dist * 0.1, 0.5),
-      REWARD_SIGN.POSITIVE,
-      context,
-      'movement-distance'
-    )
-    reward = applyRewardComponent(
-      reward,
-      Math.min(horizontal * 0.05, 0.25),
-      REWARD_SIGN.POSITIVE,
-      context,
-      'movement-horizontal'
-    )
-    reward = applyRewardComponent(
-      reward,
-      Math.min(Math.abs(dy) * 0.05, 0.15),
-      REWARD_SIGN.POSITIVE,
-      context,
-      'movement-vertical'
-    )
-  }
-
-  const health = obs[8]
-  if (Number.isFinite(health)) {
-    if (health < context.lastHealth) {
-      const damage = Math.max(0, context.lastHealth - health)
-      reward = applyRewardComponent(
-        reward,
-        Math.min(1.5, damage * 0.5),
-        REWARD_SIGN.NEGATIVE,
-        context,
-        'damage-taken'
-      )
-      context.damageDebt = limitPositive(context.damageDebt + damage * DAMAGE_DEBT_WEIGHT, DAMAGE_MEMORY_CLAMP)
-      context.recentDamage = limitPositive(context.recentDamage + damage, DAMAGE_MEMORY_CLAMP)
-    } else if (health > context.lastHealth) {
-      reward = applyRewardComponent(
-        reward,
-        Math.min(1, (health - context.lastHealth) * 0.5),
-        REWARD_SIGN.POSITIVE,
-        context,
-        'health-regain'
-      )
-    }
-    context.lastHealth = health
-  }
-
-  const food = obs[9]
-  if (Number.isFinite(food)) {
-    if (food > context.lastFood) {
-      reward = applyRewardComponent(
-        reward,
-        Math.min(0.5, (food - context.lastFood) * 0.1),
-        REWARD_SIGN.POSITIVE,
-        context,
-        'food-gain'
-      )
-    } else if (food < context.lastFood) {
-      reward = applyRewardComponent(
-        reward,
-        Math.min(0.5, (context.lastFood - food) * 0.05),
-        REWARD_SIGN.NEGATIVE,
-        context,
-        'food-loss'
-      )
-    }
-    context.lastFood = food
-  }
-
-  const invTotal = obs[18]
-  if (Number.isFinite(invTotal)) {
-    const delta = invTotal - context.lastInvTotal
-    if (delta !== 0) {
-      reward = applyRewardComponent(
-        reward,
-        Math.sign(delta) * Math.min(Math.abs(delta) * 0.2, 1.5),
-        REWARD_SIGN.EITHER,
-        context,
-        'inventory-delta'
-      )
-    }
-    context.lastInvTotal = invTotal
-  }
-
-  const nearestDist = obs[16]
-  if (Number.isFinite(nearestDist) && nearestDist > 0 && nearestDist < 3) {
-    reward = applyRewardComponent(
-      reward,
-      (3 - nearestDist) * 0.05,
-      REWARD_SIGN.NEGATIVE,
-      context,
-      'threat-proximity'
-    )
-  }
-
-  if (context.lastAction != null) {
-    if (context.prevAction === context.lastAction) {
-      context.repetitionStreak += 1
-    } else {
-      context.repetitionStreak = 0
-    }
-    const fatiguePenalty = Math.min(0.6, context.repetitionStreak * 0.05)
-    reward = applyRewardComponent(reward, fatiguePenalty, REWARD_SIGN.NEGATIVE, context, 'action-fatigue')
-  }
-
-  const crowdPenalty = computeCrowdingPenalty(context)
-  if (crowdPenalty > 0) {
-    reward = applyRewardComponent(reward, -crowdPenalty, REWARD_SIGN.NEGATIVE, context, 'crowding')
-  }
-
-  if (context.noveltyFlag) {
-    reward = applyRewardComponent(
-      reward,
-      0.12 * rewardProfile.novelty,
-      REWARD_SIGN.POSITIVE,
-      context,
-      'novelty'
-    )
-  }
-
-  updateCooperationScore(context)
-  const cooperation = Number.isFinite(context.cooperationScore) ? context.cooperationScore : 0
-  const entropy = Number.isFinite(context.behaviorEntropy) ? context.behaviorEntropy : 0
-  const chainScore = Number.isFinite(context.currentChainScore) ? context.currentChainScore : 0
-  reward = applyRewardComponent(
-    reward,
-    Math.max(-0.3, Math.min(0.3, cooperation * 0.5)) * rewardProfile.cooperation,
-    REWARD_SIGN.EITHER,
-    context,
-    'cooperation'
-  )
-  reward = applyRewardComponent(
-    reward,
-    (entropy - 0.5) * 0.1 * rewardProfile.entropy,
-    REWARD_SIGN.EITHER,
-    context,
-    'entropy'
-  )
-  reward = applyRewardComponent(
-    reward,
-    Math.min(0.25, chainScore * 0.2) * rewardProfile.skill,
-    REWARD_SIGN.POSITIVE,
-    context,
-    'skill-chain'
-  )
-
-  if (!Number.isFinite(context.blockReward)) {
-    context.blockReward = 0
-  }
-  const consumedBlockReward = context.blockReward
-  reward = applyRewardComponent(
-    reward,
-    consumedBlockReward * rewardProfile.resource,
-    REWARD_SIGN.EITHER,
-    context,
-    'block-reward'
-  )
-  context.blockReward = 0
-
-  const achievementBonus = context.achievementReward ?? 0
-  if (achievementBonus !== 0) {
-    reward = applyRewardComponent(reward, achievementBonus, REWARD_SIGN.POSITIVE, context, 'achievement')
-    context.achievementReward = 0
-  }
-
-  if (context.damageDebt > 0) {
-    reward = applyRewardComponent(
-      reward,
-      Math.min(2, context.damageDebt * DAMAGE_DEBT_PENALTY),
-      REWARD_SIGN.NEGATIVE,
-      context,
-      'damage-debt'
-    )
-  }
-
-  const pendingDeathPenalty = context.deathPenalty ?? 0
-  if (pendingDeathPenalty > 0) {
-    reward = applyRewardComponent(
-      reward,
-      pendingDeathPenalty,
-      REWARD_SIGN.NEGATIVE,
-      context,
-      'death-penalty'
-    )
-    context.deathPenalty = 0
-  }
-
-  const lineageBonus = getLineagePrestige(context.lineage) * 0.1 * rewardProfile.lineage
-  reward = applyRewardComponent(reward, lineageBonus, REWARD_SIGN.POSITIVE, context, 'lineage-prestige')
-
-  if (context.mode === 'feral') {
-    const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
-    reward = applyRewardComponent(
-      reward,
-      Math.min(0.5, fury * 0.08) * rewardProfile.feral,
-      REWARD_SIGN.POSITIVE,
-      context,
-      'feral-fury'
-    )
-    reward = applyRewardComponent(
-      reward,
-      Math.max(0, context.cooperationScore) * 0.2,
-      REWARD_SIGN.NEGATIVE,
-      context,
-      'feral-cooperation-penalty'
-    )
-    context.feralFury = Math.max(0, fury * 0.92)
-  } else {
-    const fury = Number.isFinite(context.feralFury) ? context.feralFury : 0
-    context.feralFury = Math.max(0, fury * 0.85)
-  }
-
-  const affinityBonus = computeGroupAffinityBonus(context)
-  if (affinityBonus !== 0) {
-    reward = applyRewardComponent(
-      reward,
-      affinityBonus,
-      REWARD_SIGN.EITHER,
-      context,
-      'group-affinity'
-    )
-  }
-
-  reward = applyRewardComponent(reward, 0.02, REWARD_SIGN.NEGATIVE, context, 'tick-cost')
-
-  reward = adjustMorale(context, reward)
-
-  const summary = finalizeRewardAccumulator(reward)
-
-  updateStagnation(context, summary.total)
-  updateSkillChains(context, summary.total)
-
-  context.lineagePrestige = getLineagePrestige(context.lineage)
-
-  context.lastPos = { ...pos }
-  return summary
-}
-
 async function tickLoop(context) {
   if (!globalRunning || !context.running || context.tickInFlight) return
   context.tickInFlight = true
@@ -5100,6 +4798,7 @@ async function tickLoop(context) {
   const tickStart = monotonicNow()
   let remoteUnavailable = false
   let remoteIssue = null
+  let nextTickReason = null
   try {
     if (!context.bot?.entity?.position) {
       console.warn(`[${label(context)}] Entity not ready, skipping tick.`)
@@ -5112,40 +4811,11 @@ async function tickLoop(context) {
 
     await runMaintenanceRoutines(context)
 
-    let fallbackActive = Boolean(context.echoFallbackActive)
-    const updateFallbackState = active => {
-      const previous = Boolean(context.echoFallbackActive)
-      if (active === previous) {
-        return
-      }
-      context.echoFallbackActive = active
-      if (active) {
-        console.warn(
-          `[${label(context)}] TensorFlow brain unavailable; switching to Echo fallback.`
-        )
-      } else {
-        console.log(
-          `[${label(context)}] TensorFlow brain reachable; exiting Echo fallback.`
-        )
-      }
-    }
-
     const status = getRemoteBrainStatus()
     if (!status.connected) {
       remoteUnavailable = true
       remoteIssue = status
-      if (isEchoFallbackEnabled()) {
-        fallbackActive = true
-        updateFallbackState(true)
-      } else {
-        updateFallbackState(false)
-        return
-      }
-    } else if (fallbackActive) {
-      fallbackActive = false
-      updateFallbackState(false)
-    } else {
-      updateFallbackState(false)
+      return
     }
 
     if (context.weightsSuspect || context.pendingWeightRecovery) {
@@ -5162,21 +4832,17 @@ async function tickLoop(context) {
     }
 
     let brain = null
-    if (!fallbackActive) {
-      try {
-        brain = await ensureContextBrain(context)
-      } catch (err) {
-        if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
-          remoteUnavailable = true
-          remoteIssue = err
-          fallbackActive = true
-          updateFallbackState(true)
-        } else {
-          throw err
-        }
+    try {
+      brain = await ensureContextBrain(context)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        remoteUnavailable = true
+        remoteIssue = err
+        return
       }
+      throw err
     }
-    if (!fallbackActive && !brain) {
+    if (!brain) {
       console.warn(`[${label(context)}] Brain not ready, skipping tick.`)
       return
     }
@@ -5188,7 +4854,8 @@ async function tickLoop(context) {
       console.warn(`[${label(context)}] Observation contained invalid values; skipping tick.`)
       return
     }
-    const reward = computeReward(context, observation)
+    const reward = computeReward(context)
+    const serverReward = applyRewardKalmanFilter(context, reward.reward, reward.penalty)
 
     updateTemporalMemory(context, reward.total)
 
@@ -5212,39 +4879,22 @@ async function tickLoop(context) {
       const lastObsValid = vectorHasFiniteValues(context.lastObs)
       if (lastObsValid) {
         let trainOutcome = null
-        let trainUsedFallback = fallbackActive
-        if (!fallbackActive) {
-          try {
-            trainOutcome = await trainBrainConcurrent(
-              brain,
-              context.lastObs,
-              context.lastAction,
-              reward.reward,
-              reward.penalty,
-              observation
-            )
-          } catch (err) {
-            if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
-              remoteUnavailable = true
-              remoteIssue = err
-              fallbackActive = true
-              trainUsedFallback = true
-              updateFallbackState(true)
-            } else {
-              throw err
-            }
+        try {
+          trainOutcome = await trainBrainConcurrent(
+            brain,
+            context.lastObs,
+            context.lastAction,
+            serverReward.reward,
+            serverReward.penalty,
+            observation
+          )
+        } catch (err) {
+          if (isRemoteBrainUnavailableError(err)) {
+            remoteUnavailable = true
+            remoteIssue = err
+            return
           }
-        }
-        if (fallbackActive) {
-          trainUsedFallback = true
-          trainOutcome = await reportEchoLearning({
-            observation: context.lastObs,
-            nextObservation: observation,
-            actionIndex: context.lastAction,
-            actions: ACTIONS,
-            reward: reward.total,
-            botId: label(context)
-          })
+          throw err
         }
         if (trainOutcome) {
           recordTrainingSanitization(trainOutcome.sanitization)
@@ -5252,7 +4902,7 @@ async function tickLoop(context) {
           recordClippedGradients(trainOutcome.clippedGradients)
           recordGradientNorm(trainOutcome.gradientNorm)
           trained = Boolean(trainOutcome.trained)
-          if (!trainUsedFallback && trainOutcome.weightsOk === false) {
+          if (trainOutcome.weightsOk === false) {
             const trainDetails = {
               ...(trainOutcome.sanitization ?? {}),
               trigger: 'train'
@@ -5270,30 +4920,15 @@ async function tickLoop(context) {
     }
 
     let actionResult = null
-    let actionUsedFallback = fallbackActive
-    if (!fallbackActive) {
-      try {
-        actionResult = await chooseActionConcurrent(brain, observation, effectiveEpsilon)
-      } catch (err) {
-        if (isRemoteBrainUnavailableError(err) && isEchoFallbackEnabled()) {
-          remoteUnavailable = true
-          remoteIssue = err
-          fallbackActive = true
-          actionUsedFallback = true
-          updateFallbackState(true)
-        } else {
-          throw err
-        }
+    try {
+      actionResult = await chooseActionConcurrent(brain, observation, effectiveEpsilon)
+    } catch (err) {
+      if (isRemoteBrainUnavailableError(err)) {
+        remoteUnavailable = true
+        remoteIssue = err
+        return
       }
-    }
-    if (fallbackActive) {
-      actionResult = await chooseEchoAction({
-        observation,
-        epsilon: effectiveEpsilon,
-        actions: ACTIONS,
-        botId: label(context)
-      })
-      actionUsedFallback = true
+      throw err
     }
     if (!actionResult) {
       throw new Error('Failed to select action for current tick')
@@ -5304,9 +4939,8 @@ async function tickLoop(context) {
       10
     )
     if (
-      !actionUsedFallback &&
-      (actionResult?.weightsOk === false ||
-        (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0))
+      actionResult?.weightsOk === false ||
+      (Number.isFinite(remotePolicyReplaced) && remotePolicyReplaced > 0)
     ) {
       const actionDetails = {
         observation: actionResult?.sanitization?.observation ?? {},
@@ -5332,6 +4966,7 @@ async function tickLoop(context) {
     context.prevAction = context.lastAction
     context.lastObs = observation
     context.lastAction = action
+    nextTickReason = 'action-complete'
     context.tickCount += 1
     context.generationTicks += 1
     context.cumulativeReward += reward.total
@@ -5386,14 +5021,32 @@ async function tickLoop(context) {
       }
     }
 
-    if (globalRunning && context.running) {
-      context.tickTimer = setTimeout(() => {
-        context.tickTimer = null
-        tickLoop(context).catch(err => console.error(`[${label(context)}] Tick scheduling error:`, err))
-      }, TICK_RATE)
+    const envReason = context.pendingEnvironmentTick
+      ? context.pendingEnvironmentReason || 'environment'
+      : null
+    context.pendingEnvironmentTick = false
+    context.pendingEnvironmentReason = null
+
+    const reason = nextTickReason ?? envReason
+    if (reason) {
+      scheduleTick(context, reason)
     }
   }
 }
+
+const {
+  scheduleTick,
+  cancelPendingTick,
+  isTickPending,
+  clearAllPendingTicks,
+  noteEnvironmentChange,
+  bindEnvironmentTriggers,
+  unbindEnvironmentTriggers
+} = createTickScheduler({
+  runTick: tickLoop,
+  isGlobalRunning: () => globalRunning,
+  isContextRunning: context => Boolean(context?.running)
+})
 
 async function maybeCompleteGeneration(context) {
   if (context.generationTicks < GENERATION_TICKS) {
@@ -5459,12 +5112,10 @@ async function synchronizeGeneration() {
   if (!contexts.every(ctx => ctx.readyForSync)) return
 
   if (!isRemoteBrainConnected()) {
-    if (isEchoFallbackEnabled()) {
-      const status = getRemoteBrainStatus()
-      console.warn(
-        `[Baseline] Skipping generation sync while TensorFlow brain unavailable (${describeRemoteRetry(status)}).`
-      )
-    }
+    const status = getRemoteBrainStatus()
+    console.warn(
+      `[Baseline] Skipping generation sync while TensorFlow brain unavailable (${describeRemoteRetry(status)}).`
+    )
     return
   }
 
@@ -5526,6 +5177,7 @@ async function synchronizeGeneration() {
             templateSources.length === 1 ? '' : 's'
           }.`
         )
+        scheduleBaselineSave('generation-merge')
       } catch (err) {
         if (isRemoteBrainUnavailableError(err)) {
           throw err
@@ -5541,6 +5193,35 @@ async function synchronizeGeneration() {
       stagnantGenerations = 0
     } else {
       stagnantGenerations += 1
+    }
+
+    if (
+      stagnantGenerations >= Math.max(1, Math.floor(STAGNATION_MUTATION_THRESHOLD / 2)) &&
+      LOCAL_MINIMUM_MUTATION_PROB > 0 &&
+      Math.random() < LOCAL_MINIMUM_MUTATION_PROB
+    ) {
+      const minStddev = Math.max(0, LOCAL_MINIMUM_MUTATION_MIN)
+      const maxStddev = Math.max(minStddev, LOCAL_MINIMUM_MUTATION_MAX)
+      const stddev = minStddev + Math.random() * (maxStddev - minStddev)
+      console.log(
+        `[Baseline] Potential local minimum detected — applying random mutation stddev ${stddev.toFixed(3)}.`
+      )
+      try {
+        await mutateWeights(baselineBrain, stddev)
+        markBaselineWeightsHealthy('local-minimum-mutate')
+        for (const ctx of contexts) {
+          ctx.stagnation.lastMutation = baselineState.generation
+        }
+      } catch (err) {
+        if (isRemoteBrainUnavailableError(err)) {
+          const status = getRemoteBrainStatus()
+          console.warn(
+            `[Baseline] Local-minimum mutation skipped: remote brain unavailable (${describeRemoteRetry(status)}).`
+          )
+        } else {
+          console.error('[Baseline] Local-minimum mutation failed:', err)
+        }
+      }
     }
 
     if (stagnantGenerations >= STAGNATION_MUTATION_THRESHOLD) {
@@ -5842,19 +5523,18 @@ async function synchronizeGeneration() {
   }
 }
 
-function applyDeathPenalty(context, source = 'unknown') {
+function clearControlStateOnDeath(context) {
   if (!context) return
-  const now = Date.now()
-  if (context.lastDeathAt && now - context.lastDeathAt < 1000) {
-    return
+  try {
+    context.movementController?.reset()
+  } catch (err) {
+    console.warn(`[${label(context)}] Failed to reset movement controller after death:`, err?.message ?? err)
   }
-  context.lastDeathAt = now
-  const penalty = Math.max(5, DEATH_REWARD_PENALTY)
-  context.deathPenalty = (context.deathPenalty ?? 0) + penalty
-  drainPositiveBlockReward(context, penalty * 0.1)
-  context.repetitionStreak = 0
-  context.noveltyFlag = false
-  console.warn(`[${label(context)}] Death detected via ${source} → -${penalty.toFixed(2)} reward penalty`)
+  try {
+    context.bot?.clearControlStates?.()
+  } catch (err) {
+    console.warn(`[${label(context)}] Failed to clear control states after death:`, err?.message ?? err)
+  }
 }
 
 function setupRewardTracking(context) {
@@ -6015,6 +5695,8 @@ function setupRewardTracking(context) {
 
   bot.on('death', () => {
     applyDeathPenalty(context, 'death-event')
+    clearIncomingRewards(context, 'death-event')
+    clearControlStateOnDeath(context)
   })
 }
 
@@ -6022,10 +5704,10 @@ function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
   if (!context || context.shuttingDown) return
   if (context.reconnectTimer) return
   context.running = false
-  if (context.tickTimer) {
-    clearTimeout(context.tickTimer)
-    context.tickTimer = null
-  }
+  cancelPendingTick(context)
+  context.pendingEnvironmentTick = false
+  context.pendingEnvironmentReason = null
+  unbindEnvironmentTriggers(context)
   context.reconnecting = true
   context.reconnectAttempts = (context.reconnectAttempts ?? 0) + 1
   const backoff = Math.min(30000, Math.floor(delay * context.reconnectAttempts))
@@ -6041,8 +5723,10 @@ function scheduleReconnect(context, reason = 'disconnect', delay = 5000) {
       const newBot = mineflayer.createBot({
         host: NETWORK_HOST,
         port: NETWORK_PORT,
-        username: context.username
+        username: context.username,
+        maxPacketSize: BOT_MAX_PACKET_SIZE
       })
+      newBot.loadPlugin(pathfinder)
       context.bot = newBot
       context.movementController?.reset()
       context.running = true
@@ -6062,6 +5746,8 @@ function setupBot(context) {
 
   const { bot } = context
 
+  bindEnvironmentTriggers(context)
+
   bot.once('spawn', () => {
     console.log(`[${label(context)}] Spawned! Waiting for entity to initialize...`)
 
@@ -6070,6 +5756,8 @@ function setupBot(context) {
     context.registry = context.bot.registry ?? context.registry
     if (!context.registry) {
       console.warn(`[${label(context)}] Failed to load registry — crafting actions will be limited.`)
+    } else {
+      context.pathfinderMoves = new Movements(context.bot, context.registry)
     }
 
     const waitForEntity = setInterval(() => {
@@ -6077,7 +5765,7 @@ function setupBot(context) {
         clearInterval(waitForEntity)
         console.log(`[${label(context)}] Entity ready — starting tick loop!`)
 
-        tickLoop(context).catch(err => console.error(`[${label(context)}] Initial tick error:`, err))
+        scheduleTick(context, 'spawn-ready')
       }
     }, 500)
   })
@@ -6107,15 +5795,16 @@ async function retireContext(context, reason = 'retire') {
   if (!context) return
   context.running = false
   context.shuttingDown = true
-  if (context.tickTimer) {
-    clearTimeout(context.tickTimer)
-    context.tickTimer = null
-  }
+  cancelPendingTick(context)
+  context.pendingEnvironmentTick = false
+  context.pendingEnvironmentReason = null
+  clearBackendRetry(context)
   if (context.reconnectTimer) {
     clearTimeout(context.reconnectTimer)
     context.reconnectTimer = null
   }
   try {
+    unbindEnvironmentTriggers(context)
     context.bot?.removeAllListeners?.()
     context.bot?.quit?.(safeDisconnectReason(`Retire: ${reason}`))
   } catch (err) {
@@ -6188,6 +5877,28 @@ async function restartAllBots(reason = 'recovery', { resume } = {}) {
   console.log(
     `[Brain] Restart complete (${contexts.length} bots active, running=${desiredRunning}).`
   )
+}
+
+function schedulePeriodicReinitialize() {
+  if (periodicReinitTimer || BOT_REINIT_INTERVAL_MS <= 0) {
+    return
+  }
+  periodicReinitTimer = setInterval(async () => {
+    if (periodicReinitInFlight) {
+      return
+    }
+    periodicReinitInFlight = true
+    try {
+      const wasRunning = globalRunning
+      scheduleBaselineSave('periodic-reinit')
+      await sleep(BOT_REINIT_SAVE_DELAY_MS)
+      await restartAllBots('periodic-reinit', { resume: wasRunning })
+    } catch (err) {
+      console.error('[Brain] Periodic reinit failed:', err)
+    } finally {
+      periodicReinitInFlight = false
+    }
+  }, BOT_REINIT_INTERVAL_MS)
 }
 
 async function handleFatalProcessError(source, error) {
@@ -6276,8 +5987,10 @@ function createContext(index, options = {}) {
   const bot = mineflayer.createBot({
     host: NETWORK_HOST,
     port: NETWORK_PORT,
-    username
+    username,
+    maxPacketSize: BOT_MAX_PACKET_SIZE
   })
+  bot.loadPlugin(pathfinder)
 
   const emotion = new Float32Array(EMOTION_VECTOR_SIZE)
   for (let i = 0; i < EMOTION_VECTOR_SIZE; i++) {
@@ -6308,6 +6021,8 @@ function createContext(index, options = {}) {
     feralFury: 0,
     bot,
     brain: null,
+    backendRetryTimer: null,
+    backendRetryAt: 0,
     weightsSuspect: false,
     pendingWeightRecovery: null,
     weightRecoveryInFlight: null,
@@ -6315,16 +6030,20 @@ function createContext(index, options = {}) {
     lastWeightRecovery: Date.now(),
     lastWeightRecoveryReason: 'init',
     weightSkipNotified: false,
-    echoFallbackActive: false,
     pendingMutations: [],
     epsilon: EPSILON_START,
     epsilonBoost: 0,
     running: true,
-    tickTimer: null,
     tickInFlight: false,
+    pendingEnvironmentTick: false,
+    pendingEnvironmentReason: null,
     movementController: null,
+    pathfinderMoves: null,
     registry: null,
     lastObs: null,
+    lastObservationFrame: null,
+    currentObservationFrame: null,
+    observationFilteredCount: 0,
     lastAction: null,
     prevAction: null,
     lastActionAt: 0,
@@ -6353,6 +6072,7 @@ function createContext(index, options = {}) {
     rewardDrift: 0,
     rewardVolatility: 0,
     rewardSignStats: { corrections: 0, history: [] },
+    rewardKalman: createRewardKalmanFilterState(),
     cosinePenaltyScaling: { reasons: Object.create(null) },
     actionMemoryBest: 0,
     actionMemoryWorst: 0,
@@ -6364,6 +6084,7 @@ function createContext(index, options = {}) {
     noveltyCount: 0,
     noveltyFlag: false,
     deathPenalty: 0,
+    actionInFlight: false,
     damageDebt: 0,
     recentDamage: 0,
     lastDeathAt: 0,
@@ -6423,7 +6144,8 @@ function createContext(index, options = {}) {
     },
     nonFiniteTracker: null,
     communication: createCommunicationState(),
-    groupAffinity: createGroupAffinityState()
+    groupAffinity: createGroupAffinityState(),
+    environmentListeners: []
   }
 
   resetNonFiniteTracker(context)
@@ -6464,6 +6186,8 @@ for (let i = 0; i < BOT_COUNT; i++) {
   createContext(i, { mutationStddev: seedMutation })
 }
 
+schedulePeriodicReinitialize()
+
 process.stdin.resume()
 process.stdin.setEncoding('utf8')
 console.log('[Brain] Type "pause", "resume", "save", "restart", or "exit".')
@@ -6474,11 +6198,11 @@ process.stdin.on('data', async data => {
     globalRunning = false
     for (const ctx of contexts) {
       ctx.running = false
-      if (ctx.tickTimer) {
-        clearTimeout(ctx.tickTimer)
-        ctx.tickTimer = null
-      }
+      cancelPendingTick(ctx)
+      ctx.pendingEnvironmentTick = false
+      ctx.pendingEnvironmentReason = null
     }
+    clearAllPendingTicks()
     console.log('[Brain] Paused. Current ticks will finish before stopping.')
   } else if (cmd === 'resume') {
     if (!globalRunning) {
@@ -6486,8 +6210,8 @@ process.stdin.on('data', async data => {
       for (const ctx of contexts) {
         if (!ctx.running) {
           ctx.running = true
-          if (!ctx.tickInFlight && !ctx.tickTimer) {
-            tickLoop(ctx).catch(err => console.error(`[${label(ctx)}] Resume tick error:`, err))
+          if (!ctx.tickInFlight && !isTickPending(ctx)) {
+            scheduleTick(ctx, 'resume')
           }
         }
       }
@@ -6515,11 +6239,11 @@ process.stdin.on('data', async data => {
     for (const ctx of contexts) {
       ctx.running = false
       ctx.shuttingDown = true
-      if (ctx.tickTimer) {
-        clearTimeout(ctx.tickTimer)
-        ctx.tickTimer = null
-      }
+      cancelPendingTick(ctx)
+      ctx.pendingEnvironmentTick = false
+      ctx.pendingEnvironmentReason = null
     }
+    clearAllPendingTicks()
     await flushPendingSave()
     if (isRemoteBrainConnected()) {
       try {
@@ -6570,11 +6294,11 @@ async function gracefulShutdown(reason = 'signal') {
     for (const ctx of contexts) {
       ctx.running = false
       ctx.shuttingDown = true
-      if (ctx.tickTimer) {
-        clearTimeout(ctx.tickTimer)
-        ctx.tickTimer = null
-      }
+      cancelPendingTick(ctx)
+      ctx.pendingEnvironmentTick = false
+      ctx.pendingEnvironmentReason = null
     }
+    clearAllPendingTicks()
     await flushPendingSave()
     if (isRemoteBrainConnected()) {
       try {

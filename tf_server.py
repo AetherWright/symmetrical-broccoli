@@ -212,19 +212,16 @@ WORKERS = EndpointWorkerPool(ENDPOINT_WORKER_LIMITS)
 atexit.register(WORKERS.shutdown)
 
 BRAIN_CONFIG = {
-    "hidden_units": 192,
-    "mid_units": 144,
-    "shared_units": 96,
-    "dropout_rate": 0.3,
-    "hebbian_units": [160, 112],
-    "hebbian_learning_rate": 0.01,
-    "hebbian_decay_multiplier": 1.5,
-    "hebbian_clip": 0.75,
-    "transformer_tokens": 6,
-    "transformer_embed": 32,
-    "transformer_heads": 4,
-    "transformer_layers": 2,
-    "transformer_ff": 256,
+    "storsky_units": [128, 96],
+    "dropout_rate": 0.2,
+    "memory_decay": 0.9,
+    "memory_scale": 0.15,
+    "action_branches": [8, 4, 4, 1, 3, 1, 5, 8],
+    "transformer_tokens": 4,
+    "transformer_embed": 24,
+    "transformer_heads": 3,
+    "transformer_layers": 1,
+    "transformer_ff": 96,
     "transformer_rotary_base": 10000.0,
     "learning_rate": 2e-3,
     "lion_beta_1": 0.9,
@@ -233,9 +230,8 @@ BRAIN_CONFIG = {
     "lookahead_sync": 6,
     "lookahead_alpha": 0.5,
     "ema_decay": 0.995,
-    "meta_hidden": 96,
-    "meta_state_momentum": 0.9,
     "reward_prediction_weight": 0.35,
+    "bot_heads": 4,
 }
 
 OBS_CLAMP = abs(_read_float("TF_SERVER_OBSERVATION_CLAMP", 1e6))
@@ -300,73 +296,21 @@ class LookaheadOptimizer:
             self._slow_params[index].data.copy_(param.data)
 
 
-class HebbianLinear(torch.nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        activation=natural_log_relu,
-        hebbian_learning_rate: float = 0.01,
-        decay_multiplier: float = 1.5,
-        clip: float = 0.75,
-    ):
+class StorskyLayer(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int, dropout: float) -> None:
         super().__init__()
-        self.base = torch.nn.Linear(in_features, out_features)
-        self.activation = activation
-        self.hebbian_learning_rate = float(abs(hebbian_learning_rate))
-        self.decay_multiplier = float(abs(decay_multiplier))
-        self.clip = float(abs(clip))
-        self.register_buffer("hebbian_weight", torch.zeros(out_features, in_features))
-        self.register_buffer("hebbian_bias", torch.zeros(out_features))
-        self._last_input: Optional[torch.Tensor] = None
-        self._last_output: Optional[torch.Tensor] = None
+        self.linear = torch.nn.Linear(in_features, out_features)
+        self.norm = torch.nn.LayerNorm(out_features)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.activation = torch.nn.SiLU()
+        self.use_residual = in_features == out_features
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        weight = self.base.weight + self.hebbian_weight
-        bias = self.base.bias + self.hebbian_bias
-        outputs = torch.nn.functional.linear(inputs, weight, bias)
-        if self.activation is not None:
-            outputs = self.activation(outputs)
-        if self.training:
-            self._last_input = inputs.detach()
-            self._last_output = outputs.detach()
-        else:
-            self._last_input = None
-            self._last_output = None
+        outputs = self.activation(self.norm(self.linear(inputs)))
+        outputs = self.dropout(outputs)
+        if self.use_residual:
+            outputs = outputs + inputs
         return outputs
-
-    def _apply_decay(self) -> float:
-        if self.hebbian_learning_rate <= 0:
-            return 0.0
-        decay_rate = self.hebbian_learning_rate * self.decay_multiplier
-        decay_rate = min(0.95, max(0.0, decay_rate))
-        if decay_rate == 0:
-            return 0.0
-        keep_ratio = 1.0 - decay_rate
-        self.hebbian_weight.mul_(keep_ratio)
-        self.hebbian_bias.mul_(keep_ratio)
-        return float(decay_rate)
-
-    def update_hebbian(self, reinforcement: float) -> Dict[str, Any]:
-        decay_rate = self._apply_decay()
-        reinforcement = float(np.clip(reinforcement, -1.0, 1.0))
-        applied = False
-        if reinforcement != 0.0 and self._last_input is not None and self._last_output is not None:
-            lr = self.hebbian_learning_rate * reinforcement
-            pre = torch.nn.functional.normalize(self._last_input, dim=-1)
-            post = torch.nn.functional.normalize(self._last_output, dim=-1)
-            kernel_update = torch.einsum("bi,bj->ij", post, pre)
-            kernel_update /= max(1.0, float(pre.shape[0]))
-            bias_update = post.mean(dim=0)
-            self.hebbian_weight.add_(kernel_update * lr)
-            self.hebbian_bias.add_(bias_update * lr)
-            applied = True
-        if self.clip > 0:
-            self.hebbian_weight.clamp_(-self.clip, self.clip)
-            self.hebbian_bias.clamp_(-self.clip, self.clip)
-        self._last_input = None
-        self._last_output = None
-        return {"applied": applied, "decay_rate": decay_rate}
 
 
 class ParameterEMA:
@@ -542,27 +486,16 @@ class BrainModel(torch.nn.Module):
     def __init__(self, input_size: int, action_count: int):
         super().__init__()
         self.input_bn = torch.nn.BatchNorm1d(input_size)
-        self.hidden_dense_1 = torch.nn.Linear(input_size, BRAIN_CONFIG["hidden_units"])
-        self.hidden_dropout_1 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.hebbian_dense_1 = HebbianLinear(
-            BRAIN_CONFIG["hidden_units"],
-            BRAIN_CONFIG["hebbian_units"][0],
-            hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
-            decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
-            clip=BRAIN_CONFIG["hebbian_clip"],
-        )
-        self.hebbian_dropout_1 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.hidden_dense_2 = torch.nn.Linear(BRAIN_CONFIG["hebbian_units"][0], BRAIN_CONFIG["mid_units"])
-        self.hidden_dropout_2 = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.hebbian_dense_2 = HebbianLinear(
-            BRAIN_CONFIG["mid_units"],
-            BRAIN_CONFIG["hebbian_units"][1],
-            hebbian_learning_rate=BRAIN_CONFIG["hebbian_learning_rate"],
-            decay_multiplier=BRAIN_CONFIG["hebbian_decay_multiplier"],
-            clip=BRAIN_CONFIG["hebbian_clip"],
-        )
-        self.shared_dense = torch.nn.Linear(BRAIN_CONFIG["hebbian_units"][1], BRAIN_CONFIG["shared_units"])
-        self.shared_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
+        storsky_units = BRAIN_CONFIG.get("storsky_units", [128, 96])
+        if len(storsky_units) < 2:
+            raise ValueError("storsky_units must define two layer sizes")
+        self.storsky_1 = StorskyLayer(input_size, int(storsky_units[0]), BRAIN_CONFIG["dropout_rate"])
+        self.storsky_2 = StorskyLayer(int(storsky_units[0]), int(storsky_units[1]), BRAIN_CONFIG["dropout_rate"])
+        self.memory_dim = int(storsky_units[1])
+        self.memory_decay = float(BRAIN_CONFIG.get("memory_decay", 0.9))
+        self.memory_scale = float(BRAIN_CONFIG.get("memory_scale", 0.15))
+        self.memory_norm = torch.nn.LayerNorm(self.memory_dim)
+        self.memory_project = torch.nn.Linear(self.memory_dim, self.memory_dim)
         self.transformer_tokens = int(BRAIN_CONFIG["transformer_tokens"])
         self.transformer_embed = int(BRAIN_CONFIG["transformer_embed"])
         total_transformer_dim = self.transformer_tokens * self.transformer_embed
@@ -570,7 +503,7 @@ class BrainModel(torch.nn.Module):
             raise ValueError("Transformer configuration must produce a positive feature size")
         if self.transformer_embed % max(1, int(BRAIN_CONFIG["transformer_heads"])) != 0:
             raise ValueError("Transformer embed dimension must be divisible by the number of heads")
-        self.transformer_project = torch.nn.Linear(BRAIN_CONFIG["shared_units"], total_transformer_dim)
+        self.transformer_project = torch.nn.Linear(int(storsky_units[1]), total_transformer_dim)
         self.transformer_encoder = RotaryTransformerEncoder(
             num_layers=int(BRAIN_CONFIG["transformer_layers"]),
             embed_dim=self.transformer_embed,
@@ -583,45 +516,29 @@ class BrainModel(torch.nn.Module):
         self.transformer_input_norm = torch.nn.LayerNorm(self.transformer_embed)
         self.transformer_output_norm = torch.nn.LayerNorm(self.transformer_embed)
         self.transformer_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.transformer_merge = torch.nn.Linear(total_transformer_dim, BRAIN_CONFIG["shared_units"])
-        self.context_gate = torch.nn.Linear(BRAIN_CONFIG["shared_units"] * 2, BRAIN_CONFIG["shared_units"])
-        self.policy_dense = torch.nn.Linear(BRAIN_CONFIG["shared_units"], BRAIN_CONFIG["shared_units"])
-        self.policy_dropout = torch.nn.Dropout(BRAIN_CONFIG["dropout_rate"])
-        self.reward_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
-        self.action_head = torch.nn.Linear(BRAIN_CONFIG["shared_units"], action_count)
+        self.transformer_dense = torch.nn.Linear(self.transformer_embed, self.transformer_embed)
         self.action_count = action_count
-        meta_hidden = max(8, int(BRAIN_CONFIG.get("meta_hidden", 32)))
-        meta_input_dim = BRAIN_CONFIG["shared_units"] + action_count
-        self.meta_controller = torch.nn.GRU(meta_input_dim, meta_hidden, batch_first=True)
-        self.meta_to_scale = torch.nn.Linear(meta_hidden, BRAIN_CONFIG["shared_units"])
-        self.meta_to_shift = torch.nn.Linear(meta_hidden, BRAIN_CONFIG["shared_units"])
-        self.meta_state_momentum = float(min(max(BRAIN_CONFIG.get("meta_state_momentum", 0.9), 0.0), 0.999))
+        branch_sizes = BRAIN_CONFIG.get("action_branches", [])
+        if not isinstance(branch_sizes, (list, tuple)):
+            branch_sizes = []
+        self.action_branches = [int(size) for size in branch_sizes if int(size) > 0]
+        self.branch_layers = torch.nn.ModuleList(
+            [torch.nn.Linear(self.transformer_embed, size) for size in self.action_branches]
+        )
+        self.transformer_heads = max(1, int(BRAIN_CONFIG["transformer_heads"]))
+        configured_bot_heads = max(1, int(BRAIN_CONFIG.get("bot_heads", self.transformer_heads)))
+        self.bot_heads = math.gcd(configured_bot_heads, self.transformer_embed) or 1
+        self.head_dim = self.transformer_embed // self.bot_heads
+        self.actions_per_head = max(1, math.ceil(self.action_count / self.bot_heads))
         self.register_buffer(
-            "meta_state",
-            torch.zeros(1, meta_hidden, dtype=FLOAT_POLICY["dtype"]),
+            "_meta_stub",
+            torch.zeros(1, dtype=FLOAT_POLICY["dtype"]),
             persistent=False,
         )
 
-    @staticmethod
-    def _activate(tensor: torch.Tensor) -> torch.Tensor:
-        return natural_log_relu(tensor)
-
-    def _update_meta_state(self, new_state: torch.Tensor) -> None:
-        if not isinstance(new_state, torch.Tensor):
-            return
-        with torch.no_grad():
-            mean_state = new_state.mean(dim=1)
-            if mean_state.dtype != self.meta_state.dtype or mean_state.device != self.meta_state.device:
-                mean_state = mean_state.to(device=self.meta_state.device, dtype=self.meta_state.dtype)
-            finite_mask = torch.isfinite(mean_state)
-            if not torch.all(finite_mask):
-                cleaned = torch.where(finite_mask, mean_state, torch.zeros_like(mean_state))
-            else:
-                cleaned = mean_state
-            momentum = self.meta_state_momentum
-            self.meta_state.mul_(momentum).add_(cleaned, alpha=1.0 - momentum)
-
-    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, inputs: torch.Tensor, memory_state: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if inputs.dim() != 2:
             raise ValueError(f"Expected 2D inputs (batch, features); got shape {tuple(inputs.shape)}")
         use_batch_stats = self.training and inputs.size(0) > 1
@@ -637,47 +554,73 @@ class BrainModel(torch.nn.Module):
             self.input_bn.momentum,
             self.input_bn.eps,
         )
-        x = self._activate(self.hidden_dense_1(x))
-        x = self.hidden_dropout_1(x)
-        x = self.hebbian_dense_1(x)
-        x = self.hebbian_dropout_1(x)
-        x = self._activate(self.hidden_dense_2(x))
-        x = self.hidden_dropout_2(x)
-        x = self.hebbian_dense_2(x)
-        shared = self._activate(self.shared_dense(x))
-        shared = self.shared_dropout(shared)
-        transformer_state = self.transformer_project(shared)
-        transformer_state = transformer_state.view(
-            shared.size(0), self.transformer_tokens, self.transformer_embed
-        )
+        x = self.storsky_1(x)
+        x = self.storsky_2(x)
+        if memory_state is None or memory_state.numel() != self.memory_dim:
+            memory_state = torch.zeros(self.memory_dim, device=x.device, dtype=x.dtype)
+        memory_state = memory_state.to(device=x.device, dtype=x.dtype)
+        batch_summary = x.mean(dim=0)
+        memory_decay = float(min(max(self.memory_decay, 0.0), 0.999))
+        new_memory = memory_decay * memory_state + (1.0 - memory_decay) * batch_summary
+        memory_features = self.memory_project(self.memory_norm(new_memory))
+        if self.memory_scale != 1.0:
+            memory_features = memory_features * self.memory_scale
+        x = x + memory_features.unsqueeze(0)
+        transformer_state = self.transformer_project(x)
+        transformer_state = transformer_state.view(x.size(0), self.transformer_tokens, self.transformer_embed)
         transformer_state = self.transformer_input_norm(transformer_state)
         transformer_state = self.transformer_encoder(transformer_state)
         transformer_state = self.transformer_output_norm(transformer_state)
+        transformer_state = self.transformer_dense(transformer_state)
         transformer_state = self.transformer_dropout(transformer_state)
-        transformer_state = transformer_state.reshape(shared.size(0), -1)
-        transformer_features = self.transformer_merge(transformer_state)
-        gate_input = torch.cat([shared, transformer_features], dim=-1)
-        context_weights = torch.sigmoid(self.context_gate(gate_input))
-        shared = shared + context_weights * transformer_features
-        policy_features = self._activate(self.policy_dense(shared))
-        policy_features = self.policy_dropout(policy_features)
-        reward_prediction = self.reward_head(policy_features)
-        meta_input = torch.cat([policy_features, reward_prediction], dim=-1).unsqueeze(1)
-        initial_state = self.meta_state.to(device=inputs.device, dtype=inputs.dtype)
-        initial_state = initial_state.expand(meta_input.size(0), -1).contiguous()
-        initial_state = initial_state.unsqueeze(0).detach()
-        meta_output, new_state = self.meta_controller(meta_input, initial_state)
-        meta_features = meta_output.squeeze(1)
-        scale = torch.sigmoid(self.meta_to_scale(meta_features))
-        shift = self.meta_to_shift(meta_features)
-        adapted_features = policy_features * scale + shift
-        logits = self.action_head(adapted_features)
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        self._update_meta_state(new_state.detach())
-        return probs, reward_prediction
+        if self.branch_layers:
+            pooled = transformer_state.mean(dim=1)
+            branch_logits = [layer(pooled) for layer in self.branch_layers]
+            combined_logits = torch.cat(branch_logits, dim=-1)
+            if combined_logits.size(-1) < self.action_count:
+                pad = torch.zeros(
+                    combined_logits.size(0),
+                    self.action_count - combined_logits.size(-1),
+                    device=combined_logits.device,
+                    dtype=combined_logits.dtype,
+                )
+                combined_logits = torch.cat([combined_logits, pad], dim=-1)
+            policy_logits = combined_logits[:, : self.action_count]
+        else:
+            transformer_state = transformer_state.reshape(
+                x.size(0), self.transformer_tokens, self.bot_heads, self.head_dim
+            )
+            head_features = transformer_state.permute(0, 2, 1, 3)
+            head_features = head_features.reshape(
+                x.size(0), self.bot_heads, self.transformer_tokens * self.head_dim
+            )
+            if head_features.size(-1) < self.actions_per_head:
+                pad = torch.zeros(
+                    head_features.size(0),
+                    head_features.size(1),
+                    self.actions_per_head - head_features.size(-1),
+                    device=head_features.device,
+                    dtype=head_features.dtype,
+                )
+                head_features = torch.cat([head_features, pad], dim=-1)
+            else:
+                head_features = head_features[:, :, : self.actions_per_head]
+            flat_features = head_features.reshape(head_features.size(0), -1)
+            if flat_features.size(-1) < self.action_count:
+                pad = torch.zeros(
+                    flat_features.size(0),
+                    self.action_count - flat_features.size(-1),
+                    device=flat_features.device,
+                    dtype=flat_features.dtype,
+                )
+                flat_features = torch.cat([flat_features, pad], dim=-1)
+            policy_logits = flat_features[:, : self.action_count]
+        probs = torch.nn.functional.softmax(policy_logits, dim=-1)
+        reward_prediction = policy_logits
+        return probs, reward_prediction, new_memory
 
-    def hebbian_layers(self) -> List[HebbianLinear]:
-        return [self.hebbian_dense_1, self.hebbian_dense_2]
+    def meta_state_norm(self) -> torch.Tensor:
+        return self._meta_stub
 
 
 class RemoteBrain:
@@ -685,8 +628,13 @@ class RemoteBrain:
         self.input_size = int(input_size)
         self.action_count = int(action_count)
         self.model = BrainModel(self.input_size, self.action_count).to(FLOAT_POLICY["device"])
+        self.memory_state = torch.zeros(
+            self.model.memory_dim,
+            device=FLOAT_POLICY["device"],
+            dtype=FLOAT_POLICY["dtype"],
+        )
         self.optimizer = LookaheadOptimizer(
-            torch.optim.AdamW(
+            torch.optim.Adam(
                 self.model.parameters(),
                 lr=BRAIN_CONFIG["learning_rate"],
                 betas=(BRAIN_CONFIG["lion_beta_1"], BRAIN_CONFIG["lion_beta_2"]),
@@ -838,20 +786,29 @@ class RemoteBrain:
                 return [], dropped, clipped, global_norm
         return params, dropped, clipped, global_norm
 
-    def _apply_hebbian_updates(self, reinforcement: float) -> Dict[str, Any]:
-        applied = 0
-        decay_rates: List[float] = []
-        for layer in self.model.hebbian_layers():
-            result = layer.update_hebbian(reinforcement)
-            if result.get("applied"):
-                applied += 1
-            if "decay_rate" in result:
-                decay_rates.append(float(result["decay_rate"]))
-        return {"layers": len(self.model.hebbian_layers()), "applied": applied, "decay_rates": decay_rates}
-
     def _tensor_from_array(self, array: np.ndarray) -> torch.Tensor:
         tensor = torch.from_numpy(array.astype(NP_FLOAT, copy=False)).to(self.device)
         return tensor
+
+    def _get_meta_state_norm(self) -> float:
+        meta_ref = getattr(self.model, "meta_state_norm", None)
+        if callable(meta_ref):
+            value = meta_ref()
+        else:
+            value = meta_ref
+        if isinstance(value, torch.Tensor):
+            try:
+                return float(value.detach().abs().max().item())
+            except Exception:  # pragma: no cover - defensive
+                return 0.0
+        if isinstance(value, (float, int)):
+            return float(value)
+        if isinstance(self.memory_state, torch.Tensor):
+            try:
+                return float(self.memory_state.detach().abs().max().item())
+            except Exception:  # pragma: no cover - defensive
+                return 0.0
+        return 0.0
 
     def choose_actions_batch(self, observations: List[Any], epsilons: List[float]) -> List[Dict[str, Any]]:
         with self._lock:
@@ -891,12 +848,13 @@ class RemoteBrain:
                             ema_applied = True
                         tensor = torch.from_numpy(batch).to(self.device)
                         with self._autocast_context():
-                            policy_probs, reward_predictions = self.model(tensor)
+                            policy_probs, reward_predictions, memory_state = self.model(tensor, self.memory_state)
+                        self.memory_state = memory_state.detach()
                         policy_probs = policy_probs.float()
                         reward_predictions = reward_predictions.float()
                         probs = policy_probs.cpu().numpy().astype(NP_FLOAT, copy=False)
                         reward_predictions_np = reward_predictions.cpu().numpy().astype(NP_FLOAT, copy=False)
-                        meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
+                        meta_state_norm = self._get_meta_state_norm()
                     finally:
                         if ema_applied:
                             self.ema.restore(self.model)
@@ -1088,7 +1046,7 @@ class RemoteBrain:
                             "advantage": 0.0,
                         },
                         "meta": {
-                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "state_norm": self._get_meta_state_norm(),
                             "policy_loss": 0.0,
                         },
                     }
@@ -1124,7 +1082,7 @@ class RemoteBrain:
                             "advantage": 0.0,
                         },
                         "meta": {
-                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "state_norm": self._get_meta_state_norm(),
                             "policy_loss": 0.0,
                         },
                     }
@@ -1157,7 +1115,7 @@ class RemoteBrain:
                             "advantage": 0.0,
                         },
                         "meta": {
-                            "state_norm": float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0,
+                            "state_norm": self._get_meta_state_norm(),
                             "policy_loss": 0.0,
                         },
                     }
@@ -1181,7 +1139,8 @@ class RemoteBrain:
                 obs_tensor = torch.from_numpy(obs_matrix).to(self.device)
                 self.optimizer.zero_grad()
                 with self._autocast_context():
-                    policy_probs, reward_predictions = self.model(obs_tensor)
+                    policy_probs, reward_predictions, memory_state = self.model(obs_tensor, self.memory_state)
+                self.memory_state = memory_state.detach()
                 policy_probs = policy_probs.float()
                 reward_predictions = reward_predictions.float()
                 log_probs = torch.log(policy_probs + 1e-8)
@@ -1201,7 +1160,7 @@ class RemoteBrain:
                 weight_meta = {"sanitized": False, "replaced": 0, "clipped": 0}
                 policy_loss_value = float(policy_loss.detach().cpu().item())
                 prediction_loss_value = float(prediction_loss.detach().cpu().item())
-                meta_state_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
+                meta_state_norm = self._get_meta_state_norm()
                 if not torch.isfinite(total_loss):
                     LOGGER.warning("Loss became non-finite; skipping update")
                     if getattr(self, "grad_scaler", None) and self.grad_scaler.is_enabled():
@@ -1234,8 +1193,6 @@ class RemoteBrain:
                         gradient_norm = None
                         self.optimizer.zero_grad()
                         weights_ok = self._weights_are_finite()
-                mean_reward = float(np.mean([entry["reward"] for entry in valid_entries])) if valid_entries else 0.0
-                hebbian_info = self._apply_hebbian_updates(mean_reward)
                 predicted_values_np = predicted_rewards.detach().cpu().numpy().astype(NP_FLOAT, copy=False)
                 advantages_np = advantages.detach().cpu().numpy().astype(NP_FLOAT, copy=False)
                 for offset, entry in enumerate(valid_entries):
@@ -1257,7 +1214,6 @@ class RemoteBrain:
                             },
                             "reward": entry["reward_meta"],
                         },
-                        "hebbian": hebbian_info,
                         "reward_prediction": {
                             "predicted": predicted_value,
                             "loss": prediction_loss_value,
@@ -1268,7 +1224,7 @@ class RemoteBrain:
                             "policy_loss": policy_loss_value,
                         },
                     }
-            idle_meta_norm = float(self.model.meta_state.detach().norm().item()) if self.model.meta_state.numel() else 0.0
+            idle_meta_norm = self._get_meta_state_norm()
             final_results = [
                 value
                 if value is not None
@@ -1480,8 +1436,6 @@ async def _stream_handle_train(message: Dict[str, Any]) -> Dict[str, Any]:
         response_payload["reward_prediction"] = result["reward_prediction"]
     if "meta" in result:
         response_payload["meta"] = result["meta"]
-    if "hebbian" in result:
-        response_payload["hebbian"] = result["hebbian"]
     if "learning_rate" in result:
         response_payload["learning_rate"] = result["learning_rate"]
     request_payload = {key: value for key, value in message.items() if key not in {"id", "type"}}

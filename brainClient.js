@@ -602,26 +602,28 @@ function makeDefaultTrainResult(sanitizedObservation, sanitizedNext) {
 
 async function legacyBatchAct(jobs, results) {
   if (!jobs.length) return
-  let response
-  try {
-    const payloads = jobs.map(job => job.payload)
-    response = await request('/api/brains/batch_act', { body: { requests: payloads } })
-  } catch (error) {
-    for (const job of jobs) {
-      if (!results[job.index]) {
-        results[job.index] = { ok: false, error }
+  const settled = await Promise.allSettled(
+    jobs.map(job => {
+      const payload = {
+        observation: job.payload.observation,
+        epsilon: job.payload.epsilon,
+        bot_id: job.payload.bot_id
       }
-    }
-    return
-  }
-  const remoteResults = Array.isArray(response?.results) ? response.results : []
+      return request(`/api/brains/${job.payload.brain_id}/act`, { body: payload })
+    })
+  )
   for (let i = 0; i < jobs.length; i++) {
     const job = jobs[i]
-    const remote = remoteResults[i]
+    const outcome = settled[i]
+    if (outcome.status === 'rejected') {
+      results[job.index] = { ok: false, error: outcome.reason }
+      continue
+    }
+    const remote = outcome.value
     if (!remote || remote.error) {
       const err = remote?.error
         ? new Error(remote.error)
-        : new Error('Remote brain batch action missing result')
+        : new Error('Remote brain action missing result')
       results[job.index] = { ok: false, error: err }
       continue
     }
@@ -652,26 +654,31 @@ async function legacyBatchAct(jobs, results) {
 
 async function legacyBatchTrain(jobs, results) {
   if (!jobs.length) return
-  let response
-  try {
-    const payloads = jobs.map(job => job.payload)
-    response = await request('/api/brains/batch_train', { body: { requests: payloads } })
-  } catch (error) {
-    for (const job of jobs) {
-      if (!results[job.index]) {
-        results[job.index] = { ok: false, error }
+  const settled = await Promise.allSettled(
+    jobs.map(job => {
+      const payload = {
+        observation: job.payload.observation,
+        action: job.payload.action,
+        reward: job.payload.reward,
+        penalty: job.payload.penalty,
+        next_observation: job.payload.next_observation,
+        bot_id: job.payload.bot_id
       }
-    }
-    return
-  }
-  const remoteResults = Array.isArray(response?.results) ? response.results : []
+      return request(`/api/brains/${job.payload.brain_id}/train`, { body: payload })
+    })
+  )
   for (let i = 0; i < jobs.length; i++) {
     const job = jobs[i]
-    const remote = remoteResults[i]
+    const outcome = settled[i]
+    if (outcome.status === 'rejected') {
+      results[job.index] = { ok: false, error: outcome.reason }
+      continue
+    }
+    const remote = outcome.value
     if (!remote || remote.error) {
       const err = remote?.error
         ? new Error(remote.error)
-        : new Error('Remote brain batch train missing result')
+        : new Error('Remote brain training missing result')
       results[job.index] = { ok: false, error: err }
       continue
     }
